@@ -86,6 +86,24 @@ TOOL_CATEGORIES = {
         "description": "资金流向",
         "tools": ["get_capital_flow", "get_moneyflow"],
     },
+    "a_share_specific": {
+        "description": "A股特有数据",
+        "tools": [
+            "get_northbound_flow",     # 北向资金
+            "get_limit_up_tiers",      # 涨停梯队
+            "get_sector",              # 板块数据
+            "get_dragon_tiger",        # 龙虎榜
+            "get_margin",              # 融资融券
+        ],
+    },
+    "analysis": {
+        "description": "分析数据",
+        "tools": [
+            "get_factors",             # 因子数据
+            "check_crowding",          # 因子拥挤度
+            "find_similar",            # 相似历史情境
+        ],
+    },
 }
 
 

@@ -1,16 +1,13 @@
 """
-Agent 模块初始化 — 借鉴 TradingAgents' agents/__init__.py 的工厂函数注册模式
+Agent 模块初始化 — 重写版
+
+每个 Agent 的工厂函数返回一个 LangGraph 可调用的节点函数。
 """
 from ..llm.client import LLMClient
 from .schemas import (
-    DecisionType,
-    MarketReport,
-    EventReport,
-    AnalysisReport,
-    BacktestReport,
-    SystemDecision,
-    MemoryRecall,
-    FinalReport,
+    DecisionType, RiskVerdict, Confidence,
+    MarketReport, EventReport, AnalysisReport, StockRanking,
+    BacktestReport, SystemDecision, MemoryRecall, FinalReport,
 )
 from .market_agent import create_market_agent
 from .event_agent import create_event_agent
@@ -21,11 +18,7 @@ from .memory_agent import create_memory_agent
 from .report_agent import create_report_agent
 
 __all__ = [
-    "create_market_agent",
-    "create_event_agent",
-    "create_analysis_agent",
-    "create_backtest_agent",
-    "create_system_agent",
-    "create_memory_agent",
-    "create_report_agent",
+    "create_market_agent", "create_event_agent",
+    "create_analysis_agent", "create_backtest_agent",
+    "create_system_agent", "create_memory_agent", "create_report_agent",
 ]

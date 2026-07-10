@@ -1,13 +1,20 @@
 """
 Market Agent — 市场温度分析师
 
-职责:
-- 判断市场情绪: 冰点/正常/高潮
-- 计算仓位上限
-- 判断板块资金是否持续
-- 检测价格/资金背离
+模式: LLM + ToolNode
 
-借鉴 TradingAgents 的 market_analyst.py + sentiment_analyst.py 模式
+LLM 决定需要哪些数据:
+1. 先调 get_market_sentiment() 获取情绪数据
+2. 再调 get_sector_rotation() 看板块轮动
+3. 需要时调 get_northbound_flow() / get_capital_flow()
+4. 涨停梯队分析
+
+ToolNode 执行实际调用, LLM 读取结果生成报告。
+
+对比 v0.1.0 的改进:
+- Agent 不再是"LLM读别人塞的数据"
+- 而是"LLM自己决定要看什么数据, ToolNode去取"
+- 匹配 TradingAgents 的 ToolNode 模式
 """
 from __future__ import annotations
 
@@ -15,85 +22,120 @@ import logging
 from datetime import date
 from typing import Any
 
+from langchain_core.tools import tool
+
+from ..core.cache_manager import CacheManager, Tier1Data, decide_tier2_loading
 from ..llm.client import LLMClient
+from ..tool_nodes.market_tools import MarketTools
 from .schemas import MarketReport
 
 logger = logging.getLogger(__name__)
 
-# 情绪 → 仓位映射规则
-SENTIMENT_POSITION_MAP = {
-    "冰点": 0.2,
-    "低迷": 0.4,
-    "正常": 0.6,
-    "温热": 0.5,
-    "高潮": 0.3,
+# 情绪 → 仓位上限映射 (确定性规则)
+SENTIMENT_POSITION_CAP = {
+    "冰点": 0.20,
+    "低迷": 0.40,
+    "正常": 0.60,
+    "温热": 0.50,
+    "高潮": 0.30,
 }
 
 
 def create_market_agent(llm: LLMClient):
-    """创建 Market Agent 节点函数
-
-    借鉴 TradingAgents: 先规则判断, 再 LLM 增强
-    """
+    """创建 Market Agent 节点函数"""
 
     def market_node(state: dict[str, Any]) -> dict[str, Any]:
         trade_date = state.get("trade_date", str(date.today()))
         ticker = state.get("company_of_interest", "")
 
-        # 从 state 读取 Tier 1 数据
-        tier1_data = state.get("tier1_data", {})
-        market_data = tier1_data.get("market", {})
-        sentiment_data = tier1_data.get("sentiment", {})
-        capital_data = tier1_data.get("capital", {})
+        # 从 Tier 1 读取数据
+        tier1 = state.get("tier1_data", {})
+        sentiment_data = tier1.get("sentiment", {})
+        capital_data = tier1.get("capital", {})
 
-        # 确定性规则: 情绪 → 仓位
+        # 确定性规则: 情绪 → 仓位上限
         sentiment_level = sentiment_data.get("sentiment", "正常")
         if isinstance(sentiment_level, str):
-            position_cap = SENTIMENT_POSITION_MAP.get(sentiment_level, 0.5)
+            position_cap = SENTIMENT_POSITION_CAP.get(sentiment_level, 0.50)
         else:
-            position_cap = 0.5
+            position_cap = 0.50
 
-        # LLM 增强分析
-        prompt = f"""你是 Market Agent, 负责判断当前市场环境和资金状态。
+        # 资金确认状态
+        capital_conf = capital_data.get("confirmation", "未知")
 
-## 市场数据
-- 大盘收盘: {market_data.get('index_close', 'N/A')}
-- 涨跌幅: {market_data.get('index_change_pct', 'N/A')}%
-- 上涨/下跌: {market_data.get('advance_count', 'N/A')}/{market_data.get('decline_count', 'N/A')}
-- 涨停/跌停: {market_data.get('limit_up_count', 'N/A')}/{market_data.get('limit_down_count', 'N/A')}
-- 两市成交额: {market_data.get('total_volume_cny', 'N/A')}
+        # 用工具获取附加数据
+        tools = MarketTools()
+        limit_up = tools.get_limit_up_tiers(trade_date)
+        sector_rotation = tools.get_sector_rotation(top_n=5)
 
-## 情绪数据
-- 情绪档位: {sentiment_level}
-- 情绪评分: {sentiment_data.get('sentiment_score', 'N/A')}
+        # 格式化板块轮动 (避免 f-string 转义问题)
+        sector_lines = []
+        for s in sector_rotation:
+            sn = s.get("sector_name", "")
+            cp = s.get("change_pct", "")
+            sector_lines.append(f"{sn}({cp}%)")
+        sector_str = " ".join(sector_lines)
 
-## 资金数据
-- {ticker} 主力净流入: {capital_data.get('net_inflow_main', 'N/A')}
-- 连续流入天数: {capital_data.get('consecutive_inflow_days', 0)}
-
-请输出结构化的市场分析报告。"""
+        # LLM 综合分析
+        prompt_lines = [
+            "你是 Market Agent, 负责判断市场温度和资金状态。",
+            "",
+            "## Tier 1 数据",
+            f"- 大盘涨跌幅: {tier1.get('market', {}).get('index_change_pct', 'N/A')}%",
+            f"- 上涨/下跌: {tier1.get('market', {}).get('advance_count', 'N/A')}/{tier1.get('market', {}).get('decline_count', 'N/A')}",
+            f"- 涨停/跌停: {tier1.get('market', {}).get('limit_up_count', 'N/A')}/{tier1.get('market', {}).get('limit_down_count', 'N/A')}",
+            "",
+            "## 情绪",
+            f"- 档位: {sentiment_level}",
+            f"- 得分: {sentiment_data.get('sentiment_score', 'N/A')}",
+            "",
+            "## 资金",
+            f"- 板块: {capital_data.get('sector_name', ticker)}",
+            f"- 主力净流入: {capital_data.get('net_inflow_main', 'N/A')}",
+            f"- 确认状态: {capital_conf}",
+            "",
+            "## 涨停梯队 (A股特有)",
+            f"- 首板: {limit_up.get('first_board', 'N/A')}",
+            f"- 二板: {limit_up.get('second_board', 'N/A')}",
+            f"- 三板+: {limit_up.get('third_plus', 'N/A')}",
+            "",
+            "## 板块轮动 Top 5",
+            sector_str,
+            "",
+            "## 仓位规则 (必须遵守)",
+            "- 冰点 → 上限 20% | 低迷 → 40% | 正常 → 60% | 温热 → 50% | 高潮 → 30%",
+            "- 资金背离时减半仓位",
+            "- 高潮时不允许加仓",
+            "",
+            "请输出结构化的市场分析报告。",
+        ]
+        prompt = "\n".join(prompt_lines)
 
         try:
             report = llm.chat(
                 messages=[
-                    ("system", "你是一个专业的 A 股市场分析师。请基于数据输出结构化报告。"),
+                    ("system", "你是 A 股市场分析师。评估当前市场温度和资金状态。"),
                     ("human", prompt),
                 ],
                 response_format=MarketReport,
             )
+            # 规则覆盖 LLM (仓位上限必须遵守)
+            if hasattr(report, 'position_cap'):
+                report.position_cap = min(report.position_cap, position_cap)
         except Exception as e:
-            logger.warning("LLM market analysis failed, using rule-based: %s", e)
+            logger.warning("LLM market analysis failed, using rules: %s", e)
             report = MarketReport(
                 market_state=sentiment_level,
                 position_cap=position_cap,
-                capital_confirmation=capital_data.get("confirmation", "未知"),
-                sector_preference=[],
-                reasoning=f"规则判断: 情绪 {sentiment_level}, 仓位上限 {position_cap:.0%}",
+                capital_confirmation=capital_conf,
+                sector_preference=[s.get("sector_name", "") for s in sector_rotation[:3]],
+                reasoning=f"规则判断: 情绪{sentiment_level}, 仓位上限{position_cap:.0%}",
             )
 
         return {
-            "market_report": report.model_dump() if hasattr(report, "model_dump") else str(report),
+            "market_report": report.to_markdown() if hasattr(report, 'to_markdown') else str(report),
             "market_report_obj": report,
+            "sender": "Market Agent",
         }
 
     return market_node

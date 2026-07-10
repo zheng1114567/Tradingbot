@@ -1,17 +1,16 @@
 """
 Event Agent — 事件分析师
 
-职责:
-- 识别事件类型和方向
-- 判断传导路径
-- 估计半衰期和失效条件
-- 检查证据等级和定价状态
+模式: LLM + ToolNode
 
-反伪链条规则 (硬约束在 schema 中):
-- 实体映射: 必须能映射到上市公司
-- 收入暴露: 必须说明业务关联
-- 传导长度: >3 跳降级为观察
-- 已定价检查: 连续大涨标记已定价
+LLM 决定搜索什么事件 → ToolNode 搜索财联社/东方财富 → LLM 分析传导链
+
+反伪链条规则 (硬约束):
+1. 实体映射: 事件主体必须能映射到上市公司/板块
+2. 收入暴露: 推荐个股时必须有业务关联依据
+3. 传导长度: >3 跳降级为 indirect
+4. 已定价检查: 连续大涨 → 标记已定价
+5. 证据等级: 低等级不能单独支撑推荐
 """
 from __future__ import annotations
 
@@ -19,6 +18,7 @@ import logging
 from typing import Any
 
 from ..llm.client import LLMClient
+from ..tool_nodes.event_tools import EventTools
 from .schemas import EventReport
 
 logger = logging.getLogger(__name__)
@@ -29,67 +29,97 @@ def create_event_agent(llm: LLMClient):
 
     def event_node(state: dict[str, Any]) -> dict[str, Any]:
         ticker = state.get("company_of_interest", "")
-        market_report = state.get("market_report_obj", None)
-        tier2_data = state.get("tier2_data", {})
-        events = tier2_data.get("events", [])
+        tier2 = state.get("tier2_data", {})
+        events_raw = tier2.get("events", [])
         memory = state.get("memory_context", "")
 
+        # 用工具搜索事件相关新闻
+        tools = EventTools()
+        news_items = tools.search_cailianshe_news(ticker)
+        news_items.extend(tools.search_eastmoney_news(ticker))
+
+        # 识别实体
+        detected_entities = []
+        for item in news_items:
+            text = str(item)
+            entities = tools.detect_entity(text)
+            detected_entities.extend(entities)
+
         event_summary = "\n".join(
-            f"- [{e.get('event_type', '未知')}] {e.get('summary', '')} "
-            f"(证据: {e.get('evidence_level', 'N/A')})"
-            for e in events[:10]
-        ) if events else "暂无事件数据"
+            f"- [{e.get('event_type', '?')}] {e.get('summary', str(e))[:100]}"
+            for e in events_raw[:10]
+        ) if events_raw else "暂无结构化事件数据"
+
+        news_summary = "\n".join(
+            f"- {str(n)[:80]}" for n in news_items[:10]
+        ) if news_items else "暂无相关新闻"
+
+        entities_summary = "未检测到明确主题"
+        if detected_entities:
+            entity_parts = []
+            for e in detected_entities[:5]:
+                theme = e.get("theme", "")
+                kw = e.get("keyword", "")
+                entity_parts.append(f"{theme}({kw})")
+            entities_summary = f"检测到: {', '.join(entity_parts)}"
 
         prompt = f"""你是 Event Agent, 负责判断事件是否有交易价值。
 
-## 当前标的
+## 标的
 {ticker}
 
-## 市场背景
-{market_report}
-
-## 事件列表
+## 结构化事件
 {event_summary}
 
+## 最新新闻
+{news_summary}
+
+## 实体识别
+{entities_summary}
+
 ## 历史记忆
-{memory[:500] if memory else "暂无"}
+{memory[:300] if memory else "暂无"}
 
-请分析最重要的事件:
-1. 事件是否可映射到实体/板块?
-2. 传导路径是否直接? 超过 3 跳必须降级
-3. 是否已被市场定价?(连续大涨 = 已定价)
-4. 证据等级够不够? (低等级不能单独支撑推荐)
-5. 半衰期多长? 失效条件是什么?
+## 反伪链条规则 (必须遵守)
+1. 实体映射: 事件主体必须能映射到上市公司或板块
+2. 收入暴露: 推荐个股必须有业务关联依据, 否则只能给板块级观察
+3. 传导长度: 超过 3 跳的链条降级为 indirect
+4. 已定价检查: 标的连续大涨/涨停 → 标记已定价
+5. 证据等级: 公告/披露 > 权威媒体 > 行业媒体 > 社交传闻
+6. 低等级证据不能单独支撑推荐
 
-输出结构化事件分析报告。"""
+请分析最重要的事件。输出结构化报告。"""
 
         try:
             report = llm.chat(
                 messages=[
-                    ("system", "你是 A 股事件分析师。严格遵守反伪链条规则。"),
+                    ("system",
+                     "你是 A 股事件分析师。严格遵守反伪链条规则。"
+                     "没有明确实体映射的事件, 只能给 indirect。"),
                     ("human", prompt),
                 ],
                 response_format=EventReport,
             )
         except Exception as e:
-            logger.warning("LLM event analysis failed: %s", e)
+            logger.warning("LLM event analysis failed, defaulting: %s", e)
             report = EventReport(
-                event_id="default",
+                event_id=f"event_{ticker}",
                 event_type="情绪",
                 direction="中性",
                 confidence=0.3,
-                transmission_path="无明确传导路径",
+                transmission_path="LLM不可用时无法分析传导路径",
                 direct_beneficiaries=[],
                 evidence_level="社交传闻",
                 pricing_status="未定价",
                 chain_quality="weak",
-                reasoning="LLM 不可用时的默认降级分析",
-                invalid_conditions=["无法确认事件影响"],
+                reasoning="LLM不可用, 默认降级",
+                invalid_conditions=["LLM不可用, 建议人工复核"],
             )
 
         return {
-            "event_report": report.model_dump() if hasattr(report, "model_dump") else str(report),
+            "event_report": report.to_markdown() if hasattr(report, 'to_markdown') else str(report),
             "event_report_obj": report,
+            "sender": "Event Agent",
         }
 
     return event_node

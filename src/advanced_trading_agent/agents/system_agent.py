@@ -2,24 +2,33 @@
 System Agent — 组长与裁判
 
 职责:
-- 加载 Tier 1 / Tier 2 数据
-- 调度各 Agent 发言顺序
-- 拦截越权发言
-- 汇总争议, 推动 Round 2 质询
-- 执行软风控, 输出裁定
+1. 初始化: 加载 Tier 1 → 数据质量检查 → Memory 召回
+2. Round 1 调度 (数据流控制)
+3. 判断是否进 Round 2
+4. 执行硬风控 (三层)
+5. 最终裁定
 
-借鉴 TradingAgents' research_manager.py + portfolio_manager.py 的控场模式,
-但这里 System Agent 是工作流的调度者 + 最终裁定者。
+硬风控三时间点:
+- ① 分析前: ST/停牌/退市 → HARD_VETO 直接终止
+- ② Round1 后: 流动性/涨跌停 → SOFT_VETO 带入讨论
+- ③ 裁定前: 冲击成本/仓位 → 最终 HARD_VETO
+
+借鉴 TradingAgents' portfolio_manager.py 的裁定模式,
+但硬风控由代码执行, LLM 不可覆盖。
 """
 from __future__ import annotations
 
 import logging
+from datetime import date
 from typing import Any
 
-from ..data_service.schema import DecisionType
+from ..core.cache_manager import Tier1Data, decide_tier2_loading
+from ..core.data_quality import DataQualityChecker
 from ..llm.client import LLMClient
 from ..risk.hard_risk import HardRiskController, RiskVerdictType
-from .schemas import SystemDecision
+from ..risk.soft_risk import SoftRiskController
+from ..tool_nodes.market_tools import MarketTools
+from .schemas import DecisionType, RiskVerdict, SystemDecision
 
 logger = logging.getLogger(__name__)
 
@@ -27,104 +36,255 @@ logger = logging.getLogger(__name__)
 def create_system_agent(llm: LLMClient):
     """创建 System Agent 节点函数"""
 
-    def system_node(state: dict[str, Any]) -> dict[str, Any]:
+    def init_node(state: dict[str, Any]) -> dict[str, Any]:
+        """初始化节点: 数据质量检查 + Memory 召回 + 硬风控1
+
+        这个节点在 Market Agent 之前执行。
+        """
         ticker = state.get("company_of_interest", "")
-        trade_date = state.get("trade_date", "")
-
-        # 读取各 Agent 报告
-        market_rpt = state.get("market_report_obj", None)
-        event_rpt = state.get("event_report_obj", None)
-        analysis_rpt = state.get("analysis_report_obj", None)
-        backtest_rpt = state.get("backtest_report_obj", None)
-        memory_ctx = state.get("memory_context", "")
-
-        # 读取风控数据
+        trade_date = state.get("trade_date", str(date.today()))
         tier1 = state.get("tier1_data", {})
-        risk_data = tier1.get("risk", {})
 
-        # 硬风控检查
+        # 数据质量检查
+        quality = DataQualityChecker.check_tier1(tier1)
+
+        # 硬风控 1: ST/停牌/退市
+        risk_data = tier1.get("risk", {})
         hard_risk = HardRiskController()
-        risk_verdict = hard_risk.check_all(
+        risk1 = hard_risk.check_all(
             code=ticker,
-            direction="buy",
             st_list=risk_data.get("st_list"),
             suspended_list=risk_data.get("suspended_list"),
             delisting_list=risk_data.get("delisting_list"),
-            daily_volume_cny=risk_data.get("daily_volume", 0),
         )
 
-        if risk_verdict.verdict == RiskVerdictType.HARD_VETO:
+        if risk1.verdict == RiskVerdictType.HARD_VETO:
+            # 硬风控否决 → 直接结束
+            logger.warning("硬风控1否决 %s: %s", ticker, risk1.reasons)
             return {
+                "risk_check_1": {
+                    "verdict": "HARD_VETO",
+                    "reasons": risk1.reasons,
+                    "suggested": risk1.suggested_actions,
+                },
+                "system_state": "vetoed",
                 "system_decision_obj": SystemDecision(
                     decision=DecisionType.REJECT,
                     position=0,
                     alpha_source=[],
                     horizon_days=5,
-                    reasons=[f"硬风控否决: {'; '.join(risk_verdict.reasons)}"],
-                    objections=[],
-                    invalid_conditions=[],
-                    risk_verdict="HARD_VETO",
-                    risk_details=risk_verdict.reasons,
-                    reasoning="硬风控不通过, 终止",
+                    reasons=[f"硬风控1否决: {'; '.join(risk1.reasons)}"],
+                    objections=risk1.reasons,
+                    risk_verdict=RiskVerdict.HARD_VETO,
+                    risk_details=risk1.reasons,
+                    reasoning="硬风控不通过, 终止分析",
                 ),
-                "system_decision_state": "completed",
             }
 
-        # LLM 综合裁定
+        # 判断是否 Winter 模式
+        sentiment = tier1.get("sentiment", {}).get("sentiment", "正常")
+        winter = sentiment in ("冰点", "低迷")
+
+        tier2_decision = decide_tier2_loading(
+            Tier1Data(
+                market=tier1.get("market", {}),
+                sentiment=tier1.get("sentiment", {}),
+                capital=tier1.get("capital", {}),
+                winter_mode=winter,
+            )
+        )
+
+        return {
+            "data_quality_report": quality,
+            "risk_check_1": {
+                "verdict": "PASS",
+                "reasons": risk1.reasons or [],
+            },
+            "system_state": "running",
+            "tier1_data": {**tier1, "winter_mode": winter},
+        }
+
+    def round2_judge_node(state: dict[str, Any]) -> dict[str, Any]:
+        """判断是否需要 Round 2 交叉质询
+
+        进入 Round 2 的条件:
+        1. 存在明确的矛盾 (如 Market 说资金背离但 Event 说利好)
+        2. Backtest 样本不足 (< 30) 但 Analysis 排序靠前
+        3. 至少 2 个 Agent 的观点存在分歧
+        """
+        market_rpt = state.get("market_report_obj")
+        event_rpt = state.get("event_report_obj")
+        analysis_rpt = state.get("analysis_report_obj")
+        backtest_rpt = state.get("backtest_report_obj")
+
+        contradictions = []
+
+        # 检查矛盾
+        if market_rpt and event_rpt:
+            if (market_rpt.capital_confirmation in ("资金背离", "资金不足")
+                    and event_rpt.direction == "利好"):
+                contradictions.append(
+                    f"Market:资金{market_rpt.capital_confirmation} ↔ Event:{event_rpt.direction}"
+                )
+
+        if backtest_rpt and analysis_rpt:
+            if (backtest_rpt.sample_size < 30
+                    and analysis_rpt.stock_rankings
+                    and analysis_rpt.stock_rankings[0].composite_score > 7):
+                contradictions.append(
+                    f"Backtest:样本不足({backtest_rpt.sample_size}) ↔ Analysis:高分"
+                )
+
+        needs_round2 = len(contradictions) > 0
+
+        return {
+            "round2_state": {
+                "active": needs_round2,
+                "round_count": 0,
+                "max_rounds": 8,
+                "questions": [],
+                "contradictions": contradictions,
+                "current_speaker": "",
+                "completed": not needs_round2,
+            },
+            "system_state": "round2" if needs_round2 else "finalizing",
+        }
+
+    def final_decision_node(state: dict[str, Any]) -> dict[str, Any]:
+        """最终裁定: LLM 综合 + 硬风控 3
+
+        读取所有 Agent 报告, 执行硬风控 3, LLM 输出最终裁定。
+        """
+        ticker = state.get("company_of_interest", "")
+        trade_date = state.get("trade_date", str(date.today()))
+
+        market_rpt = state.get("market_report_obj")
+        event_rpt = state.get("event_report_obj")
+        analysis_rpt = state.get("analysis_report_obj")
+        backtest_rpt = state.get("backtest_report_obj")
+        memory_ctx = state.get("memory_context", "")
+        round2 = state.get("round2_state", {})
+
+        tier1 = state.get("tier1_data", {})
+        risk_data = tier1.get("risk", {})
+
+        # 硬风控 3: 冲击成本/仓位
+        hard_risk = HardRiskController()
+        risk3 = hard_risk.check_all(
+            code=ticker,
+            daily_volume_cny=risk_data.get("daily_volume", 0),
+            current_position_pct=risk_data.get("current_position", 0),
+            proposed_pct=0.10,  # 默认建议 10%
+        )
+
+        # 软风控
+        soft_risk = SoftRiskController()
+        soft_assessment = soft_risk.assess_all()
+
+        # 汇总各 Agent 结论
+        summary_lines = []
+
+        if market_rpt:
+            summary_lines.append(
+                f"Market Agent: 市场{market_rpt.market_state}, "
+                f"仓位上限{market_rpt.position_cap:.0%}, "
+                f"资金{market_rpt.capital_confirmation}"
+            )
+        if event_rpt:
+            summary_lines.append(
+                f"Event Agent: [{event_rpt.event_type}] "
+                f"{event_rpt.direction}({event_rpt.confidence:.0%}), "
+                f"链条{event_rpt.chain_quality}"
+            )
+        if analysis_rpt:
+            summary_lines.append(
+                f"Analysis Agent: 板块评分{analysis_rpt.sector_score or 'N/A'}, "
+                f"Top股票{len(analysis_rpt.stock_rankings)}只"
+            )
+        if backtest_rpt:
+            summary_lines.append(
+                f"Backtest Agent: {backtest_rpt.sample_size}样本, "
+                f"胜率{backtest_rpt.win_rate:.0%}, "
+                f"超额{backtest_rpt.avg_excess_return:+.2%}"
+            )
+
+        agent_summary = "\n".join(summary_lines)
+
+        round2_summary = ""
+        if round2 and round2.get("contradictions"):
+            round2_summary = "\n".join(
+                f"- {c}" for c in round2["contradictions"]
+            )
+
         prompt = f"""你是 System Agent, 负责最终裁定。
 
 ## 标的
 {ticker} ({trade_date})
 
-## 硬风控结果
-{risk_verdict}
+## 各 Agent 分析汇总
+{agent_summary}
 
-## 市场分析
-{market_rpt}
+## Round 2 争议
+{round2_summary or '无明显矛盾'}
 
-## 事件分析
-{event_rpt}
+## 硬风控
+{risk3}
 
-## 因子分析
-{analysis_rpt}
-
-## 回测验证
-{backtest_rpt}
+## 软风控
+{soft_assessment}
 
 ## 历史记忆
-{memory_ctx[:500] if memory_ctx else "暂无"}
+{memory_ctx[:400] if memory_ctx else "暂无"}
 
-请进行最终裁定:
-1. 推荐: Alpha 清晰 + 资金确认 + 因子支持 + 回测有效 + 风控通过
-2. 观察: Alpha 存在但样本不足/资金背离/估值过高/链条偏弱
-3. 拒绝: 风控不通过/Alpha 不清晰/反例强/成本过高
+## 裁定规则
+推荐: Alpha 清晰 + 资金确认 + 因子支持 + 回测有效 + 风控通过
+观察: Alpha 存在但样本不足/资金背离/估值过高/链条偏弱
+拒绝: 风控不通过/Alpha 不清晰/反例强/成本过高
 
-每条推荐必须绑定 Alpha 来源。输出结构化裁定结果。"""
+每个推荐必须绑定 Alpha 来源。
+硬风控 HARD_VETO 不可覆盖, 必须输出拒绝。"""
 
         try:
             decision = llm.chat(
                 messages=[
-                    ("system", "你是 A 股交易系统组长。严格遵守硬风控, 不输出无 Alpha 来源的推荐。"),
+                    ("system",
+                     "你是 A 股交易系统组长。"
+                     "严格遵守硬风控结果。"
+                     "不输出无 Alpha 来源的推荐。"),
                     ("human", prompt),
                 ],
                 response_format=SystemDecision,
             )
         except Exception as e:
-            logger.warning("LLM system decision failed, defaulting to watch: %s", e)
+            logger.warning("LLM decision failed, defaulting to watch: %s", e)
             decision = SystemDecision(
                 decision=DecisionType.WATCH,
                 alpha_source=[],
                 horizon_days=5,
                 reasons=["LLM 不可用, 默认观察"],
                 objections=["无法获取 LLM 裁定"],
-                risk_verdict="PASS" if risk_verdict.verdict == RiskVerdictType.PASS else "SOFT_VETO",
-                risk_details=risk_verdict.reasons,
+                risk_verdict=RiskVerdict.PASS if risk3.verdict == RiskVerdictType.PASS else RiskVerdict.SOFT_VETO,
+                risk_details=risk3.reasons,
                 reasoning="LLM 降级: 默认观察",
             )
 
+        # 硬风控 3 覆盖 (HARD_VETO 不可被 LLM 覆盖)
+        if risk3.verdict == RiskVerdictType.HARD_VETO:
+            decision.decision = DecisionType.REJECT
+            decision.risk_verdict = RiskVerdict.HARD_VETO
+            decision.position = 0
+            decision.reasons = [f"硬风控3否决: {'; '.join(risk3.reasons)}"]
+            decision.risk_details = risk3.reasons
+            decision.reasoning = "硬风控不通过"
+
         return {
             "system_decision_obj": decision,
-            "system_decision_state": "completed",
+            "risk_check_3": {
+                "verdict": decision.risk_verdict.value,
+                "reasons": risk3.reasons,
+            },
+            "system_state": "completed",
+            "sender": "System Agent",
         }
 
-    return system_node
+    return {"init": init_node, "round2_judge": round2_judge_node, "final": final_decision_node}

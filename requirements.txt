@@ -1,0 +1,14 @@
+# 安装核心依赖
+#   pip install -r requirements.txt
+#
+# 安装全部 (含 A 股数据源 + Anthropic)
+#   pip install -r requirements.txt --extra-index-url ...
+#
+# 锁定版 (精确复现环境)
+#   pip install -r requirements.lock
+#
+# 开发依赖
+#   pip install -e ".[dev,akshare,tushare,anthropic]"
+
+-e .
+.[dev,akshare,tushare,anthropic]

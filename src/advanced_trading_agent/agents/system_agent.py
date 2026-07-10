@@ -22,12 +22,10 @@ import logging
 from datetime import date
 from typing import Any
 
-from ..core.cache_manager import Tier1Data, decide_tier2_loading
+from ..core.cache_manager import Tier1Data, WINTER_SENTIMENTS, decide_tier2_loading
 from ..core.data_quality import DataQualityChecker
 from ..llm.client import LLMClient
-from ..risk.hard_risk import HardRiskController, RiskVerdictType
 from ..risk.soft_risk import SoftRiskController
-from ..tool_nodes.market_tools import MarketTools
 from .schemas import DecisionType, RiskVerdict, SystemDecision
 
 logger = logging.getLogger(__name__)
@@ -37,9 +35,10 @@ def create_system_agent(llm: LLMClient):
     """创建 System Agent 节点函数"""
 
     def init_node(state: dict[str, Any]) -> dict[str, Any]:
-        """初始化节点: 数据质量检查 + Memory 召回 + 硬风控1
+        """初始化节点: 数据质量检查 + 判断 Winter 模式 + Tier2 加载决策
 
         这个节点在 Market Agent 之前执行。
+        硬风控1 (ST/停牌/退市) 已在 Risk Check 1 节点完成。
         """
         ticker = state.get("company_of_interest", "")
         trade_date = state.get("trade_date", str(date.today()))
@@ -48,42 +47,9 @@ def create_system_agent(llm: LLMClient):
         # 数据质量检查
         quality = DataQualityChecker.check_tier1(tier1)
 
-        # 硬风控 1: ST/停牌/退市
-        risk_data = tier1.get("risk", {})
-        hard_risk = HardRiskController()
-        risk1 = hard_risk.check_all(
-            code=ticker,
-            st_list=risk_data.get("st_list"),
-            suspended_list=risk_data.get("suspended_list"),
-            delisting_list=risk_data.get("delisting_list"),
-        )
-
-        if risk1.verdict == RiskVerdictType.HARD_VETO:
-            # 硬风控否决 → 直接结束
-            logger.warning("硬风控1否决 %s: %s", ticker, risk1.reasons)
-            return {
-                "risk_check_1": {
-                    "verdict": "HARD_VETO",
-                    "reasons": risk1.reasons,
-                    "suggested": risk1.suggested_actions,
-                },
-                "system_state": "vetoed",
-                "system_decision_obj": SystemDecision(
-                    decision=DecisionType.REJECT,
-                    position=0,
-                    alpha_source=[],
-                    horizon_days=5,
-                    reasons=[f"硬风控1否决: {'; '.join(risk1.reasons)}"],
-                    objections=risk1.reasons,
-                    risk_verdict=RiskVerdict.HARD_VETO,
-                    risk_details=risk1.reasons,
-                    reasoning="硬风控不通过, 终止分析",
-                ),
-            }
-
         # 判断是否 Winter 模式
         sentiment = tier1.get("sentiment", {}).get("sentiment", "正常")
-        winter = sentiment in ("冰点", "低迷")
+        winter = sentiment in WINTER_SENTIMENTS
 
         tier2_decision = decide_tier2_loading(
             Tier1Data(
@@ -96,10 +62,6 @@ def create_system_agent(llm: LLMClient):
 
         return {
             "data_quality_report": quality,
-            "risk_check_1": {
-                "verdict": "PASS",
-                "reasons": risk1.reasons or [],
-            },
             "system_state": "running",
             "tier1_data": {**tier1, "winter_mode": winter},
         }
@@ -153,7 +115,8 @@ def create_system_agent(llm: LLMClient):
     def final_decision_node(state: dict[str, Any]) -> dict[str, Any]:
         """最终裁定: LLM 综合 + 硬风控 3
 
-        读取所有 Agent 报告, 执行硬风控 3, LLM 输出最终裁定。
+        读取所有 Agent 报告和 Risk Check 3 结果, LLM 输出最终裁定。
+        硬风控 3 结果不可被 LLM 覆盖。
         """
         ticker = state.get("company_of_interest", "")
         trade_date = state.get("trade_date", str(date.today()))
@@ -165,17 +128,10 @@ def create_system_agent(llm: LLMClient):
         memory_ctx = state.get("memory_context", "")
         round2 = state.get("round2_state", {})
 
-        tier1 = state.get("tier1_data", {})
-        risk_data = tier1.get("risk", {})
-
-        # 硬风控 3: 冲击成本/仓位
-        hard_risk = HardRiskController()
-        risk3 = hard_risk.check_all(
-            code=ticker,
-            daily_volume_cny=risk_data.get("daily_volume", 0),
-            current_position_pct=risk_data.get("current_position", 0),
-            proposed_pct=0.10,  # 默认建议 10%
-        )
+        # 读取硬风控 3 结果 (由 Risk Check 3 节点计算)
+        risk3 = state.get("risk_check_3", {})
+        risk3_verdict = risk3.get("verdict", "PASS")
+        risk3_reasons = risk3.get("reasons", [])
 
         # 软风控
         soft_risk = SoftRiskController()
@@ -263,25 +219,26 @@ def create_system_agent(llm: LLMClient):
                 horizon_days=5,
                 reasons=["LLM 不可用, 默认观察"],
                 objections=["无法获取 LLM 裁定"],
-                risk_verdict=RiskVerdict.PASS if risk3.verdict == RiskVerdictType.PASS else RiskVerdict.SOFT_VETO,
-                risk_details=risk3.reasons,
+                risk_verdict=RiskVerdict.PASS if risk3_verdict == "PASS" else RiskVerdict.SOFT_VETO,
+                risk_details=risk3_reasons,
                 reasoning="LLM 降级: 默认观察",
             )
 
         # 硬风控 3 覆盖 (HARD_VETO 不可被 LLM 覆盖)
-        if risk3.verdict == RiskVerdictType.HARD_VETO:
+        is_veto = risk3_verdict == "HARD_VETO"
+        if is_veto:
             decision.decision = DecisionType.REJECT
             decision.risk_verdict = RiskVerdict.HARD_VETO
             decision.position = 0
-            decision.reasons = [f"硬风控3否决: {'; '.join(risk3.reasons)}"]
-            decision.risk_details = risk3.reasons
+            decision.reasons = [f"硬风控3否决: {'; '.join(risk3_reasons)}"]
+            decision.risk_details = risk3_reasons
             decision.reasoning = "硬风控不通过"
 
         return {
             "system_decision_obj": decision,
             "risk_check_3": {
                 "verdict": decision.risk_verdict.value,
-                "reasons": risk3.reasons,
+                "reasons": risk3_reasons,
             },
             "system_state": "completed",
             "sender": "System Agent",

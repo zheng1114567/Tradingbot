@@ -9,8 +9,8 @@ description = "多智能体量化交易分析系统 — A股盘后观察池"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    "langgraph>=0.4.0",
-    "langchain-core>=0.3.0",
+    "langgraph>=1.1.0",
+    "langchain-core>=1.4.0",
     "pandas>=2.1.0",
     "numpy>=1.26.0",
     "pydantic>=2.5.0",
@@ -33,6 +33,8 @@ dev = [
 # A股数据源
 tushare = ["tushare>=1.12.0"]
 akshare = ["akshare>=1.14.0"]
+# LLM 供应商
+anthropic = ["anthropic>=0.84.0"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

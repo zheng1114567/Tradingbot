@@ -134,6 +134,13 @@ class BacktestEngine:
         if alpha_source is None:
             alpha_source = []
 
+        if price_df.empty:
+            return BacktestResult(
+                run_date=date.today(), target_date=entry_date,
+                code=code, decision=decision, tradable=False,
+                benchmark=self.benchmark,
+            )
+
         # Point-in-time: 找到 entry_date 在数据中的位置
         price_df = price_df.sort_values("trade_date").reset_index(drop=True)
         try:
@@ -153,6 +160,7 @@ class BacktestEngine:
 
         # T+1: 最早次日卖出
         entry_price = entry_row.get("open", entry_row["close"])
+        exit_price = entry_price
         cost_buy = self.calc_trade_cost(is_buy=True)
 
         returns: dict[int, float | None] = {}
@@ -191,15 +199,10 @@ class BacktestEngine:
             cost_sell = self.calc_trade_cost(is_buy=False)
             raw_return = (exit_price - entry_price) / entry_price
             net_return = raw_return - (cost_buy + cost_sell) / 10000
-
             returns[days] = net_return
 
-            # 相对基准超额收益
-            bench_entry = price_df.loc[entry_idx].get("bench_close", entry_price)
-            bench_exit = price_df.loc[exit_idx].get("bench_close", bench_exit) if 'bench_exit' in dir() else entry_price
-            # 简化处理: benchmark 单独传入
-            returns[days] = net_return
-            excess_returns[days] = None  # 外部计算
+            # 相对基准超额收益 (外部计算, 由调用方传入 bench_close 列)
+            excess_returns[days] = None
 
             # 最大回撤
             for look_idx in range(entry_idx + 1, exit_idx + 1):
@@ -221,7 +224,7 @@ class BacktestEngine:
             decision=decision,
             alpha_source=alpha_source,
             entry_price=entry_price,
-            exit_price=exit_price if 'exit_price' in dir() else None,
+            exit_price=exit_price,
             holding_days=actual_days,
             returns=returns,
             excess_returns=excess_returns,

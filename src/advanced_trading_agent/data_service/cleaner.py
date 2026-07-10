@@ -76,7 +76,7 @@ class DataCleaner:
         for idx, row in df.iterrows():
             pct = row.get("pct_chg", 0)
             code = str(row.get("code", ""))
-            if "ST" in code or "*ST" in code:
+            if "ST" in code:  # 同时匹配 ST 和 *ST
                 limit = 5.0
             elif code.startswith("68") or code.startswith("30"):  # 科创/创业板
                 limit = 20.0

@@ -45,10 +45,16 @@ class LLMClient:
             api_key = os.environ.get("OPENAI_API_KEY", "")
             self._client = OpenAI(api_key=api_key)
         elif self.provider == "anthropic":
-            # Anthropic 通过 OpenAI 兼容模式
+            # Anthropic 使用独立的 anthropic SDK (非 OpenAI 兼容)
+            try:
+                from anthropic import Anthropic
+            except ImportError:
+                raise ImportError(
+                    "anthropic provider requires `pip install anthropic`"
+                )
             api_key = os.environ.get("ANTHROPIC_API_KEY", "")
-            base_url = os.environ.get("ANTHROPIC_BASE_URL", "https://api.anthropic.com/v1")
-            self._client = OpenAI(api_key=api_key, base_url=base_url)
+            self._client = Anthropic(api_key=api_key)
+            return self._client
         else:
             # 自定义 OpenAI 兼容端点
             api_key = os.environ.get(f"{self.provider.upper()}_API_KEY", "")
@@ -57,27 +63,10 @@ class LLMClient:
 
         return self._client
 
-    def chat(self, messages: list[dict[str, str]],
-             response_format: type | None = None,
-             temperature: float | None = None,
-             max_tokens: int = 4096) -> str:
-        """调用 LLM 聊天
-
-        Args:
-            messages: [{"role": "system", "content": "..."}, {"role": "user", "content": "..."}]
-            response_format: Pydantic 模型 (用 structured output)
-            temperature: 采样温度
-            max_tokens: 最大 token 数
-        """
-        kwargs = {
-            "model": self.model,
-            "messages": messages,
-            "temperature": temperature or self.temperature,
-            "max_tokens": max_tokens,
-        }
-
+    def _call_openai(self, kwargs: dict[str, Any],
+                      response_format: type | None = None) -> str:
+        """调用 OpenAI 兼容 API"""
         if response_format is not None:
-            # Pydantic 结构化输出
             kwargs["response_format"] = {
                 "type": "json_schema",
                 "json_schema": {
@@ -87,21 +76,91 @@ class LLMClient:
                 },
             }
 
+        response = self.client.chat.completions.create(**kwargs)
+        content = response.choices[0].message.content or ""
+
+        if response_format is not None:
+            return self._parse_structured(content, response_format)
+
+        return content
+
+    def _call_anthropic(self, kwargs: dict[str, Any],
+                         response_format: type | None = None) -> str:
+        """调用 Anthropic API"""
+        import json
+
+        # 转换消息格式: OpenAI → Anthropic
+        system_msg = None
+        anthropic_messages = []
+        for m in kwargs["messages"]:
+            if m["role"] == "system":
+                system_msg = m["content"]
+            else:
+                anthropic_messages.append({
+                    "role": "user" if m["role"] == "user" else "assistant",
+                    "content": m["content"],
+                })
+
+        if response_format is not None:
+            system_msg = (
+                f"{system_msg}\n\nYou must respond with valid JSON conforming to "
+                f"this schema: {json.dumps(response_format.model_json_schema(), ensure_ascii=False)}"
+            )
+
+        params = {
+            "model": kwargs["model"],
+            "max_tokens": kwargs.get("max_tokens", 4096),
+            "messages": anthropic_messages,
+        }
+        if system_msg:
+            params["system"] = system_msg
+
+        response = self.client.messages.create(**params)
+        content = response.content[0].text if response.content else ""
+
+        if response_format is not None:
+            return self._parse_structured(content, response_format)
+
+        return content
+
+    @staticmethod
+    def _parse_structured(content: str, response_format: type) -> Any:
+        """解析 JSON 到 Pydantic"""
         try:
-            response = self.client.chat.completions.create(**kwargs)
-            content = response.choices[0].message.content or ""
-
-            if response_format is not None:
-                # 解析 JSON 到 Pydantic
-                try:
-                    import json
-                    parsed = json.loads(content)
-                    return response_format(**parsed)
-                except Exception as e:
-                    logger.warning("Failed to parse structured output: %s", e)
-                    return content
-
+            import json
+            parsed = json.loads(content)
+            return response_format(**parsed)
+        except Exception as e:
+            logger.warning("Failed to parse structured output: %s", e)
             return content
+
+    def chat(self, messages: list[dict[str, str]],
+             response_format: type | None = None,
+             temperature: float | None = None,
+             max_tokens: int = 4096) -> Any:
+        """调用 LLM 聊天
+
+        Args:
+            messages: [{"role": "system", "content": "..."}, {"role": "user", "content": "..."}]
+            response_format: Pydantic 模型 (用 structured output)
+            temperature: 采样温度
+            max_tokens: 最大 token 数
+
+        Returns:
+            如果指定了 response_format, 返回 Pydantic 实例;
+            否则返回 str.
+        """
+        kwargs = {
+            "model": self.model,
+            "messages": messages,
+            "temperature": temperature or self.temperature,
+            "max_tokens": max_tokens,
+        }
+
+        try:
+            if self.provider == "anthropic":
+                return self._call_anthropic(kwargs, response_format=response_format)
+            return self._call_openai(kwargs, response_format=response_format)
         except Exception as e:
             logger.error("LLM call failed: %s", e)
             raise

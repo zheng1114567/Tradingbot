@@ -27,18 +27,18 @@ class EventTools:
 
     def search_cailianshe_news(self, keyword: str,
                                  days_back: int = 3) -> list[dict[str, Any]]:
-        """搜索财联社新闻 (A股资讯核心源)
+        """搜索财经新闻 (akshare 全球财经资讯)
 
-        财联社以快讯著称, 适合捕捉事件驱动机会
+        使用 akshare 的 stock_info_global() 获取全球财经资讯,
+        通过关键词过滤相关新闻。
         """
-        cache_key = f"cls:{keyword}:{days_back}"
+        cache_key = f"news:{keyword}:{days_back}"
         cached = self.cache.get(cache_key)
         if cached:
             return cached
 
         try:
             import akshare as ak
-            # akshare 的财联社接口
             df = ak.stock_info_global()
             if df is not None and not df.empty:
                 records = df.to_dict("records")
@@ -53,37 +53,16 @@ class EventTools:
         except ImportError:
             logger.warning("akshare not installed")
         except Exception as e:
-            logger.warning("财联社搜索失败: %s", e)
+            logger.warning("新闻搜索失败: %s", e)
         return []
 
     def search_eastmoney_news(self, keyword: str,
                                days_back: int = 3) -> list[dict[str, Any]]:
-        """搜索东方财富新闻
+        """搜索 A 股个股新闻资讯 (akshare stock_info_global)
 
-        东方财富: A股最大的财经资讯平台
+        与 search_news 使用相同数据源, 提供别名方便后续扩展。
         """
-        cache_key = f"eastmoney:{keyword}:{days_back}"
-        cached = self.cache.get(cache_key)
-        if cached:
-            return cached
-
-        try:
-            import akshare as ak
-            df = ak.stock_info_global()
-            if df is not None and not df.empty:
-                records = df.to_dict("records")
-                filtered = [
-                    r for r in records
-                    if keyword.lower() in str(r).lower()
-                ]
-                result = filtered[:20]
-                self.cache.set(cache_key, result)
-                return result
-        except ImportError:
-            logger.warning("akshare not installed")
-        except Exception as e:
-            logger.warning("东方财富搜索失败: %s", e)
-        return []
+        return self.search_cailianshe_news(keyword, days_back)
 
     def get_company_announcements(self, code: str,
                                    days_back: int = 30) -> list[dict[str, Any]]:
@@ -110,6 +89,7 @@ class EventTools:
         """获取财经日历事件
 
         包括: 宏观经济数据公布, 央行决议, 重要会议等
+        当前使用 akshare stock_info_global, 后续接入专业财经日历 API。
         """
         cache_key = f"calendar:{start_date}:{end_date}"
         cached = self.cache.get(cache_key)
@@ -156,7 +136,7 @@ class EventTools:
 _tools = EventTools()
 
 def search_news(**kwargs) -> str:
-    """搜索 A 股财经新闻 (财联社+东方财富)"""
+    """搜索 A 股财经新闻"""
     keyword = kwargs.get("keyword", "")
     results = _tools.search_cailianshe_news(keyword)
     results.extend(_tools.search_eastmoney_news(keyword))

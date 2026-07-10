@@ -249,9 +249,45 @@ def get_northbound_flow_akshare(trade_date: str | None = None) -> dict[str, Any]
     return {"net_inflow": 0}
 
 
-def get_limit_up_tiers_stub(trade_date: str | None = None) -> dict[str, int]:
-    """涨停梯队分析 (stub, 后续接入真实数据)"""
-    return {"first_board": 0, "second_board": 0, "third_plus": 0, "note": "stub实现"}
+def get_limit_up_tiers_akshare(trade_date: str | None = None) -> dict[str, int]:
+    """涨停梯队分析 — 使用 akshare 东方财富涨停板数据
+
+    返回首板/二板/三板及以上数量。
+    """
+    td = trade_date or date.today().strftime("%Y%m%d")
+    td = td.replace("-", "")
+    try:
+        import akshare as ak
+        df = ak.stock_zt_pool_em(date=td)
+        if df is None or df.empty:
+            logger.info("涨停板数据为空 (交易日: %s)", td)
+            return {"first_board": 0, "second_board": 0, "third_plus": 0}
+
+        # 从 "封板资金"、"涨停统计" 等列判断连板数
+        # akshare 返回的列中包含 "连板数" 或 "board" 相关字段
+        records = df.to_dict("records")
+        first_board = 0
+        second_board = 0
+        third_plus = 0
+        for r in records:
+            board_count = r.get("连板数", r.get("连续涨停", 0))
+            if board_count == 0:
+                # 很多情况下连板数为 0 也是首板
+                first_board += 1
+            elif board_count == 1:
+                first_board += 1
+            elif board_count == 2:
+                second_board += 1
+            else:
+                third_plus += 1
+
+        return {"first_board": first_board, "second_board": second_board, "third_plus": third_plus}
+    except ImportError:
+        logger.warning("akshare not installed, using default limit-up data")
+        return {"first_board": 0, "second_board": 0, "third_plus": 0}
+    except Exception as e:
+        logger.warning("涨停板数据获取失败: %s", e)
+        return {"first_board": 0, "second_board": 0, "third_plus": 0}
 
 
 def get_sector_tushare_full(top_n: int = 10) -> list[dict[str, Any]]:
@@ -267,9 +303,54 @@ def get_sector_tushare_full(top_n: int = 10) -> list[dict[str, Any]]:
     return []
 
 
-def get_factors_stub(code: str = "", sector: str = "") -> list[dict[str, Any]]:
-    """因子数据 (stub, 后续接入 Pre-computed factor DB)"""
-    return []
+def get_factors_computed(code: str = "", sector: str = "") -> list[dict[str, Any]]:
+    """因子数据 — 通过 FactorCalculator 从行情数据实时计算
+
+    1. 获取近 365 天的日K
+    2. 用 FactorCalculator 计算六因子
+    3. 返回最新一期的因子值
+    """
+    if not code:
+        return []
+
+    from .cleaner import DataCleaner
+    from .factors import FactorCalculator
+
+    try:
+        # 通过路由获取日K (优先 tushare, 降级 akshare)
+        from .vendor_router import route_to_vendor
+        daily = route_to_vendor("get_daily", code=code)
+        if isinstance(daily, str) or not daily:
+            return []
+
+        df = DataCleaner.clean_daily(daily)
+        if df.empty:
+            return []
+
+        # 计算因子
+        df = FactorCalculator.run_all(df)
+        if df.empty:
+            return []
+
+        # 取最新一行
+        latest = df.iloc[-1].to_dict()
+        result = [{
+            "code": code,
+            "name": latest.get("name", ""),
+            "sector": sector,
+            "quality_score": latest.get("roe"),
+            "growth_score": latest.get("revenue_growth"),
+            "valuation_score": latest.get("pe_quantile", latest.get("pb_quantile")),
+            "momentum_score": latest.get("momentum_20d"),
+            "volatility_score": latest.get("volatility"),
+            "liquidity_score": latest.get("amihud"),
+            "composite_score": latest.get("composite_score"),
+            "factor_warning": None,
+        }]
+        return result
+    except Exception as e:
+        logger.warning("因子计算失败 %s: %s", code, e)
+        return []
 
 
 def check_crowding_stub(sector: str = "") -> dict[str, Any]:
@@ -335,13 +416,15 @@ def register_all_vendors():
     register_vendor_impl("get_northbound_flow", "tushare", get_northbound_flow_tushare)
     register_vendor_impl("get_northbound_flow", "akshare", get_northbound_flow_akshare)
     # A股特有: 涨停梯队
-    register_vendor_impl("get_limit_up_tiers", "tushare", get_limit_up_tiers_stub)
+    register_vendor_impl("get_limit_up_tiers", "tushare", get_limit_up_tiers_akshare)
+    register_vendor_impl("get_limit_up_tiers", "akshare", get_limit_up_tiers_akshare)
     # A股特有: 龙虎榜
     register_vendor_impl("get_dragon_tiger", "tushare", get_dragon_tiger_tushare)
     # A股特有: 融资融券
     register_vendor_impl("get_margin", "tushare", get_margin_tushare)
     # 分析数据
-    register_vendor_impl("get_factors", "tushare", get_factors_stub)
+    register_vendor_impl("get_factors", "tushare", get_factors_computed)
+    register_vendor_impl("get_factors", "akshare", get_factors_computed)
     register_vendor_impl("check_crowding", "tushare", check_crowding_stub)
     register_vendor_impl("find_similar", "tushare", find_similar_stub)
 

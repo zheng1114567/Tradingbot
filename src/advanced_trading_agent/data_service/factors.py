@@ -198,6 +198,7 @@ class FactorCalculator:
         """运行所有因子计算"""
         if df.empty:
             return df
+        n_before = len(df.columns)
         df = FactorCalculator.roe(df)
         df = FactorCalculator.revenue_growth(df)
         df = FactorCalculator.profit_growth(df)
@@ -209,4 +210,6 @@ class FactorCalculator:
         df = FactorCalculator.max_drawdown(df)
         df = FactorCalculator.amihud_illiquidity(df)
         df = FactorCalculator.composite_score(df)
+        n_added = len(df.columns) - n_before
+        logger.debug("FactorCalculator.run_all: added %d columns", n_added)
         return df

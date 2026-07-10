@@ -54,26 +54,43 @@ def analyze_single(ticker: str, trade_date: str | None = None,
     return report
 
 
-def analyze_batch(tickers_file: str, debug: bool = False) -> list[str]:
-    """批量分析
+def analyze_batch(tickers_file: str, debug: bool = False,
+                  max_workers: int = 4) -> list[str]:
+    """批量分析 (并发执行)
 
     Args:
         tickers_file: 每行一个股票代码的文件
         debug: 是否打印调试信息
+        max_workers: 最大并发数 (默认 4)
     """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
     with open(tickers_file, "r", encoding="utf-8") as f:
         tickers = [line.strip() for line in f if line.strip()]
 
-    reports = []
-    for ticker in tickers:
-        logger.info("=== Analyzing %s ===", ticker)
-        try:
-            report = analyze_single(ticker, debug=debug)
-            reports.append(report)
-            logger.info("=== Done %s ===", ticker)
-        except Exception as e:
-            logger.error("Failed %s: %s", ticker, e)
-            reports.append(f"# {ticker}\n\n**失败**: {e}")
+    reports: list[str] = []
+    logger.info("Batch analyzing %d tickers (max_workers=%d)...", len(tickers), max_workers)
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_map = {
+            executor.submit(analyze_single, ticker, debug=debug): ticker
+            for ticker in tickers
+        }
+        for future in as_completed(future_map):
+            ticker = future_map[future]
+            try:
+                report = future.result()
+                reports.append(report)
+                logger.info("=== Done %s ===", ticker)
+            except Exception as e:
+                logger.error("Failed %s: %s", ticker, e)
+                reports.append(f"# {ticker}\n\n**失败**: {e}")
+
+    # 按原始 ticker 顺序排序
+    ticker_order = {t: i for i, t in enumerate(tickers)}
+    reports.sort(key=lambda r: min(
+        ticker_order.get(t, 999) for t in tickers if t in r
+    ))
 
     # 保存汇总
     summary_path = Path(config.get("results_dir", "data/results")) / "batch_summary.md"
@@ -89,13 +106,14 @@ def main():
     parser.add_argument("--ticker", "-t", help="股票代码 (如 000001.SZ)")
     parser.add_argument("--date", "-d", help="交易日 (默认今天)")
     parser.add_argument("--batch", "-b", help="批量分析文件路径")
+    parser.add_argument("--workers", type=int, default=4, help="批量并发数 (默认 4)")
     parser.add_argument("--debug", action="store_true", help="调试模式")
     parser.add_argument("--json", action="store_true", help="JSON 输出")
 
     args = parser.parse_args()
 
     if args.batch:
-        reports = analyze_batch(args.batch, debug=args.debug)
+        reports = analyze_batch(args.batch, debug=args.debug, max_workers=args.workers)
         print(f"Batch complete: {len(reports)} tickers analyzed")
         return
 

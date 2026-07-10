@@ -1,0 +1,424 @@
+"""Agent 单元测试 — 覆盖全部 5 个 Agent 的 LLM 路径和降级路径
+
+测试策略:
+- Mock LLMClient.chat() 返回预定义的 Pydantic 对象
+- Mock Tool 类返回受控数据
+- 测试正常路径 (LLM 成功)
+- 测试降级路径 (LLM 异常 → 规则兜底)
+"""
+from __future__ import annotations
+
+from datetime import date
+from typing import Any
+from unittest.mock import MagicMock, patch
+
+import pytest
+from advanced_trading_agent.agents.schemas import (
+    AnalysisReport,
+    BacktestReport,
+    Confidence,
+    DecisionType,
+    EventReport,
+    FinalReport,
+    MarketReport,
+    MemoryRecall,
+    RiskVerdict,
+    StockRanking,
+    SystemDecision,
+)
+from advanced_trading_agent.agents.market_agent import create_market_agent
+from advanced_trading_agent.agents.event_agent import create_event_agent
+from advanced_trading_agent.agents.analysis_agent import create_analysis_agent
+from advanced_trading_agent.agents.backtest_agent import create_backtest_agent
+from advanced_trading_agent.agents.system_agent import create_system_agent
+from advanced_trading_agent.agents.report_agent import create_report_agent
+
+
+# ============================================================
+# Mock LLM
+# ============================================================
+
+class MockLLM:
+    """Mock LLMClient — chat 方法返回预设 Pydantic 对象"""
+
+    def __init__(self, return_value: Any = None, raise_error: bool = False):
+        self._return = return_value
+        self._raise = raise_error
+        self.last_kwargs = None
+
+    def chat(self, messages, response_format=None, temperature=None, max_tokens=4096):
+        self.last_kwargs = {
+            "messages": messages,
+            "response_format": response_format,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+        }
+        if self._raise:
+            raise RuntimeError("Mock LLM error")
+        if self._return is not None:
+            return self._return
+        if response_format:
+            return _default_for(response_format)
+        return "mock response"
+
+    @property
+    def client(self):
+        return "mock"
+
+
+_DEFAULTS: dict = {}
+
+
+def _default_for(model_class):
+    """为 Pydantic 类生成默认实例的深拷贝"""
+    if model_class not in _DEFAULTS:
+        _DEFAULTS[model_class] = {
+            MarketReport: MarketReport(
+                market_state="正常", position_cap=0.6,
+                capital_confirmation="资金确认", reasoning="mock",
+            ),
+            EventReport: EventReport(
+                event_id="mock_e1", event_type="政策", direction="利好",
+                confidence=0.6, transmission_path="mock", evidence_level="权威媒体",
+                pricing_status="未定价", chain_quality="direct", reasoning="mock",
+            ),
+            AnalysisReport: AnalysisReport(
+                factor_explanation="mock", reasoning="mock",
+                stock_rankings=[
+                    StockRanking(code="000001.SZ", name="测试股",
+                                 composite_score=7.5, main_driver="mock因子")
+                ],
+            ),
+            BacktestReport: BacktestReport(
+                sample_size=30, win_rate=0.55, avg_excess_return=0.02,
+                confidence=Confidence.MEDIUM, reasoning="mock",
+            ),
+            SystemDecision: SystemDecision(
+                decision=DecisionType.RECOMMEND, position=0.1,
+                alpha_source=["mock"], horizon_days=5,
+                reasons=["mock支持"], objections=[],
+                risk_verdict=RiskVerdict.PASS, reasoning="mock",
+            ),
+        }[model_class]
+    return _DEFAULTS[model_class].model_copy(deep=True)
+
+
+# ============================================================
+# 共享 Fixtures
+# ============================================================
+
+@pytest.fixture
+def mock_llm():
+    return MockLLM()
+
+
+@pytest.fixture
+def mock_llm_fail():
+    return MockLLM(raise_error=True)
+
+
+@pytest.fixture
+def base_state():
+    """最小化 state，所有 Agent 都能跑"""
+    return {
+        "company_of_interest": "000001.SZ",
+        "trade_date": "2026-07-10",
+        "tier1_data": {
+            "market": {"index_close": 3000, "index_change_pct": 0.5},
+            "sentiment": {"sentiment": "正常", "sentiment_score": 55},
+            "capital": {"confirmation": "资金确认", "net_inflow_main": 1e8},
+            "risk": {"st_list": [], "suspended_list": [], "delisting_list": []},
+        },
+        "tier2_data": {
+            "factors": [],
+            "events": [],
+            "backtest_samples": [],
+        },
+    }
+
+
+# ============================================================
+# Market Agent 测试
+# ============================================================
+
+class TestMarketAgent:
+    """Market Agent — 市场温度分析"""
+
+    def test_happy_path(self, mock_llm, base_state):
+        node = create_market_agent(mock_llm)
+        result = node(base_state)
+        assert "market_report" in result
+        assert "market_report_obj" in result
+        assert isinstance(result["market_report_obj"], MarketReport)
+        assert result["sender"] == "Market Agent"
+
+    def test_llm_fallback_to_rules(self, mock_llm_fail, base_state):
+        node = create_market_agent(mock_llm_fail)
+        result = node(base_state)
+        obj = result["market_report_obj"]
+        assert isinstance(obj, MarketReport)
+        assert obj.market_state == "正常"
+        assert obj.position_cap == 0.6
+
+    def test_market_frozen_caps_position(self, mock_llm, base_state):
+        state = {**base_state, "tier1_data": {
+            **base_state["tier1_data"],
+            "sentiment": {"sentiment": "冰点", "sentiment_score": 10},
+        }}
+        node = create_market_agent(mock_llm)
+        result = node(state)
+        obj = result["market_report_obj"]
+        assert obj.position_cap == 0.2
+
+    def test_market_high_caps_position(self, mock_llm, base_state):
+        state = {**base_state, "tier1_data": {
+            **base_state["tier1_data"],
+            "sentiment": {"sentiment": "高潮", "sentiment_score": 90},
+        }}
+        node = create_market_agent(mock_llm)
+        result = node(state)
+        obj = result["market_report_obj"]
+        assert obj.position_cap == 0.3
+
+    def test_too_high_capped_by_rules(self, mock_llm, base_state):
+        llm = MockLLM(return_value=MarketReport(
+            market_state="低迷", position_cap=0.99,
+            capital_confirmation="资金背离", reasoning="test",
+        ))
+        node = create_market_agent(llm)
+        result = node(base_state)
+        obj = result["market_report_obj"]
+        assert obj.position_cap == 0.60
+
+
+# ============================================================
+# Event Agent 测试
+# ============================================================
+
+class TestEventAgent:
+    """Event Agent — 事件分析"""
+
+    def test_happy_path(self, mock_llm, base_state):
+        node = create_event_agent(mock_llm)
+        result = node(base_state)
+        assert "event_report" in result
+        assert "event_report_obj" in result
+        assert isinstance(result["event_report_obj"], EventReport)
+        assert result["sender"] == "Event Agent"
+
+    def test_llm_fallback(self, mock_llm_fail, base_state):
+        node = create_event_agent(mock_llm_fail)
+        result = node(base_state)
+        obj = result["event_report_obj"]
+        assert isinstance(obj, EventReport)
+        assert obj.chain_quality == "weak"
+
+    def test_with_tier2_events(self, mock_llm, base_state):
+        state = {**base_state, "tier2_data": {
+            "events": [{"event_id": "e1", "event_type": "政策", "summary": "降准",
+                        "direction": "利好", "confidence": 0.8}],
+        }}
+        node = create_event_agent(mock_llm)
+        result = node(state)
+        obj = result["event_report_obj"]
+        assert isinstance(obj, EventReport)
+
+
+# ============================================================
+# Analysis Agent 测试
+# ============================================================
+
+class TestAnalysisAgent:
+    """Analysis Agent — 因子分析"""
+
+    def test_happy_path(self, mock_llm, base_state):
+        node = create_analysis_agent(mock_llm)
+        result = node(base_state)
+        assert "analysis_report" in result
+        assert "analysis_report_obj" in result
+        assert isinstance(result["analysis_report_obj"], AnalysisReport)
+        assert result["sender"] == "Analysis Agent"
+
+    def test_llm_fallback(self, mock_llm_fail, base_state):
+        node = create_analysis_agent(mock_llm_fail)
+        result = node(base_state)
+        obj = result["analysis_report_obj"]
+        assert isinstance(obj, AnalysisReport)
+        assert len(obj.stock_rankings) == 0
+
+    def test_deterministic_ranking_used(self, mock_llm, base_state):
+        llm = MockLLM(return_value=AnalysisReport(
+            factor_explanation="test", reasoning="test",
+            stock_rankings=[StockRanking(code="X", name="LLM虚构",
+                                         composite_score=9.9, main_driver="虚构")],
+        ))
+        node = create_analysis_agent(llm)
+        result = node(base_state)
+        obj = result["analysis_report_obj"]
+        # 无因子数据时, 确定性排序为空, LLM 排序被保留
+        assert len(obj.stock_rankings) == 1
+
+
+# ============================================================
+# Backtest Agent 测试
+# ============================================================
+
+class TestBacktestAgent:
+    """Backtest Agent — 回测验证"""
+
+    def test_happy_path(self, mock_llm, base_state):
+        node = create_backtest_agent(mock_llm)
+        result = node(base_state)
+        assert "backtest_report" in result
+        assert "backtest_report_obj" in result
+        assert isinstance(result["backtest_report_obj"], BacktestReport)
+        assert result["sender"] == "Backtest Agent"
+
+    def test_llm_fallback(self, mock_llm_fail, base_state):
+        node = create_backtest_agent(mock_llm_fail)
+        result = node(base_state)
+        obj = result["backtest_report_obj"]
+        assert isinstance(obj, BacktestReport)
+        assert obj.confidence == Confidence.LOW
+
+    def test_with_backtest_samples(self, mock_llm, base_state):
+        state = {**base_state, "tier2_data": {
+            "backtest_samples": [{
+                "sample_size": 50, "win_rate": 0.6,
+                "avg_excess_return": 0.03, "confidence": "high",
+            }],
+        }}
+        node = create_backtest_agent(mock_llm)
+        result = node(state)
+        obj = result["backtest_report_obj"]
+        assert isinstance(obj, BacktestReport)
+
+    def test_confidence_capped_when_low_samples(self, mock_llm, base_state):
+        llm = MockLLM(return_value=BacktestReport(
+            sample_size=5, win_rate=0.6, avg_excess_return=0.02,
+            confidence=Confidence.HIGH, reasoning="mock",
+        ))
+        node = create_backtest_agent(llm)
+        result = node(base_state)
+        obj = result["backtest_report_obj"]
+        assert obj.confidence == Confidence.MEDIUM
+
+
+# ============================================================
+# System Agent 测试
+# ============================================================
+
+class TestSystemAgent:
+    """System Agent — 初始化+裁定"""
+
+    def test_init_node(self, mock_llm, base_state):
+        sa = create_system_agent(mock_llm)
+        result = sa["init"](base_state)
+        assert "data_quality_report" in result
+        assert "system_state" in result
+        assert result["system_state"] == "running"
+
+    def test_init_node_winter_mode(self, mock_llm, base_state):
+        state = {**base_state, "tier1_data": {
+            **base_state["tier1_data"],
+            "sentiment": {"sentiment": "冰点", "sentiment_score": 8},
+        }}
+        sa = create_system_agent(mock_llm)
+        result = sa["init"](state)
+        assert result["tier1_data"].get("winter_mode") is True
+
+    def test_round2_judge_no_contradiction(self, mock_llm, base_state):
+        sa = create_system_agent(mock_llm)
+        result = sa["round2_judge"](base_state)
+        assert result["round2_state"]["active"] is False
+        assert result["round2_state"]["completed"] is True
+
+    def test_round2_judge_with_contradiction(self, mock_llm, base_state):
+        state = {
+            **base_state,
+            "market_report_obj": MarketReport(
+                market_state="正常", position_cap=0.6,
+                capital_confirmation="资金背离", reasoning="test",
+            ),
+            "event_report_obj": EventReport(
+                event_id="e1", event_type="政策", direction="利好",
+                confidence=0.8, transmission_path="直接受益",
+                evidence_level="权威媒体", pricing_status="未定价",
+                chain_quality="direct", reasoning="test",
+            ),
+            "backtest_report_obj": BacktestReport(
+                sample_size=30, win_rate=0.6, avg_excess_return=0.02,
+                confidence=Confidence.MEDIUM, reasoning="test",
+            ),
+        }
+        sa = create_system_agent(mock_llm)
+        result = sa["round2_judge"](state)
+        assert result["round2_state"]["active"] is True
+        assert len(result["round2_state"]["contradictions"]) > 0
+
+    def test_final_decision(self, mock_llm, base_state):
+        sa = create_system_agent(mock_llm)
+        state = {
+            **base_state,
+            "risk_check_3": {"verdict": "PASS", "reasons": []},
+            "market_report_obj": _default_for(MarketReport),
+        }
+        result = sa["final"](state)
+        assert "system_decision_obj" in result
+        assert isinstance(result["system_decision_obj"], SystemDecision)
+        assert result["system_state"] == "completed"
+
+    def test_final_decision_llm_fallback(self, mock_llm_fail, base_state):
+        sa = create_system_agent(mock_llm_fail)
+        state = {
+            **base_state,
+            "risk_check_3": {"verdict": "PASS", "reasons": []},
+        }
+        result = sa["final"](state)
+        decision = result["system_decision_obj"]
+        assert decision.decision == DecisionType.WATCH
+        assert "LLM 不可用" in decision.reasons[0]
+
+    def test_final_hard_veto_override(self, mock_llm, base_state):
+        sa = create_system_agent(mock_llm)
+        state = {
+            **base_state,
+            "risk_check_3": {"verdict": "HARD_VETO", "reasons": ["测试拒绝"]},
+            "market_report_obj": _default_for(MarketReport),
+        }
+        result = sa["final"](state)
+        decision = result["system_decision_obj"]
+        assert decision.decision == DecisionType.REJECT
+        assert decision.risk_verdict == RiskVerdict.HARD_VETO
+
+
+# ============================================================
+# Report Agent 测试
+# ============================================================
+
+class TestReportAgent:
+    """Report Agent — 报告输出"""
+
+    def test_with_decision(self, base_state):
+        node = create_report_agent()
+        state = {
+            **base_state,
+            "system_decision_obj": SystemDecision(
+                decision=DecisionType.RECOMMEND, position=0.1,
+                alpha_source=["因子"], horizon_days=5,
+                reasons=["好"], objections=[],
+                risk_verdict=RiskVerdict.PASS, reasoning="test",
+            ),
+        }
+        result = node(state)
+        assert "final_report" in result
+        assert "final_report_obj" in result
+        report = result["final_report_obj"]
+        assert isinstance(report, FinalReport)
+        assert report.decision == DecisionType.RECOMMEND
+
+    def test_without_decision(self, base_state):
+        node = create_report_agent()
+        result = node(base_state)
+        report = result["final_report_obj"]
+        assert report.decision == DecisionType.REJECT

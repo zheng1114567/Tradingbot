@@ -40,6 +40,8 @@ from ..agents import (
 )
 from ..agents.system_agent import create_system_agent
 from ..config import config
+from ..data_service.collector import register_all_vendors
+from ..data_service.vendor_router import route_to_vendor
 from ..llm.client import LLMClient
 from .conditional import (
     after_market,
@@ -88,13 +90,13 @@ def create_workflow() -> StateGraph:
 
     # 添加节点
     workflow.add_node("Risk Check 1", risk1_node)
+    workflow.add_node("System Init", sa_init)
     workflow.add_node("Memory Agent", memory_node)
     workflow.add_node("Market Agent", market_node)
     workflow.add_node("Event Agent", event_node)
     workflow.add_node("Analysis Agent", analysis_node)
     workflow.add_node("Backtest Agent", backtest_node)
     workflow.add_node("Risk Check 2", risk2_node)
-    workflow.add_node("System Init", sa_init)
     workflow.add_node("Round 2 Judge", sa_round2_judge)
     workflow.add_node("Round 2 Debate", _create_round2_node(llm))
     workflow.add_node("Risk Check 3", risk3_node)
@@ -106,14 +108,15 @@ def create_workflow() -> StateGraph:
     # START → 硬风控1
     workflow.add_edge(START, "Risk Check 1")
 
-    # 硬风控1: HARD_VETO → END, PASS → 继续
+    # 硬风控1: HARD_VETO → END, PASS → System Init
     workflow.add_conditional_edges(
         "Risk Check 1",
         after_risk_check_1,
-        {"round1": "Memory Agent", "end": END},
+        {"round1": "System Init", "end": END},
     )
 
-    # Memory → Market
+    # System Init → Memory → Market
+    workflow.add_edge("System Init", "Memory Agent")
     workflow.add_edge("Memory Agent", "Market Agent")
 
     # Market Agent: 冰点 → 跳过后续深度分析
@@ -239,6 +242,47 @@ class TradingSystem:
         self.mode = mode  # "live" or "backtest"
         self.workflow = create_workflow()
 
+    @staticmethod
+    def _load_data(ticker: str, trade_date: str) -> tuple[dict, dict]:
+        """自动加载 Tier 1 / Tier 2 数据, 返回 (tier1_data, tier2_data)
+
+        优先使用传入的自定义数据; 未传则尝试从供应商加载。
+        """
+        import logging
+        logger = logging.getLogger(__name__)
+
+        # 注册所有供应商 (幂等)
+        register_all_vendors()
+
+        tier1: dict[str, Any] = {}
+        tier2: dict[str, Any] = {}
+
+        # --- Tier 1: 市场摘要 ---
+        try:
+            market_data = route_to_vendor("get_daily", code="000001.SH",
+                                          start_date=trade_date, end_date=trade_date)
+            if isinstance(market_data, list) and market_data:
+                row = market_data[0] if isinstance(market_data[0], dict) else {}
+                tier1["market"] = {
+                    "index_close": row.get("close", 0),
+                    "index_change_pct": row.get("pct_chg", 0),
+                }
+        except Exception as e:
+            logger.warning("无法加载大盘数据: %s", e)
+
+        # --- Tier 2: 个股数据 ---
+        try:
+            from ..data_service.collector import get_daily_tushare, get_daily_akshare
+            # 尝试获取个股行情
+            daily = route_to_vendor("get_daily", code=ticker,
+                                    start_date=trade_date, end_date=trade_date)
+            if isinstance(daily, list) and daily:
+                tier2["price_data"] = daily
+        except Exception as e:
+            logger.warning("无法加载个股数据 (%s): %s", ticker, e)
+
+        return tier1, tier2
+
     def analyze(self, ticker: str, trade_date: str | None = None,
                 tier1_data: dict[str, Any] | None = None,
                 tier2_data: dict[str, Any] | None = None) -> tuple[dict[str, Any], str]:
@@ -254,6 +298,12 @@ class TradingSystem:
             (final_state, final_report_markdown)
         """
         trade_date = trade_date or str(date.today())
+
+        # 自动加载数据: 优先使用传入数据, 缺失时从供应商加载
+        if not tier1_data and not tier2_data:
+            tier1_data, tier2_data = self._load_data(ticker, trade_date)
+        tier1_data = tier1_data or {}
+        tier2_data = tier2_data or {}
 
         init_state = {
             "messages": [("human", f"分析 {ticker} {trade_date}")],

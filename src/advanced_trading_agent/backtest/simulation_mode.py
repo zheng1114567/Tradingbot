@@ -37,11 +37,8 @@ from ..agents.schemas import (
     StockRanking,
     SystemDecision,
 )
-# 情绪 → 仓位上限映射
-SENTIMENT_POSITION_CAP = {
-    "冰点": 0.20, "低迷": 0.40, "正常": 0.60,
-    "温热": 0.50, "高潮": 0.30,
-}
+# 情绪 → 仓位上限映射 (与 market_agent.py 共享)
+from ..agents.market_agent import SENTIMENT_POSITION_CAP
 from ..risk.hard_risk import HardRiskController, RiskVerdictType
 
 logger = logging.getLogger(__name__)

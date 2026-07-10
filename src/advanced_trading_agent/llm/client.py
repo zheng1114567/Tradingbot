@@ -1,0 +1,119 @@
+"""
+LLM 客户端 — 多供应商支持 (DeepSeek, OpenAI, Anthropic)
+
+借鉴 TradingAgents 的 llm_clients/*.py 模式,
+但简化了配置, 默认使用 DeepSeek。
+"""
+from __future__ import annotations
+
+import logging
+import os
+from typing import Any
+
+from openai import OpenAI
+
+from ..config import config
+
+logger = logging.getLogger(__name__)
+
+
+class LLMClient:
+    """LLM 客户端 — DeepSeek 优先, 支持降级"""
+
+    def __init__(self, provider: str | None = None,
+                 model: str | None = None,
+                 temperature: float | None = None):
+        cfg = config.get_all()
+        self.provider = provider or cfg.get("llm_provider", "deepseek")
+        self.model = model or cfg.get("deep_think_llm", "deepseek-chat")
+        self.temperature = temperature if temperature is not None else cfg.get("temperature", 0.1)
+        self._client = None
+
+    @property
+    def client(self) -> OpenAI:
+        """懒加载 OpenAI 兼容客户端"""
+        if self._client is not None:
+            return self._client
+
+        if self.provider == "deepseek":
+            api_key = os.environ.get("DEEPSEEK_API_KEY", "")
+            self._client = OpenAI(
+                api_key=api_key,
+                base_url="https://api.deepseek.com/v1",
+            )
+        elif self.provider == "openai":
+            api_key = os.environ.get("OPENAI_API_KEY", "")
+            self._client = OpenAI(api_key=api_key)
+        elif self.provider == "anthropic":
+            # Anthropic 通过 OpenAI 兼容模式
+            api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+            base_url = os.environ.get("ANTHROPIC_BASE_URL", "https://api.anthropic.com/v1")
+            self._client = OpenAI(api_key=api_key, base_url=base_url)
+        else:
+            # 自定义 OpenAI 兼容端点
+            api_key = os.environ.get(f"{self.provider.upper()}_API_KEY", "")
+            base_url = os.environ.get(f"{self.provider.upper()}_BASE_URL", "")
+            self._client = OpenAI(api_key=api_key, base_url=base_url)
+
+        return self._client
+
+    def chat(self, messages: list[dict[str, str]],
+             response_format: type | None = None,
+             temperature: float | None = None,
+             max_tokens: int = 4096) -> str:
+        """调用 LLM 聊天
+
+        Args:
+            messages: [{"role": "system", "content": "..."}, {"role": "user", "content": "..."}]
+            response_format: Pydantic 模型 (用 structured output)
+            temperature: 采样温度
+            max_tokens: 最大 token 数
+        """
+        kwargs = {
+            "model": self.model,
+            "messages": messages,
+            "temperature": temperature or self.temperature,
+            "max_tokens": max_tokens,
+        }
+
+        if response_format is not None:
+            # Pydantic 结构化输出
+            kwargs["response_format"] = {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": response_format.__name__,
+                    "strict": True,
+                    "schema": response_format.model_json_schema(),
+                },
+            }
+
+        try:
+            response = self.client.chat.completions.create(**kwargs)
+            content = response.choices[0].message.content or ""
+
+            if response_format is not None:
+                # 解析 JSON 到 Pydantic
+                try:
+                    import json
+                    parsed = json.loads(content)
+                    return response_format(**parsed)
+                except Exception as e:
+                    logger.warning("Failed to parse structured output: %s", e)
+                    return content
+
+            return content
+        except Exception as e:
+            logger.error("LLM call failed: %s", e)
+            raise
+
+    def invoke(self, messages: list[dict[str, str]],
+               response_format: type | None = None) -> str | Any:
+        """便捷调用方法"""
+        return self.chat(messages, response_format=response_format)
+
+
+def create_llm(provider: str | None = None,
+               model: str | None = None,
+               temperature: float | None = None) -> LLMClient:
+    """工厂函数创建 LLM 客户端"""
+    return LLMClient(provider=provider, model=model, temperature=temperature)

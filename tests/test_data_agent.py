@@ -3,6 +3,7 @@
 import json
 
 from advanced_trading_agent.data_agent.data_agent import DataAgent, DataAgentRequest
+from advanced_trading_agent.data_agent.planner import DataAgentPlanner
 
 
 class FakeLLM:
@@ -219,11 +220,33 @@ def test_data_agent_react_planner_persists_plan(tmp_path):
 
     final_payload = json.loads(open(result.response_path, encoding="utf-8").read())
     assert final_payload["planner"]["trace"][0]["action"] == "inspect_request"
+    assert final_payload["planner"]["trace"][0]["reason"]
+    assert "thought" not in final_payload["planner"]["trace"][0]
+    assert final_payload["planner"]["next_actions"][0]["name"] == "collect_daily_bars"
+    assert final_payload["planner"]["decision_summary"]
+    assert final_payload["planner"]["clarification_questions"] == []
     assert final_payload["agent_payload"]["tier2_data"]["sector_context"]["matched_sector"] == "银行"
     assert final_payload["input"]["planner"]["skipped_methods"] == [
         "get_capital_flow",
         "compute_factors",
     ]
+
+
+def test_data_agent_planner_returns_user_clarification_questions():
+    request = DataAgentRequest(
+        ticker="",
+        trade_date=None,
+        include_news=True,
+        news_keyword=None,
+    )
+
+    questions = DataAgentPlanner.clarification_questions(request)
+
+    assert questions[0]["id"] == "ticker"
+    assert questions[0]["required"] is True
+    assert "哪只股票" in questions[0]["question"]
+    assert any(item["id"] == "trade_date" for item in questions)
+    assert any(item["id"] == "news_keyword" for item in questions)
 
 
 def test_data_agent_marks_risk_errors_unavailable(tmp_path):

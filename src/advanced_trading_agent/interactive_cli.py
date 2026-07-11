@@ -14,6 +14,8 @@ from typing import Callable, Literal, TextIO
 from pydantic import BaseModel, Field
 
 from .config import config
+from .data_agent.data_agent import DataAgentRequest
+from .data_agent.planner import DataAgentPlanner
 from .main import analyze_single, run_standalone_data_agent
 
 
@@ -319,6 +321,35 @@ def _safe_json_summary(text: str, limit: int = 1200) -> str:
     return stripped[:limit].rstrip() + "\n... <truncated>"
 
 
+def _format_clarification_questions(intent: DataIntent, questions: list[dict[str, object]]) -> str:
+    lines = [
+        "# DataAgent Needs Clarification",
+        f"query: {intent.query or '<empty>'}",
+        f"action: {intent.action}",
+        f"reasoning: {intent.reasoning or '<none>'}",
+        "",
+        "请补充以下信息后再继续：",
+    ]
+    for idx, item in enumerate(questions, start=1):
+        default = item.get("default") if isinstance(item, dict) else None
+        suffix = f" 默认: {default}" if default not in (None, "") else ""
+        question = item.get("question", "") if isinstance(item, dict) else str(item)
+        lines.append(f"{idx}. {question}{suffix}")
+    return "\n".join(lines)
+
+
+def _clarification_questions_for_intent(intent: DataIntent, context: SessionContext) -> list[dict[str, object]]:
+    request = DataAgentRequest(
+        ticker=intent.ticker or context.ticker or "",
+        trade_date=intent.trade_date or context.trade_date,
+        start_date=intent.start_date,
+        end_date=intent.end_date,
+        news_keyword=None,
+    )
+    questions = DataAgentPlanner.clarification_questions(request)
+    return [item for item in questions if item.get("required")]
+
+
 def _load_recent_candidate_rows(results_dir: str | None = None) -> list[dict[str, object]]:
     root = _configured_results_dir(results_dir)
     rows: list[dict[str, object]] = []
@@ -390,6 +421,9 @@ def execute_data_intent(
         return CommandResult(format_screen_summary(intent))
 
     ticker = intent.ticker or context.ticker
+    clarification_questions = _clarification_questions_for_intent(intent, context)
+    if clarification_questions:
+        return CommandResult(_format_clarification_questions(intent, clarification_questions))
     if not ticker:
         return CommandResult("No ticker resolved from data request. Include a ticker, e.g. /data 分析今天收盘后的数据 000001.SZ")
 
@@ -400,7 +434,7 @@ def execute_data_intent(
         start_date=intent.start_date,
         end_date=intent.end_date or _compact_date(trade_date),
         output_dir=None,
-        use_react_planner=False,
+        use_react_planner=True,
         news_keyword=None,
         use_llm_news_filter=True,
         fetch_news_full_text=True,

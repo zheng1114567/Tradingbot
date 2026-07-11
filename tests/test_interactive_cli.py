@@ -238,7 +238,7 @@ def test_data_natural_language_today_collects_current_close_data():
             "start_date": today.strftime("%Y%m%d"),
             "end_date": today.strftime("%Y%m%d"),
             "output_dir": None,
-            "use_react_planner": False,
+            "use_react_planner": True,
             "news_keyword": None,
             "use_llm_news_filter": True,
             "fetch_news_full_text": True,
@@ -264,6 +264,7 @@ def test_data_natural_language_year_range_uses_current_year_window():
     assert calls[0]["kwargs"]["trade_date"] == today.isoformat()
     assert calls[0]["kwargs"]["start_date"] == f"{today.year}0101"
     assert calls[0]["kwargs"]["end_date"] == today.strftime("%Y%m%d")
+    assert calls[0]["kwargs"]["use_react_planner"] is True
 
 
 def test_data_natural_language_can_use_injected_llm_intent_parser():
@@ -299,6 +300,7 @@ def test_data_natural_language_can_use_injected_llm_intent_parser():
     assert data_calls[0]["args"] == ("000001.SZ",)
     assert data_calls[0]["kwargs"]["start_date"] == "20260701"
     assert data_calls[0]["kwargs"]["end_date"] == "20260710"
+    assert data_calls[0]["kwargs"]["use_react_planner"] is True
 
 
 def test_datas_alias_supports_natural_language_requests():
@@ -315,6 +317,24 @@ def test_datas_alias_supports_natural_language_requests():
 
     assert "# DataAgent Intent" in result.output
     assert calls[0]["args"] == ("000001.SZ",)
+    assert calls[0]["kwargs"]["use_react_planner"] is True
+
+
+def test_data_natural_language_asks_for_ticker_before_collecting():
+    calls = []
+
+    def fake_data(*args, **kwargs):
+        calls.append({"args": args, "kwargs": kwargs})
+        return '{"run_id": "should-not-run"}'
+
+    result = interactive_cli.execute_command(
+        "/data 分析今天收盘后的数据",
+        data_runner=fake_data,
+    )
+
+    assert "# DataAgent Needs Clarification" in result.output
+    assert "你想分析哪只股票" in result.output
+    assert calls == []
 
 
 def test_data_natural_language_screen_uses_local_candidate_summary():

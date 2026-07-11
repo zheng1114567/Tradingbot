@@ -3,12 +3,15 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import shlex
 import sys
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
-from typing import Callable, TextIO
+from typing import Callable, Literal, TextIO
+
+from pydantic import BaseModel, Field
 
 from .config import config
 from .main import analyze_single, run_standalone_data_agent
@@ -33,9 +36,18 @@ Slash commands:
 
   /d <ticker> [YYYY-MM-DD]
   /data [ticker] [--date YYYY-MM-DD] [--start-date YYYYMMDD] [--end-date YYYYMMDD]
+  /datas [ticker] [--date YYYY-MM-DD] [--start-date YYYYMMDD] [--end-date YYYYMMDD]
       Run DataAgent only and print its persisted artifact summary.
       Example: /d 000001.SZ 2026-07-10
       If ticker is omitted, refresh data for the current ticker.
+
+  /data <natural language request>
+      Ask the DataAgent in natural language. The LLM maps the request to a data task,
+      with deterministic fallback if the LLM is unavailable.
+      Examples:
+        /data 分析今天收盘后的数据 000001.SZ
+        /data 拉一下平安银行今年的数据
+        /data 最近一段时间有哪些表现比较好的股票
 
   /date [ticker]
   /dates [ticker]
@@ -89,6 +101,323 @@ class SessionContext:
 
 AnalyzeRunner = Callable[..., str]
 DataRunner = Callable[..., str]
+
+
+class DataIntent(BaseModel):
+    """Structured data task parsed from a natural-language request."""
+
+    action: Literal["collect", "dates", "screen"] = Field(
+        description="collect=run DataAgent, dates=list stored dates, screen=find strong candidates"
+    )
+    ticker: str | None = Field(default=None, description="A-share ticker, e.g. 000001.SZ")
+    trade_date: str | None = Field(default=None, description="ISO date YYYY-MM-DD")
+    start_date: str | None = Field(default=None, description="Data start date YYYYMMDD")
+    end_date: str | None = Field(default=None, description="Data end date YYYYMMDD")
+    top_n: int = Field(default=10, ge=1, le=100, description="Candidate count for screen tasks")
+    query: str = Field(default="", description="Original user request")
+    reasoning: str = Field(default="", description="Brief rationale for parsed intent")
+
+
+IntentParser = Callable[[str, SessionContext], DataIntent]
+
+
+_TICKER_RE = re.compile(r"\b\d{6}\.(?:SH|SZ|BJ)\b", re.IGNORECASE)
+_ISO_DATE_RE = re.compile(r"\b(20\d{2})-(\d{2})-(\d{2})\b")
+_COMPACT_DATE_RE = re.compile(r"\b(20\d{2})(\d{2})(\d{2})\b")
+_TOP_N_RE = re.compile(r"(?:top|前|最近|最好|强势)\s*(\d{1,3})", re.IGNORECASE)
+
+
+def _today() -> date:
+    return date.today()
+
+
+def _compact_date(value: str | None) -> str | None:
+    if not value:
+        return None
+    return value.replace("-", "")
+
+
+def _extract_ticker(text: str) -> str | None:
+    match = _TICKER_RE.search(text)
+    return match.group(0).upper() if match else None
+
+
+def _extract_date(text: str) -> str | None:
+    match = _ISO_DATE_RE.search(text)
+    if match:
+        return "-".join(match.groups())
+    match = _COMPACT_DATE_RE.search(text)
+    if match:
+        year, month, day = match.groups()
+        return f"{year}-{month}-{day}"
+    return None
+
+
+def _extract_top_n(text: str, default: int = 10) -> int:
+    match = _TOP_N_RE.search(text)
+    if not match:
+        return default
+    try:
+        return max(1, min(100, int(match.group(1))))
+    except ValueError:
+        return default
+
+
+def _fallback_data_intent(text: str, context: SessionContext | None = None) -> DataIntent:
+    context = context or SessionContext()
+    normalized = text.strip()
+    today = _today()
+    ticker = _extract_ticker(normalized) or context.ticker
+    explicit_date = _extract_date(normalized)
+    trade_date = explicit_date or context.trade_date
+    lowered = normalized.lower()
+
+    wants_dates = any(token in normalized for token in ("有哪些日期", "多少 date", "多少日期", "已有日期", "数据日期"))
+    wants_screen = any(token in normalized for token in ("比较好", "表现好", "强势", "候选", "筛", "排名", "top", "Top"))
+    wants_year = "今年" in normalized or "year" in lowered
+    wants_recent = any(token in normalized for token in ("最近", "这一段", "一段时间", "近一段", "近段"))
+    wants_today = "今天" in normalized or "当天" in normalized or "收盘" in normalized or "today" in lowered
+
+    if wants_dates:
+        return DataIntent(
+            action="dates",
+            ticker=ticker,
+            trade_date=trade_date,
+            query=normalized,
+            reasoning="规则解析: 用户询问本地已落盘数据日期",
+        )
+
+    if wants_screen and not ticker:
+        return DataIntent(
+            action="screen",
+            trade_date=explicit_date or context.trade_date or today.isoformat(),
+            start_date=(today - timedelta(days=30)).strftime("%Y%m%d"),
+            end_date=today.strftime("%Y%m%d"),
+            top_n=_extract_top_n(normalized),
+            query=normalized,
+            reasoning="规则解析: 用户询问最近表现较好的股票",
+        )
+
+    if wants_year:
+        start_date = f"{today.year}0101"
+        end_date = today.strftime("%Y%m%d")
+        return DataIntent(
+            action="collect",
+            ticker=ticker,
+            trade_date=explicit_date or today.isoformat(),
+            start_date=start_date,
+            end_date=end_date,
+            query=normalized,
+            reasoning="规则解析: 用户请求今年数据",
+        )
+
+    if wants_recent:
+        return DataIntent(
+            action="collect",
+            ticker=ticker,
+            trade_date=explicit_date or today.isoformat(),
+            start_date=(today - timedelta(days=30)).strftime("%Y%m%d"),
+            end_date=today.strftime("%Y%m%d"),
+            query=normalized,
+            reasoning="规则解析: 用户请求最近一段时间数据",
+        )
+
+    if wants_today or not trade_date:
+        trade_date = explicit_date or today.isoformat()
+
+    return DataIntent(
+        action="collect",
+        ticker=ticker,
+        trade_date=trade_date,
+        start_date=_compact_date(trade_date),
+        end_date=_compact_date(trade_date),
+        query=normalized,
+        reasoning="规则解析: 默认采集指定或当前交易日数据",
+    )
+
+
+def parse_data_intent(
+    text: str,
+    context: SessionContext | None = None,
+    *,
+    llm: object | None = None,
+) -> DataIntent:
+    """Parse a natural-language data request into an auditable DataIntent."""
+
+    context = context or SessionContext()
+    fallback = _fallback_data_intent(text, context)
+    if llm is None:
+        try:
+            from .llm.client import create_llm
+
+            llm = create_llm()
+        except Exception:
+            return fallback
+
+    try:
+        intent = llm.chat(
+            messages=[
+                (
+                    "system",
+                    "你是 DataAgent 的意图解析器。只把用户自然语言转换成结构化数据任务，"
+                    "不要编造行情数据。action 只能是 collect/dates/screen。"
+                    "今天/当天/收盘默认指当前日期；今年要转为年初到今天；"
+                    "最近一段时间默认近 30 天；如果用户没有给股票代码但上下文有当前股票，可复用上下文。",
+                ),
+                (
+                    "user",
+                    json.dumps(
+                        {
+                            "query": text,
+                            "current_ticker": context.ticker,
+                            "current_trade_date": context.trade_date,
+                            "today": _today().isoformat(),
+                        },
+                        ensure_ascii=False,
+                    ),
+                ),
+            ],
+            response_format=DataIntent,
+            temperature=0,
+        )
+    except Exception:
+        return fallback
+
+    if not isinstance(intent, DataIntent):
+        return fallback
+    if intent.ticker is None:
+        intent.ticker = fallback.ticker
+    if intent.trade_date is None:
+        intent.trade_date = fallback.trade_date
+    if intent.start_date is None:
+        intent.start_date = fallback.start_date
+    if intent.end_date is None:
+        intent.end_date = fallback.end_date
+    if intent.query == "":
+        intent.query = text
+    return intent
+
+
+def _looks_like_natural_data_request(args: list[str]) -> bool:
+    if not args:
+        return False
+    option_like = any(part.startswith("-") for part in args)
+    if option_like:
+        return False
+    joined = " ".join(args)
+    if re.search(r"[\u4e00-\u9fff]", joined):
+        return True
+    if len(args) <= 2 and _extract_ticker(" ".join(args)):
+        return False
+    return len(args) > 2
+
+
+def _safe_json_summary(text: str, limit: int = 1200) -> str:
+    stripped = text.strip()
+    if len(stripped) <= limit:
+        return stripped
+    return stripped[:limit].rstrip() + "\n... <truncated>"
+
+
+def _load_recent_candidate_rows(results_dir: str | None = None) -> list[dict[str, object]]:
+    root = _configured_results_dir(results_dir)
+    rows: list[dict[str, object]] = []
+    for response_path in root.rglob("response.json"):
+        try:
+            payload = json.loads(response_path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        request = payload.get("request", {})
+        final_data = payload.get("final_data", {})
+        cleaned = final_data.get("cleaned", {})
+        analysis = final_data.get("analysis", {})
+        daily = cleaned.get("daily", {})
+        latest = daily.get("latest", {}) if isinstance(daily, dict) else {}
+        ticker = request.get("ticker") or latest.get("code")
+        trade_date = request.get("trade_date") or latest.get("trade_date")
+        if not ticker:
+            continue
+        score = 0.0
+        pct_chg = latest.get("pct_chg") or daily.get("price_change_pct") if isinstance(daily, dict) else None
+        try:
+            score += float(pct_chg or 0)
+        except (TypeError, ValueError):
+            pass
+        factors = analysis.get("factors") if isinstance(analysis, dict) else None
+        if isinstance(factors, dict):
+            try:
+                score += float(factors.get("composite_score") or 0)
+            except (TypeError, ValueError):
+                pass
+        rows.append({
+            "ticker": str(ticker),
+            "trade_date": str(trade_date or ""),
+            "score": score,
+            "pct_chg": pct_chg,
+            "response_path": str(response_path),
+        })
+    return sorted(rows, key=lambda item: float(item.get("score") or 0), reverse=True)
+
+
+def format_screen_summary(intent: DataIntent, *, results_dir: str | None = None) -> str:
+    rows = _load_recent_candidate_rows(results_dir)[: intent.top_n]
+    lines = [
+        f"Candidate screen: top {intent.top_n}",
+        f"query: {intent.query}",
+        f"window: {intent.start_date or '<auto>'} -> {intent.end_date or '<auto>'}",
+    ]
+    if not rows:
+        lines.append("  <no local candidate data found; run /data or /run for more tickers first>")
+        return "\n".join(lines)
+    for idx, row in enumerate(rows, start=1):
+        lines.append(
+            f"  {idx}. {row['ticker']} {row['trade_date']} score={row['score']:.2f} pct_chg={row.get('pct_chg')}"
+        )
+    return "\n".join(lines)
+
+
+def execute_data_intent(
+    intent: DataIntent,
+    *,
+    context: SessionContext,
+    data_runner: DataRunner,
+) -> CommandResult:
+    if intent.action == "dates":
+        output = format_dates_summary(list_data_dates(intent.ticker))
+        return CommandResult(output)
+
+    if intent.action == "screen":
+        return CommandResult(format_screen_summary(intent))
+
+    ticker = intent.ticker or context.ticker
+    if not ticker:
+        return CommandResult("No ticker resolved from data request. Include a ticker, e.g. /data 分析今天收盘后的数据 000001.SZ")
+
+    trade_date = intent.trade_date or context.trade_date or str(date.today())
+    output = data_runner(
+        ticker,
+        trade_date=trade_date,
+        start_date=intent.start_date,
+        end_date=intent.end_date or _compact_date(trade_date),
+        output_dir=None,
+        use_react_planner=False,
+        news_keyword=None,
+        use_llm_news_filter=True,
+        fetch_news_full_text=True,
+    )
+    context.set_current(ticker, trade_date)
+    context.last_data_output = output
+    return CommandResult("\n".join([
+        "# DataAgent Intent",
+        f"action: {intent.action}",
+        f"ticker: {ticker}",
+        f"trade_date: {trade_date}",
+        f"start_date: {intent.start_date or '<auto>'}",
+        f"end_date: {intent.end_date or _compact_date(trade_date) or '<auto>'}",
+        f"reasoning: {intent.reasoning or '<none>'}",
+        "",
+        _safe_json_summary(output),
+    ]))
 
 
 def build_root_parser() -> argparse.ArgumentParser:
@@ -341,6 +670,7 @@ def execute_command(
     context: SessionContext | None = None,
     analyze_runner: AnalyzeRunner = analyze_single,
     data_runner: DataRunner = run_standalone_data_agent,
+    intent_parser: IntentParser = parse_data_intent,
 ) -> CommandResult:
     context = context or SessionContext()
     normalized = normalize_line(line)
@@ -397,7 +727,10 @@ def execute_command(
         context.set_current(ticker, trade_date)
         context.last_report = report
         return CommandResult(report)
-    if command in {"/data", "/d"}:
+    if command in {"/data", "/d", "/datas"}:
+        if _looks_like_natural_data_request(args):
+            intent = intent_parser(" ".join(args), context)
+            return execute_data_intent(intent, context=context, data_runner=data_runner)
         try:
             parsed = _parse_args(build_data_parser(), args)
         except ValueError as exc:
@@ -478,6 +811,7 @@ def repl(
     stdout: TextIO = sys.stdout,
     analyze_runner: AnalyzeRunner = analyze_single,
     data_runner: DataRunner = run_standalone_data_agent,
+    intent_parser: IntentParser = parse_data_intent,
     show_banner: bool = True,
 ) -> int:
     context = SessionContext()
@@ -495,6 +829,7 @@ def repl(
             context=context,
             analyze_runner=analyze_runner,
             data_runner=data_runner,
+            intent_parser=intent_parser,
         )
         if result.output:
             print(result.output, file=stdout)

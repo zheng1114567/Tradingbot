@@ -13,6 +13,8 @@ def test_help_command_lists_core_slash_commands():
     assert result.should_exit is False
     assert "/a <ticker>" in result.output
     assert "/data [ticker]" in result.output
+    assert "/datas [ticker]" in result.output
+    assert "/data <natural language request>" in result.output
     assert "/date [ticker]" in result.output
     assert "/dates [ticker]" in result.output
     assert "/run [ticker]" in result.output
@@ -212,6 +214,133 @@ def test_parameterless_data_reuses_current_context():
     assert result.output == "data ok"
     assert calls[0]["args"] == ("000001.SZ",)
     assert calls[0]["kwargs"]["trade_date"] == "2026-07-10"
+
+
+def test_data_natural_language_today_collects_current_close_data():
+    calls = []
+
+    def fake_data(*args, **kwargs):
+        calls.append({"args": args, "kwargs": kwargs})
+        return '{"run_id": "run-today"}'
+
+    result = interactive_cli.execute_command(
+        "/data 分析今天收盘后的数据 000001.SZ",
+        data_runner=fake_data,
+    )
+
+    today = interactive_cli.date.today()
+    assert "# DataAgent Intent" in result.output
+    assert "run-today" in result.output
+    assert calls == [{
+        "args": ("000001.SZ",),
+        "kwargs": {
+            "trade_date": today.isoformat(),
+            "start_date": today.strftime("%Y%m%d"),
+            "end_date": today.strftime("%Y%m%d"),
+            "output_dir": None,
+            "use_react_planner": False,
+            "news_keyword": None,
+            "use_llm_news_filter": True,
+            "fetch_news_full_text": True,
+        },
+    }]
+
+
+def test_data_natural_language_year_range_uses_current_year_window():
+    calls = []
+
+    def fake_data(*args, **kwargs):
+        calls.append({"args": args, "kwargs": kwargs})
+        return '{"run_id": "run-year"}'
+
+    result = interactive_cli.execute_command(
+        "/data 拉一下今年的数据 000001.SZ",
+        data_runner=fake_data,
+    )
+
+    today = interactive_cli.date.today()
+    assert "# DataAgent Intent" in result.output
+    assert calls[0]["args"] == ("000001.SZ",)
+    assert calls[0]["kwargs"]["trade_date"] == today.isoformat()
+    assert calls[0]["kwargs"]["start_date"] == f"{today.year}0101"
+    assert calls[0]["kwargs"]["end_date"] == today.strftime("%Y%m%d")
+
+
+def test_data_natural_language_can_use_injected_llm_intent_parser():
+    context = interactive_cli.SessionContext(ticker="000001.SZ", trade_date="2026-07-10")
+    parser_calls = []
+    data_calls = []
+
+    def fake_intent_parser(text, session_context):
+        parser_calls.append((text, session_context.ticker, session_context.trade_date))
+        return interactive_cli.DataIntent(
+            action="collect",
+            ticker="000001.SZ",
+            trade_date="2026-07-10",
+            start_date="20260701",
+            end_date="20260710",
+            query=text,
+            reasoning="fake llm intent",
+        )
+
+    def fake_data(*args, **kwargs):
+        data_calls.append({"args": args, "kwargs": kwargs})
+        return '{"run_id": "run-window"}'
+
+    result = interactive_cli.execute_command(
+        "/data 帮我拉一段时间的数据",
+        context=context,
+        data_runner=fake_data,
+        intent_parser=fake_intent_parser,
+    )
+
+    assert parser_calls == [("帮我拉一段时间的数据", "000001.SZ", "2026-07-10")]
+    assert "fake llm intent" in result.output
+    assert data_calls[0]["args"] == ("000001.SZ",)
+    assert data_calls[0]["kwargs"]["start_date"] == "20260701"
+    assert data_calls[0]["kwargs"]["end_date"] == "20260710"
+
+
+def test_datas_alias_supports_natural_language_requests():
+    calls = []
+
+    def fake_data(*args, **kwargs):
+        calls.append({"args": args, "kwargs": kwargs})
+        return '{"run_id": "run-alias"}'
+
+    result = interactive_cli.execute_command(
+        "/datas 分析今天的数据 000001.SZ",
+        data_runner=fake_data,
+    )
+
+    assert "# DataAgent Intent" in result.output
+    assert calls[0]["args"] == ("000001.SZ",)
+
+
+def test_data_natural_language_screen_uses_local_candidate_summary():
+    data_calls = []
+
+    def fake_data(*args, **kwargs):
+        data_calls.append({"args": args, "kwargs": kwargs})
+        return "should not run"
+
+    def fake_intent_parser(text, session_context):
+        return interactive_cli.DataIntent(
+            action="screen",
+            top_n=3,
+            query=text,
+            reasoning="fake screen intent",
+        )
+
+    result = interactive_cli.execute_command(
+        "/data 最近表现比较好的股票",
+        data_runner=fake_data,
+        intent_parser=fake_intent_parser,
+    )
+
+    assert "Candidate screen: top 3" in result.output
+    assert "最近表现比较好的股票" in result.output
+    assert data_calls == []
 
 
 def test_parameterless_analyze_requires_current_context():

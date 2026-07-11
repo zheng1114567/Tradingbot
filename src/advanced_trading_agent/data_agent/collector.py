@@ -984,6 +984,49 @@ def get_daily_local(code: str = "", start_date: str | None = None,
         raise VendorNotConfiguredError("local_cache requires baostock", vendor="local_cache")
 
 
+def get_capital_flow_local(code: str = "", start_date: str | None = None,
+                           end_date: str | None = None,
+                           trade_date: str | None = None) -> list[dict[str, Any]]:
+    """Compute capital flow proxy from cached daily OHLCV data.
+
+    Uses amount (成交额) deviation from 5-day MA as a proxy for
+    capital flow direction. Works fully offline from parquet cache.
+    """
+    import pandas as pd
+    from .local_cache import get_cached_daily
+
+    try:
+        data = get_cached_daily(code, start_date, end_date)
+        if not data:
+            raise NoMarketDataError(f"No cached daily data for {code}", symbol=code, vendor="local_cache")
+    except ImportError:
+        raise VendorNotConfiguredError("local_cache requires baostock", vendor="local_cache")
+
+    df = pd.DataFrame(data)
+    date_col = "datetime" if "datetime" in df.columns else "trade_date"
+    if date_col not in df.columns and "date" in df.columns:
+        date_col = "date"
+    if date_col not in df.columns:
+        return []
+
+    df[date_col] = pd.to_datetime(df[date_col])
+    df = df.sort_values(date_col)
+
+    amount_col = "amount" if "amount" in df.columns else None
+    if not amount_col:
+        return []
+
+    df[amount_col] = pd.to_numeric(df[amount_col], errors="coerce")
+    df["amount_ma5"] = df[amount_col].rolling(5).mean()
+    df["net_inflow_main"] = df[amount_col] - df["amount_ma5"]
+    df["data_source"] = "local_computed"
+
+    records = df.tail(5).to_dict("records")
+    for r in records:
+        r["confirmation"] = "资金确认" if r.get("net_inflow_main", 0) > 0 else "资金背离"
+    return records
+
+
 def register_all_vendors() -> None:
     """Register free vendor adapters."""
 
@@ -992,6 +1035,7 @@ def register_all_vendors() -> None:
     register_vendor_impl("get_daily", "local_cache", get_daily_local)
 
     register_vendor_impl("get_capital_flow", "akshare", get_capital_flow_akshare)
+    register_vendor_impl("get_capital_flow", "local_cache", get_capital_flow_local)
     register_vendor_impl("get_news", "akshare", get_news_akshare)
     register_vendor_impl("get_news", "sina", get_news_sina)
     register_vendor_impl("get_sector", "akshare", get_sector_akshare)

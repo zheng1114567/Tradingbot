@@ -31,25 +31,31 @@ pip install -e .
 ### 单独测试 DataAgent
 
 ```bash
-python -m advanced_trading_agent.main --data-agent --ticker 000001.SZ --date 2026-07-10 --start-date 20260101 --end-date 20260710 --output-dir ./data/results
+dataagent --ticker 000001.SZ --date 2026-07-10 --start-date 20260101 --end-date 20260710 --output-dir ./data/results
+```
+
+也可以直接用模块方式运行:
+
+```bash
+python -m advanced_trading_agent.data_agent.cli --ticker 000001.SZ --date 2026-07-10 --start-date 20260101 --end-date 20260710 --output-dir ./data/results
 ```
 
 如需先做 ReAct-style 数据规划，再执行确定性数据流水线:
 
 ```bash
-python -m advanced_trading_agent.main --data-agent --react-planner --ticker 000001.SZ --date 2026-07-10 --start-date 20260101 --output-dir ./data/results
+dataagent --react-planner --ticker 000001.SZ --date 2026-07-10 --start-date 20260101 --output-dir ./data/results
 ```
 
 也可以给新闻采集加关键词过滤:
 
 ```bash
-python -m advanced_trading_agent.main --data-agent --react-planner --ticker 000001.SZ --date 2026-07-10 --start-date 20260101 --output-dir ./data/results --news-keyword 平安银行
+dataagent --react-planner --ticker 000001.SZ --date 2026-07-10 --start-date 20260101 --output-dir ./data/results --news-keyword 平安银行
 ```
 
 默认会使用 LLM 对新闻相关性、方向、置信度做筛选；如果没有 LLM Key 或调用失败，会自动降级为规则筛选并在 `analysis.events.filter` 里留痕。调试时也可以关闭 LLM 新闻筛选:
 
 ```bash
-python -m advanced_trading_agent.main --data-agent --ticker 000001.SZ --date 2026-07-10 --no-llm-news-filter
+dataagent --ticker 000001.SZ --date 2026-07-10 --no-llm-news-filter
 ```
 
 DataAgent 会按步骤留痕并分层保存:

@@ -108,6 +108,62 @@ def test_data_agent_persists_layered_trace(tmp_path):
     assert result.artifacts["news_events"].path.endswith("04_analysis\\news_events.json") or result.artifacts["news_events"].path.endswith("04_analysis/news_events.json")
 
 
+def test_data_agent_auto_resolves_stock_profile_keywords(tmp_path):
+    calls = []
+
+    def fake_route(method, **kwargs):
+        calls.append((method, kwargs))
+        if method == "get_daily":
+            return [
+                {
+                    "ts_code": kwargs["code"],
+                    "trade_date": "20260710",
+                    "open": 10.0,
+                    "high": 10.5,
+                    "low": 9.9,
+                    "close": 10.2,
+                    "pre_close": 10.0,
+                    "pct_chg": 2.0,
+                    "vol": 1000,
+                    "amount": 10200,
+                }
+            ]
+        if method == "get_capital_flow":
+            return []
+        if method == "get_news":
+            return [
+                {
+                    "title": "平安银行经营稳定",
+                    "summary": "零售业务保持稳定。",
+                    "source": "test",
+                }
+            ]
+        if method == "get_sector":
+            return [{"sector_name": "银行", "change_pct": 1.2, "rank": 1, "data_source": "test"}]
+        if method in {"get_st_status", "get_suspended", "get_delisting"}:
+            return []
+        raise AssertionError(f"unexpected method: {method}")
+
+    result = DataAgent(route_fn=fake_route, results_dir=str(tmp_path)).run(
+        DataAgentRequest(
+            ticker="000001.SZ",
+            trade_date="2026-07-10",
+            include_factors=False,
+            use_llm_news_filter=False,
+        )
+    )
+
+    news_calls = [kwargs for method, kwargs in calls if method == "get_news"]
+    assert news_calls[0]["keyword"] == "平安银行"
+
+    final_payload = result.final_data
+    assert final_payload["input"]["request"]["news_keyword"] == "平安银行"
+    assert final_payload["input"]["request"]["sector_keyword"] == "银行"
+    assert final_payload["input"]["stock_profile"]["company_name"] == "平安银行"
+    assert final_payload["input"]["stock_profile"]["applied_fields"] == ["news_keyword", "sector_keyword"]
+    assert final_payload["analysis"]["sector"]["matched_sector"] == "银行"
+
+
 def test_data_agent_react_planner_persists_plan(tmp_path):
     calls = []
 

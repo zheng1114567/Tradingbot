@@ -46,13 +46,15 @@ python -m advanced_trading_agent.data_agent.cli --ticker 000001.SZ --date 2026-0
 dataagent --react-planner --ticker 000001.SZ --date 2026-07-10 --start-date 20260101 --output-dir ./data/results
 ```
 
-也可以给新闻采集加关键词过滤:
+默认情况下，DataAgent 会先根据 `ticker` 自动解析股票画像，再把公司名用于新闻采集，把行业关键词用于板块匹配。比如 `000001.SZ` 会自动补成 `news_keyword=平安银行`、`sector_keyword=银行`，这些结果会写入 `01_input/request.json` 的 `stock_profile` 留痕。
+
+如果你要覆盖自动识别结果，也可以显式给新闻采集加关键词过滤:
 
 ```bash
 dataagent --react-planner --ticker 000001.SZ --date 2026-07-10 --start-date 20260101 --output-dir ./data/results --news-keyword 平安银行
 ```
 
-默认还会采集市场板块榜单，生成 `sector_context` 给 Market / Analysis / System Agent 使用。如果你已经知道标的所属板块，可以显式传入板块关键词，帮助 DataAgent 匹配:
+默认还会采集市场板块榜单，生成 `sector_context` 给 Market / Analysis / System Agent 使用。如果你已经知道标的所属板块，也可以显式传入板块关键词，覆盖自动识别结果:
 
 ```bash
 dataagent --ticker 000001.SZ --date 2026-07-10 --sector-keyword 银行 --output-dir ./data/results

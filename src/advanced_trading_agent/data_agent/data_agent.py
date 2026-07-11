@@ -14,7 +14,7 @@ import os
 import re
 import time
 from html import unescape
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -129,6 +129,137 @@ class DataAgentRequest:
         return None
 
 
+@dataclass(frozen=True)
+class StockProfile:
+    """Resolved stock identity used to drive purposeful data collection."""
+
+    ticker: str
+    company_name: str | None = None
+    sector_keyword: str | None = None
+    sector_name: str | None = None
+    aliases: list[str] = field(default_factory=list)
+    source: str = "unknown"
+    confidence: float = 0.0
+
+
+class StockProfileResolver:
+    """Best-effort A-share profile resolver with deterministic local fallbacks."""
+
+    _STATIC_PROFILES: dict[str, StockProfile] = {
+        "000001.SZ": StockProfile(
+            ticker="000001.SZ",
+            company_name="平安银行",
+            sector_keyword="银行",
+            sector_name="银行",
+            aliases=["平安银行", "平安银行股份有限公司", "000001", "000001.SZ"],
+            source="built_in_a_share_profile",
+            confidence=0.95,
+        ),
+        "000001.SH": StockProfile(
+            ticker="000001.SH",
+            company_name="上证指数",
+            sector_keyword=None,
+            sector_name=None,
+            aliases=["上证指数", "上证综指", "000001", "000001.SH"],
+            source="built_in_a_share_profile",
+            confidence=0.95,
+        ),
+    }
+
+    _SECTOR_HINTS: tuple[tuple[tuple[str, ...], str], ...] = (
+        (("银行",), "银行"),
+        (("证券", "券商"), "证券"),
+        (("保险",), "保险"),
+        (("煤炭",), "煤炭"),
+        (("钢铁",), "钢铁"),
+        (("医药", "生物"), "医药"),
+        (("电力",), "电力"),
+        (("汽车",), "汽车"),
+        (("地产", "房地产"), "房地产"),
+        (("白酒", "酒"), "酿酒"),
+    )
+
+    def resolve(self, ticker: str) -> StockProfile:
+        normalized = self._normalize_ticker(ticker)
+        if normalized in self._STATIC_PROFILES:
+            return self._STATIC_PROFILES[normalized]
+        akshare_profile = self._resolve_from_akshare(normalized)
+        if akshare_profile.company_name:
+            return akshare_profile
+        return StockProfile(
+            ticker=normalized or ticker,
+            aliases=[item for item in {ticker, normalized, self._ticker_digits(normalized)} if item],
+            source="ticker_only",
+            confidence=0.2,
+        )
+
+    @classmethod
+    def _resolve_from_akshare(cls, ticker: str) -> StockProfile:
+        code = cls._ticker_digits(ticker)
+        if not code:
+            return StockProfile(ticker=ticker, source="akshare_code_name_unavailable", confidence=0.0)
+        try:
+            import akshare as ak
+
+            frame = ak.stock_info_a_code_name()
+        except Exception:
+            return StockProfile(ticker=ticker, source="akshare_code_name_unavailable", confidence=0.0)
+        if not isinstance(frame, pd.DataFrame) or frame.empty:
+            return StockProfile(ticker=ticker, source="akshare_code_name_empty", confidence=0.0)
+
+        code_column = cls._first_existing_column(frame, ("code", "代码", "证券代码"))
+        name_column = cls._first_existing_column(frame, ("name", "名称", "证券简称"))
+        if not code_column or not name_column:
+            return StockProfile(ticker=ticker, source="akshare_code_name_schema_mismatch", confidence=0.0)
+
+        matched = frame[frame[code_column].astype(str).str.zfill(6) == code]
+        if matched.empty:
+            return StockProfile(ticker=ticker, source="akshare_code_name_not_found", confidence=0.0)
+
+        company_name = str(matched.iloc[0][name_column]).strip() or None
+        sector_keyword = cls._infer_sector_keyword(company_name)
+        aliases = [item for item in {company_name, ticker, code} if item]
+        return StockProfile(
+            ticker=ticker,
+            company_name=company_name,
+            sector_keyword=sector_keyword,
+            sector_name=sector_keyword,
+            aliases=aliases,
+            source="akshare_code_name",
+            confidence=0.75 if company_name else 0.0,
+        )
+
+    @classmethod
+    def _infer_sector_keyword(cls, company_name: str | None) -> str | None:
+        text = str(company_name or "")
+        for needles, sector in cls._SECTOR_HINTS:
+            if any(needle in text for needle in needles):
+                return sector
+        return None
+
+    @staticmethod
+    def _first_existing_column(frame: pd.DataFrame, candidates: tuple[str, ...]) -> str | None:
+        for column in candidates:
+            if column in frame.columns:
+                return column
+        return None
+
+    @staticmethod
+    def _normalize_ticker(ticker: str) -> str:
+        value = str(ticker or "").strip().upper()
+        if not value:
+            return value
+        match = re.match(r"^(SZ|SH)(\d{6})$", value)
+        if match:
+            return f"{match.group(2)}.{match.group(1)}"
+        return value
+
+    @staticmethod
+    def _ticker_digits(ticker: str) -> str:
+        match = re.search(r"(\d{6})", str(ticker or ""))
+        return match.group(1) if match else ""
+
+
 @dataclass
 class DataAgentArtifact:
     """One persisted step in the data-agent trace."""
@@ -167,17 +298,20 @@ class DataAgent:
         results_dir: str | None = None,
         planner: DataAgentPlanner | None = None,
         llm_client: Any | None = None,
+        profile_resolver: StockProfileResolver | None = None,
     ) -> None:
         self._route_fn = route_fn
         self._results_dir = Path(results_dir or config.get("results_dir", "data/results"))
         self._planner = planner or DataAgentPlanner()
         self._llm_client = llm_client
+        self._profile_resolver = profile_resolver or StockProfileResolver()
 
     def run(self, request: DataAgentRequest) -> DataAgentRun:
         # Ensure the free vendor adapters are available when DataAgent is used standalone.
         from .collector import register_all_vendors
 
         register_all_vendors()
+        request, stock_profile = self._apply_stock_profile(request)
         run_dir = self._make_run_dir(request)
         manifest = DataManifest(
             ticker=request.ticker,
@@ -200,6 +334,7 @@ class DataAgent:
             "stage": "input",
             "created_at": _utc_now(),
             "request": asdict(request),
+            "stock_profile": stock_profile,
             "planner": plan_payload,
             "vendor_chain": {
                 "daily": get_vendor_chain("get_daily"),
@@ -280,6 +415,27 @@ class DataAgent:
         run_dir = self._results_dir / "data_agent_runs" / f"{trade_date}_{ticker}_{timestamp}"
         run_dir.mkdir(parents=True, exist_ok=True)
         return run_dir
+
+    def _apply_stock_profile(self, request: DataAgentRequest) -> tuple[DataAgentRequest, dict[str, Any]]:
+        profile = self._profile_resolver.resolve(request.ticker)
+        updates: dict[str, Any] = {}
+        applied_fields: list[str] = []
+
+        if not request.news_keyword and profile.company_name:
+            updates["news_keyword"] = profile.company_name
+            applied_fields.append("news_keyword")
+        if not request.sector_keyword and profile.sector_keyword:
+            updates["sector_keyword"] = profile.sector_keyword
+            applied_fields.append("sector_keyword")
+
+        effective_request = replace(request, **updates) if updates else request
+        profile_payload = {
+            **asdict(profile),
+            "applied_fields": applied_fields,
+            "effective_news_keyword": effective_request.news_keyword,
+            "effective_sector_keyword": effective_request.sector_keyword,
+        }
+        return effective_request, profile_payload
 
     def _collect_raw(
         self,

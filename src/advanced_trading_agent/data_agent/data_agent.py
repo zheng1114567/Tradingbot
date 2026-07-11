@@ -13,6 +13,7 @@ import json
 import os
 import re
 import time
+from html import unescape
 from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -37,6 +38,28 @@ _SAFE_PATH_PART = re.compile(r"[^A-Za-z0-9_.-]+")
 _SCRIPT_STYLE_RE = re.compile(r"<(script|style)[^>]*>.*?</\1>", re.IGNORECASE | re.DOTALL)
 _HTML_TAG_RE = re.compile(r"<[^>]+>")
 _WHITESPACE_RE = re.compile(r"\s+")
+_NEWS_NOISE_PATTERNS = (
+    re.compile(r"^原标题[:：]"),
+    re.compile(r"^来源[:：]"),
+    re.compile(r"^文章来源[:：]"),
+    re.compile(r"^责任编辑[:：]"),
+    re.compile(r"^编辑[:：]"),
+    re.compile(r"^校对[:：]"),
+    re.compile(r"^作者[:：]\s*$"),
+    re.compile(r"^免责声明[:：]"),
+    re.compile(r"^风险提示[:：]"),
+    re.compile(r"^广告$"),
+    re.compile(r"^更多精彩.*"),
+    re.compile(r"^下载.*APP.*"),
+    re.compile(r"^打开.*APP.*"),
+    re.compile(r"^微信扫一扫.*"),
+    re.compile(r"^海量资讯.*"),
+    re.compile(r"^本文源自[:：]"),
+    re.compile(r"^本文来自.*"),
+    re.compile(r"^股市有风险.*"),
+    re.compile(r"^投资需谨慎.*"),
+    re.compile(r"^Copyright\b", re.IGNORECASE),
+)
 
 
 def _utc_now() -> str:
@@ -940,6 +963,7 @@ class DataAgent:
             summary = cls._first_present(record, ["summary", "摘要", "内容", "content", "article_content"]) or title
             full_text = cls._first_present(record, ["full_text", "正文", "text", "article_text"])
             evidence_text = cls._select_evidence_text(full_text, summary, title)
+            content_cleaning = record.get("content_cleaning")
             source = cls._first_present(record, ["source", "来源", "data_source"]) or record.get("data_source", "")
             event_time = cls._first_present(record, ["time", "时间", "datetime", "发布时间", "date", "日期"])
             url = cls._first_present(record, ["url", "链接", "link"])
@@ -951,6 +975,7 @@ class DataAgent:
                 "full_text": str(full_text or "")[:8000],
                 "evidence_text": evidence_text,
                 "content_status": str(record.get("content_status") or ("full_text" if full_text else "summary_only")),
+                "content_cleaning": content_cleaning if isinstance(content_cleaning, dict) else {},
                 "content_error": record.get("content_error"),
                 "direction": str(record.get("direction") or "中性"),
                 "confidence": float(record.get("confidence") or 0.5),
@@ -980,8 +1005,11 @@ class DataAgent:
             url = cls._first_present(item, ["url", "链接", "link"])
 
             if existing_text:
-                item["full_text"] = str(existing_text)[:8000]
-                item["content_status"] = item.get("content_status") or "full_text"
+                cleaned_text, cleaning_trace = cls._clean_article_text(str(existing_text))
+                item["raw_full_text"] = str(existing_text)[:12000]
+                item["full_text"] = cleaned_text[:8000]
+                item["content_status"] = item.get("content_status") or ("full_text" if cleaned_text else "summary_only")
+                item["content_cleaning"] = cleaning_trace
                 item["evidence_text"] = cls._select_evidence_text(item["full_text"], summary, title)
                 enriched.append(item)
                 continue
@@ -1001,12 +1029,22 @@ class DataAgent:
                 item["content_error"] = f"{type(exc).__name__}: {str(exc)[:200]}"
 
             if full_text:
-                item["full_text"] = full_text[:8000]
-                item["content_status"] = "full_text"
+                cleaned_text, cleaning_trace = cls._clean_article_text(full_text)
+                item["raw_full_text"] = full_text[:12000]
+                item["full_text"] = cleaned_text[:8000]
+                item["content_status"] = "full_text" if cleaned_text else "summary_only"
+                item["content_cleaning"] = cleaning_trace
                 item["content_error"] = item.get("content_error")
             else:
                 item["full_text"] = ""
                 item["content_status"] = "summary_only"
+                item["content_cleaning"] = {
+                    "status": "skipped",
+                    "raw_length": 0,
+                    "cleaned_length": 0,
+                    "removed_segments": 0,
+                    "deduplicated_segments": 0,
+                }
                 item["content_error"] = item.get("content_error") or "extract_empty"
             item["evidence_text"] = cls._select_evidence_text(item.get("full_text"), summary, title)
             enriched.append(item)
@@ -1037,18 +1075,81 @@ class DataAgent:
             body = "\n".join(p for p in candidates if len(p) >= 12)
         else:
             body = _HTML_TAG_RE.sub(" ", text)
-        body = (
-            body.replace("&nbsp;", " ")
-            .replace("&amp;", "&")
-            .replace("&lt;", "<")
-            .replace("&gt;", ">")
-            .replace("&quot;", '"')
-            .replace("&#39;", "'")
+        body = unescape(body).replace("\u3000", " ").replace("\xa0", " ")
+        body = "\n".join(
+            _WHITESPACE_RE.sub(" ", line).strip()
+            for line in body.splitlines()
+            if line.strip()
         )
-        body = _WHITESPACE_RE.sub(" ", body).strip()
         if len(body) < 80:
             return ""
         return body[:12000]
+
+    @classmethod
+    def _clean_article_text(cls, text: str) -> tuple[str, dict[str, Any]]:
+        raw = unescape(text or "").replace("\u3000", " ").replace("\xa0", " ")
+        raw = raw.replace("\r\n", "\n").replace("\r", "\n")
+        raw_length = len(raw)
+
+        segments = [
+            _WHITESPACE_RE.sub(" ", segment).strip()
+            for segment in re.split(r"\n+|(?<=[。！？；])\s+", raw)
+        ]
+        cleaned_segments: list[str] = []
+        seen: set[str] = set()
+        removed = 0
+        deduped = 0
+        for segment in segments:
+            if not segment:
+                continue
+            segment = cls._strip_news_noise(segment)
+            if not segment:
+                removed += 1
+                continue
+            if cls._is_noise_segment(segment):
+                removed += 1
+                continue
+            normalized_key = re.sub(r"\W+", "", segment.lower())
+            if normalized_key and normalized_key in seen:
+                deduped += 1
+                continue
+            if normalized_key:
+                seen.add(normalized_key)
+            cleaned_segments.append(segment)
+
+        cleaned = "\n".join(cleaned_segments).strip()
+        if len(cleaned) < 80:
+            cleaned = _WHITESPACE_RE.sub(" ", raw).strip()
+            status = "raw_fallback" if cleaned else "empty"
+        else:
+            status = "cleaned"
+        cleaned = cleaned[:12000]
+        return cleaned, {
+            "status": status,
+            "raw_length": raw_length,
+            "cleaned_length": len(cleaned),
+            "removed_segments": removed,
+            "deduplicated_segments": deduped,
+        }
+
+    @classmethod
+    def _strip_news_noise(cls, text: str) -> str:
+        text = re.sub(r"https?://\S+", "", text).strip()
+        text = re.sub(r"（?文章来源[:：].*?）?$", "", text).strip()
+        text = re.sub(r"（?责任编辑[:：].*?）?$", "", text).strip()
+        text = re.sub(r"（?编辑[:：].*?）?$", "", text).strip()
+        text = re.sub(r"（?原标题[:：].*?）?$", "", text).strip()
+        return _WHITESPACE_RE.sub(" ", text).strip()
+
+    @classmethod
+    def _is_noise_segment(cls, text: str) -> bool:
+        if len(text) < 6:
+            return True
+        if any(pattern.search(text) for pattern in _NEWS_NOISE_PATTERNS):
+            return True
+        if text.count(" ") > 0 and len(text.split()) <= 2 and len(text) < 16:
+            return True
+        return False
 
     @staticmethod
     def _first_present(record: dict[str, Any], keys: list[str]) -> Any:
@@ -1072,6 +1173,7 @@ class DataAgent:
                 "summary": record.get("summary", ""),
                 "evidence_text": record.get("evidence_text") or record.get("summary", ""),
                 "content_status": record.get("content_status", "summary_only"),
+                "content_cleaning": record.get("content_cleaning", {}),
                 "content_error": record.get("content_error"),
                 "direction": record.get("direction", "中性"),
                 "confidence": record.get("confidence", 0.5),

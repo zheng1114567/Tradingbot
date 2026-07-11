@@ -394,7 +394,16 @@ def test_data_agent_fetches_full_news_text(tmp_path, monkeypatch):
         status_code = 200
         apparent_encoding = "utf-8"
         encoding = "utf-8"
-        text = "<html><body><p>Ping An Bank released a detailed operating update with retail banking evidence.</p><p>The full article contains enough context for downstream trading agents.</p></body></html>"
+        text = (
+            "<html><body>"
+            "<p>原标题：noise headline</p>"
+            "<p>Ping An Bank released a detailed operating update with retail banking evidence.</p>"
+            "<p>Ping An Bank released a detailed operating update with retail banking evidence.</p>"
+            "<p>The full article contains enough context for downstream trading agents.</p>"
+            "<p>责任编辑：someone</p>"
+            "<p>投资需谨慎。</p>"
+            "</body></html>"
+        )
 
         def raise_for_status(self):
             return None
@@ -434,5 +443,12 @@ def test_data_agent_fetches_full_news_text(tmp_path, monkeypatch):
     event = result.final_data["agent_payload"]["tier2_data"]["events"][0]
     assert raw_news["content_status"] == "full_text"
     assert "full article contains enough context" in raw_news["full_text"]
+    assert "责任编辑" not in raw_news["full_text"]
+    assert "原标题" not in raw_news["full_text"]
+    assert raw_news["full_text"].count("retail banking evidence") == 1
+    assert raw_news["content_cleaning"]["status"] == "cleaned"
+    assert raw_news["content_cleaning"]["removed_segments"] >= 2
+    assert raw_news["content_cleaning"]["deduplicated_segments"] == 1
     assert event["content_status"] == "full_text"
+    assert event["content_cleaning"]["status"] == "cleaned"
     assert "downstream trading agents" in event["evidence_text"]

@@ -70,7 +70,7 @@ dataagent --ticker 000001.SZ --date 2026-07-10 --no-sector-context
 dataagent --ticker 000001.SZ --date 2026-07-10 --no-llm-news-filter
 ```
 
-默认还会尝试访问新闻 URL 抽取正文，把正文片段保存为 `evidence_text`，供后续 Event / Analysis / System Agent 直接读取。如果正文抓取失败，会保留摘要并标记 `content_status=summary_only`；调试时也可以关闭正文抓取:
+默认还会尝试访问新闻 URL 抽取正文，去除广告/编辑/版权等噪声并去重段落，把清洗后的正文片段保存为 `evidence_text`，供后续 Event / Analysis / System Agent 直接读取。如果正文抓取失败，会保留摘要并标记 `content_status=summary_only`；正文清洗过程会记录在 `content_cleaning` 里。调试时也可以关闭正文抓取:
 
 ```bash
 dataagent --ticker 000001.SZ --date 2026-07-10 --no-news-full-text
@@ -82,7 +82,7 @@ DataAgent 会按步骤留痕并分层保存:
 data/results/data_agent_runs/<date>_<ticker>_<timestamp>/
 ├── 00_planner/plan.json           # ReAct Planner 计划和 trace；仅 --react-planner 开启
 ├── 01_input/request.json          # 输入参数、供应商链
-├── 02_raw/raw_data.json           # 原始供应商数据，新闻含 full_text/content_status/evidence_text
+├── 02_raw/raw_data.json           # 原始供应商数据，新闻含 raw_full_text/full_text/content_cleaning/evidence_text
 ├── 03_cleaned/cleaned_data.json   # 标准化、清洗后的数据
 ├── 04_analysis/analysis_data.json # 因子、摘要和分析数据
 ├── 04_analysis/news_events.json   # 新闻筛选、LLM 判断、事件化结果的独立留痕
@@ -95,7 +95,7 @@ Agent 推荐读取 `05_agent_payload/agent_payload.json`:
 ```text
 tier1_data.market / sentiment / sector / capital / risk
 tier2_data.price_data / factors / events / sector_context / data_quality
-tier2_data.events[*].evidence_text / content_status / llm_reason
+tier2_data.events[*].evidence_text / content_status / content_cleaning / llm_reason
 ```
 
 ## 运行

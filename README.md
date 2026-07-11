@@ -16,8 +16,16 @@ pip install -e .
 ### DataAgent 需要接入的 API
 
 - `TUSHARE_TOKEN`: 推荐配置。用于 A 股日 K、资金流、财务、ST/停牌、北向资金、龙虎榜、融资融券等数据。
+  - 注册/Token: `https://tushare.pro/register`
+  - 文档: `https://tushare.pro/document/1?doc_id=40`
 - `akshare`: 无需 token，但需要安装 `pip install -e ".[akshare]"` 或 `pip install akshare`。主要作为行情、新闻、板块、涨停梯队的降级数据源。
-- `DEEPSEEK_API_KEY`: 只有运行完整多 Agent 分析时需要；单独测试 DataAgent 不需要 LLM key。
+  - 文档: `https://akshare.akfamily.xyz/`
+- `DEEPSEEK_API_KEY`: 完整多 Agent 分析默认 LLM key；单独测试 DataAgent 不需要。
+  - API Key: `https://platform.deepseek.com/api_keys`
+  - 文档: `https://api-docs.deepseek.com/`
+- 可选 LLM 供应商:
+  - `OPENAI_API_KEY`: `https://platform.openai.com/api-keys`
+  - `ANTHROPIC_API_KEY`: `https://console.anthropic.com/settings/keys`
 
 ### 单独测试 DataAgent
 
@@ -25,10 +33,17 @@ pip install -e .
 python -m advanced_trading_agent.main --data-agent --ticker 000001.SZ --date 2026-07-10 --start-date 20260101 --end-date 20260710 --output-dir ./data/results
 ```
 
+如需先做 ReAct-style 数据规划，再执行确定性数据流水线:
+
+```bash
+python -m advanced_trading_agent.main --data-agent --react-planner --ticker 000001.SZ --date 2026-07-10 --start-date 20260101 --output-dir ./data/results
+```
+
 DataAgent 会按步骤留痕并分层保存:
 
 ```text
 data/results/data_agent_runs/<date>_<ticker>_<timestamp>/
+├── 00_planner/plan.json           # ReAct Planner 计划和 trace；仅 --react-planner 开启
 ├── 01_input/request.json          # 输入参数、供应商链
 ├── 02_raw/raw_data.json           # 原始供应商数据
 ├── 03_cleaned/cleaned_data.json   # 标准化、清洗后的数据

@@ -22,6 +22,7 @@ from ..config import config
 from .cleaner import DataCleaner
 from .factors import FactorCalculator
 from .manifest import DataManifest
+from .planner import DataAgentPlan, DataAgentPlanner
 from .vendor_router import get_vendor_chain, route_to_vendor
 
 
@@ -55,6 +56,7 @@ class DataAgentRequest:
     end_date: str | None = None
     include_capital_flow: bool = True
     include_factors: bool = True
+    use_react_planner: bool = False
     output_dir: str | None = None
     max_return_records: int = 20
 
@@ -89,6 +91,7 @@ class DataAgentRun:
     manifest_path: str
     response_path: str
     final_data: dict[str, Any]
+    plan: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
@@ -104,9 +107,11 @@ class DataAgent:
         *,
         route_fn: RouteFn = route_to_vendor,
         results_dir: str | None = None,
+        planner: DataAgentPlanner | None = None,
     ) -> None:
         self._route_fn = route_fn
         self._results_dir = Path(results_dir or config.get("results_dir", "data/results"))
+        self._planner = planner or DataAgentPlanner()
 
     def run(self, request: DataAgentRequest) -> DataAgentRun:
         run_dir = self._make_run_dir(request)
@@ -116,10 +121,21 @@ class DataAgent:
         )
 
         artifacts: dict[str, DataAgentArtifact] = {}
+        plan_payload: dict[str, Any] | None = None
+        if request.use_react_planner:
+            request, plan = self._planner.plan(request)
+            plan_payload = plan.to_dict()
+            artifacts["planner"] = self._write_json(run_dir / "00_planner" / "plan.json", {
+                "stage": "planner",
+                "created_at": _utc_now(),
+                "plan": plan_payload,
+            })
+
         input_payload = {
             "stage": "input",
             "created_at": _utc_now(),
             "request": asdict(request),
+            "planner": plan_payload,
             "vendor_chain": {
                 "daily": get_vendor_chain("get_daily"),
                 "capital_flow": get_vendor_chain("get_capital_flow"),
@@ -147,6 +163,7 @@ class DataAgent:
             "raw": raw_payload,
             "cleaned": cleaned_payload,
             "analysis": analysis_payload,
+            "planner": plan_payload,
             "manifest": manifest.to_dict(),
         }
         artifacts["final"] = self._write_json(run_dir / "05_final" / "response.json", final_payload)
@@ -160,6 +177,7 @@ class DataAgent:
             manifest_path=str(manifest_path),
             response_path=artifacts["final"].path,
             final_data=final_payload,
+            plan=plan_payload,
         )
 
     def _make_run_dir(self, request: DataAgentRequest) -> Path:
@@ -346,6 +364,7 @@ def run_data_agent(
     start_date: str | None = None,
     end_date: str | None = None,
     output_dir: str | None = None,
+    use_react_planner: bool = False,
 ) -> DataAgentRun:
     """Convenience entry point for tests and CLI usage."""
 
@@ -355,5 +374,6 @@ def run_data_agent(
         start_date=start_date,
         end_date=end_date,
         output_dir=output_dir,
+        use_react_planner=use_react_planner,
     )
     return DataAgent(results_dir=output_dir).run(request)

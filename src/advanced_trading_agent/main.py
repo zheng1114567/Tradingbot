@@ -158,6 +158,7 @@ def run_standalone_data_agent(
     start_date: str | None = None,
     end_date: str | None = None,
     output_dir: str | None = None,
+    use_react_planner: bool = False,
 ) -> str:
     """Run data collection, cleaning, analysis, and layered persistence only."""
     result = DataAgent(results_dir=output_dir).run(
@@ -167,6 +168,7 @@ def run_standalone_data_agent(
             start_date=start_date,
             end_date=end_date,
             output_dir=output_dir,
+            use_react_planner=use_react_planner,
         )
     )
     return json.dumps(result.to_dict(), ensure_ascii=False, indent=2)
@@ -203,6 +205,7 @@ def main():
     parser.add_argument("--daily-review", action="store_true", help="运行每日复盘任务")
     parser.add_argument("--portfolio-backtest", action="store_true", help="运行观察池组合回测")
     parser.add_argument("--data-agent", action="store_true", help="单独运行 DataAgent 并分层保存数据")
+    parser.add_argument("--react-planner", action="store_true", help="DataAgent 运行前启用 ReAct Planner")
     parser.add_argument("--strategy-audit", action="store_true", help="查看策略规则变更审计队列")
     parser.add_argument("--audit-proposal-id", help="要审批的策略变更 proposal_id")
     parser.add_argument("--audit-action", choices=["approve", "reject"], help="策略变更审批动作")
@@ -243,6 +246,7 @@ def main():
             start_date=args.start_date,
             end_date=args.end_date,
             output_dir=args.output_dir,
+            use_react_planner=args.react_planner,
         ))
         return
 

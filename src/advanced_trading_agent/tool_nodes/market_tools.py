@@ -42,9 +42,11 @@ class MarketTools:
         try:
             data = route_to_vendor("get_daily", code="000001.SH",
                                    start_date=trade_date, end_date=trade_date)
+            if not isinstance(data, dict):
+                data = {}
             # 涨停梯队需要额外计算
             result = {
-                "sentiment": data.get("sentiment", "正常") if isinstance(data, dict) else "正常",
+                "sentiment": data.get("sentiment", "正常"),
                 "advance_count": data.get("advance_count", 0),
                 "decline_count": data.get("decline_count", 0),
                 "limit_up_count": data.get("limit_up_count", 0),

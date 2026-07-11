@@ -21,6 +21,14 @@ from ..core.cache_manager import CacheManager
 logger = logging.getLogger(__name__)
 
 
+def _first_available_akshare_function(ak: Any, *names: str) -> Any | None:
+    for name in names:
+        fn = getattr(ak, name, None)
+        if fn is not None:
+            return fn
+    return None
+
+
 class EventTools:
     """Event Agent 工具箱"""
 
@@ -41,7 +49,20 @@ class EventTools:
 
         try:
             import akshare as ak
-            df = ak.stock_info_global()
+            fn = _first_available_akshare_function(
+                ak,
+                "stock_info_global_em",
+                "stock_info_global_sina",
+                "stock_info_global_cls",
+                "stock_info_global",
+            )
+            if fn is None:
+                logger.info("akshare global news function unavailable")
+                return []
+            try:
+                df = fn()
+            except TypeError:
+                df = fn(symbol="全部")
             if df is not None and not df.empty:
                 records = df.to_dict("records")
                 # 关键词过滤
@@ -76,7 +97,21 @@ class EventTools:
 
         try:
             import akshare as ak
-            df = ak.stock_zh_a_notice(code=code)
+            fn = _first_available_akshare_function(
+                ak,
+                "stock_individual_notice_report",
+                "stock_notice_report",
+                "stock_zh_a_notice",
+            )
+            if fn is None:
+                logger.info("akshare announcement function unavailable")
+                return []
+            if getattr(fn, "__name__", "") == "stock_individual_notice_report":
+                df = fn(security=code, symbol="全部")
+            elif getattr(fn, "__name__", "") == "stock_notice_report":
+                df = fn(symbol="全部")
+            else:
+                df = fn(code=code)
             if df is not None and not df.empty:
                 result = df.head(20).to_dict("records")
                 self.cache.set(cache_key, result)
@@ -100,7 +135,20 @@ class EventTools:
 
         try:
             import akshare as ak
-            df = ak.stock_info_global()
+            fn = _first_available_akshare_function(
+                ak,
+                "stock_info_global_em",
+                "stock_info_global_sina",
+                "stock_info_global_cls",
+                "stock_info_global",
+            )
+            if fn is None:
+                logger.info("akshare calendar news function unavailable")
+                return []
+            try:
+                df = fn()
+            except TypeError:
+                df = fn(symbol="全部")
             if df is not None and not df.empty:
                 result = df.head(20).to_dict("records")
                 self.cache.set(cache_key, result)

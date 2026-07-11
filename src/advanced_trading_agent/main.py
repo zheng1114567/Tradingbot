@@ -35,13 +35,14 @@ logger = logging.getLogger(__name__)
 
 
 def analyze_single(ticker: str, trade_date: str | None = None,
-                   debug: bool = False) -> str:
+                   debug: bool = False, skip_backtest: bool = False) -> str:
     """分析单个标的
 
     Args:
         ticker: 股票代码 (如 "000001.SZ")
         trade_date: 交易日, 默认今天
         debug: 是否打印调试信息
+        skip_backtest: 是否跳过回测审查
 
     Returns:
         Markdown 格式的分析报告
@@ -50,19 +51,24 @@ def analyze_single(ticker: str, trade_date: str | None = None,
     logger.info("Analyzing %s on %s...", ticker, trade_date)
 
     system = TradingSystem(debug=debug)
-    final_state, report = system.analyze(ticker, trade_date)
+    final_state, report = system.analyze(
+        ticker,
+        trade_date,
+        skip_backtest=skip_backtest,
+    )
 
     return report
 
 
 def analyze_batch(tickers_file: str, debug: bool = False,
-                  max_workers: int = 4) -> list[str]:
+                  max_workers: int = 4, skip_backtest: bool = False) -> list[str]:
     """批量分析 (并发执行)
 
     Args:
         tickers_file: 每行一个股票代码的文件
         debug: 是否打印调试信息
         max_workers: 最大并发数 (默认 4)
+        skip_backtest: 是否跳过回测审查
     """
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -74,7 +80,12 @@ def analyze_batch(tickers_file: str, debug: bool = False,
 
     with ThreadPoolExecutor(max_workers=max(1, max_workers)) as executor:
         future_map = {
-            executor.submit(analyze_single, ticker, debug=debug): (idx, ticker)
+            executor.submit(
+                analyze_single,
+                ticker,
+                debug=debug,
+                skip_backtest=skip_backtest,
+            ): (idx, ticker)
             for idx, ticker in enumerate(tickers)
         }
         for future in as_completed(future_map):
@@ -226,6 +237,7 @@ def main():
     parser.add_argument("--no-llm-news-filter", action="store_true", help="DataAgent 新闻筛选不调用 LLM, 仅使用规则兜底")
     parser.add_argument("--no-news-full-text", action="store_true", help="DataAgent 不抓取新闻 URL 正文, 仅保留摘要")
     parser.add_argument("--workers", type=int, default=4, help="批量并发数 (默认 4)")
+    parser.add_argument("--skip-backtest", action="store_true", help="跳过 Backtest Agent，仅保留可审计占位报告")
     parser.add_argument("--debug", action="store_true", help="调试模式")
     parser.add_argument("--json", action="store_true", help="JSON 输出")
 
@@ -277,7 +289,12 @@ def main():
         return
 
     if args.batch:
-        reports = analyze_batch(args.batch, debug=args.debug, max_workers=args.workers)
+        reports = analyze_batch(
+            args.batch,
+            debug=args.debug,
+            max_workers=args.workers,
+            skip_backtest=args.skip_backtest,
+        )
         print(f"Batch complete: {len(reports)} tickers analyzed")
         return
 
@@ -285,7 +302,12 @@ def main():
         parser.print_help()
         sys.exit(1)
 
-    report = analyze_single(args.ticker, args.date, debug=args.debug)
+    report = analyze_single(
+        args.ticker,
+        args.date,
+        debug=args.debug,
+        skip_backtest=args.skip_backtest,
+    )
 
     if args.json:
         # 提取 JSON 部分

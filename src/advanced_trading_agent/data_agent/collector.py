@@ -261,15 +261,33 @@ def get_news_akshare(
 
     if include_announcements and len(records) < limit:
         try:
-            df = ak.stock_announcement_em(symbol=code6)
+            fn = (
+                getattr(ak, "stock_announcement_em", None)
+                or getattr(ak, "stock_individual_notice_report", None)
+                or getattr(ak, "stock_notice_report", None)
+            )
+            if fn is None:
+                df = None
+            elif getattr(fn, "__name__", "") == "stock_individual_notice_report":
+                df = fn(security=code6, symbol="全部")
+            elif getattr(fn, "__name__", "") == "stock_notice_report":
+                df = fn(symbol="全部")
+            else:
+                df = fn(symbol=code6)
             if df is not None and not df.empty:
                 for row in df.head(max(0, limit - len(records))).to_dict("records"):
                     records.append({
-                        "title": row.get("公告标题") or row.get("title") or "",
-                        "summary": row.get("公告标题") or row.get("summary") or "",
+                        "title": (
+                            row.get("公告标题")
+                            or row.get("title")
+                            or row.get("公告名称")
+                            or row.get("title_ch")
+                            or ""
+                        ),
+                        "summary": row.get("公告标题") or row.get("summary") or row.get("公告名称") or "",
                         "source": "akshare",
-                        "time": row.get("公告时间") or row.get("time") or "",
-                        "url": row.get("公告链接") or row.get("url") or "",
+                        "time": row.get("公告时间") or row.get("time") or row.get("公告日期") or "",
+                        "url": row.get("公告链接") or row.get("url") or row.get("网址") or "",
                         "type": "announcement",
                         "code": code,
                         "data_source": "akshare",
@@ -507,7 +525,17 @@ def get_delisting_akshare() -> list[str]:
 def get_northbound_flow_akshare(trade_date: str | None = None) -> dict[str, Any]:
     ak = _get_akshare()
     try:
-        df = ak.stock_hsgt_north_net_flow_in_em(symbol="北上")
+        fn = (
+            getattr(ak, "stock_hsgt_north_net_flow_in_em", None)
+            or getattr(ak, "stock_hsgt_hist_em", None)
+            or getattr(ak, "stock_hsgt_fund_flow_summary_em", None)
+        )
+        if fn is None:
+            return {"net_inflow": 0, "data_source": "akshare", "note": "northbound function unavailable"}
+        if getattr(fn, "__name__", "") == "stock_hsgt_hist_em":
+            df = fn(symbol="北向资金")
+        else:
+            df = fn()
         if df is not None and not df.empty:
             record = df.to_dict("records")[-1]
             record["data_source"] = "akshare"

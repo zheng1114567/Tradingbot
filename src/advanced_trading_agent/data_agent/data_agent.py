@@ -782,7 +782,12 @@ class DataAgent:
             max_tokens=1200,
         )
         payload = json.loads(str(response))
-        decisions = payload.get("decisions", payload if isinstance(payload, list) else [])
+        if isinstance(payload, list):
+            decisions = payload
+        elif isinstance(payload, dict):
+            decisions = payload.get("decisions", [])
+        else:
+            decisions = []
         if not isinstance(decisions, list):
             raise ValueError("LLM news filter response must contain a decisions list")
         return [item for item in decisions if isinstance(item, dict)]

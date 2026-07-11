@@ -285,18 +285,45 @@ class LocalCache:
 def get_cached_sector_data(trade_date: str | None = None, top_n: int = 10) -> list[dict[str, Any]]:
     """Convenience: get sector ranking from local cache.
 
-    Falls back to building the cache from baostock on first call.
-    Format compatible with what MarketScanner._scan_hot_sectors expects.
+    Reads from sector_ranking_{date}.json or board_index.json created
+    by build_cache.py. Falls back to baostock-based computation if no
+    cache exists.
     """
+    td = trade_date or date.today().isoformat()
     cache = LocalCache()
-    data = cache.ensure_sector_data(trade_date)
+
+    # Prefer efinance-based ranking cache (from build_cache.py)
+    ranking_path = cache.cache_dir / f"sector_ranking_{td}.json"
+    if ranking_path.exists():
+        data = json.loads(ranking_path.read_text("utf-8"))
+        return data[:top_n]
+
+    # Fall back to baostock-computed cache
+    data = cache.ensure_sector_data(td)
     sectors = data.get("sectors", [])
     return sectors[:top_n]
 
 
 def get_cached_sector_constituents(sector_name: str) -> list[dict[str, Any]]:
-    """Convenience: get constituents for a sector from local cache."""
+    """Convenience: get constituents for a sector from local cache.
+
+    Reads from board_index.json created by build_cache.py.
+    """
     cache = LocalCache()
+
+    # Prefer efinance-based board index (from build_cache.py)
+    idx_path = cache.cache_dir / "board_index.json"
+    if idx_path.exists():
+        board_index = json.loads(idx_path.read_text("utf-8"))
+        constituents = board_index.get(sector_name, [])
+        if constituents:
+            return constituents
+        # Fuzzy match
+        for bname, stocks in board_index.items():
+            if sector_name in bname or bname in sector_name:
+                return stocks
+
+    # Fall back to baostock-computed cache
     data = cache.ensure_sector_data()
     constituents = data.get("constituents", {})
     return constituents.get(sector_name, [])
@@ -304,6 +331,12 @@ def get_cached_sector_constituents(sector_name: str) -> list[dict[str, Any]]:
 
 def get_cached_daily(ticker: str, start_date: str | None = None,
                      end_date: str | None = None) -> list[dict[str, Any]]:
-    """Convenience: get daily data from local cache."""
+    """Convenience: get daily data from local parquet cache."""
     cache = LocalCache()
+    cache_path = cache.cache_dir / "daily" / f"{ticker.replace('.', '_')}.parquet"
+    if cache_path.exists():
+        df = pd.read_parquet(cache_path)
+        if "trade_date" in df.columns:
+            df["trade_date"] = pd.to_datetime(df["trade_date"])
+        return df.to_dict("records")
     return cache.ensure_daily_data(ticker, start_date, end_date)

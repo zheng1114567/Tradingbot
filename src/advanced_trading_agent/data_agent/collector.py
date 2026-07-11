@@ -968,7 +968,11 @@ def get_limit_up_tiers_local(trade_date: str | None = None) -> dict[str, Any]:
     if not data or not data.get("stocks"):
         raise NoMarketDataError("No cached limit-up data — run build_cache first", vendor="local_cache")
     return data
-    """Daily OHLCV from local baostock parquet cache."""
+
+
+def get_daily_local(code: str = "", start_date: str | None = None,
+                    end_date: str | None = None) -> list[dict[str, Any]]:
+    """Daily OHLCV from local parquet cache."""
     from .local_cache import get_cached_daily
 
     try:

@@ -340,3 +340,23 @@ def get_cached_daily(ticker: str, start_date: str | None = None,
             df["trade_date"] = pd.to_datetime(df["trade_date"])
         return df.to_dict("records")
     return cache.ensure_daily_data(ticker, start_date, end_date)
+
+
+def get_cached_dragon_tiger(trade_date: str | None = None) -> list[dict[str, Any]]:
+    """Read cached dragon-tiger data."""
+    td = trade_date or date.today().isoformat()
+    cache = LocalCache()
+    path = cache.cache_dir / f"dragon_tiger_{td}.json"
+    if path.exists():
+        return json.loads(path.read_text("utf-8"))
+    return []
+
+
+def get_cached_limit_up(trade_date: str | None = None) -> dict[str, Any]:
+    """Read cached limit-up pool data."""
+    td = trade_date or date.today().isoformat()
+    cache = LocalCache()
+    path = cache.cache_dir / f"limit_up_{td}.json"
+    if path.exists():
+        return json.loads(path.read_text("utf-8"))
+    return {}

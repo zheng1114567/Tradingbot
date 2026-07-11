@@ -49,6 +49,12 @@ def build(trade_date: str | None = None, output_dir: str | None = None) -> Path:
     # 4. Daily data snapshot for top stocks via baostock (best-effort)
     _cache_daily_snapshot(cache_dir, board_index, td)
 
+    # 5. Dragon-tiger via efinance
+    _cache_dragon_tiger(cache_dir, td)
+
+    # 6. Limit-up pool via akshare
+    _cache_limit_up(cache_dir, td)
+
     logger.info("=== Cache complete: %s ===", cache_dir)
     _print_summary(cache_dir)
 
@@ -342,6 +348,71 @@ def _cache_via_baostock(
 # ------------------------------------------------------------------
 # Helpers
 # ------------------------------------------------------------------
+
+
+def _cache_dragon_tiger(cache_dir: Path, trade_date: str) -> int:
+    """Download dragon-tiger board data via efinance."""
+    path = cache_dir / f"dragon_tiger_{trade_date}.json"
+    if path.exists():
+        data = json.loads(path.read_text("utf-8"))
+        logger.info("Dragon-tiger: %d records (cached)", len(data))
+        return len(data)
+
+    try:
+        import efinance as ef
+    except ImportError:
+        logger.warning("efinance not installed, skipping dragon-tiger")
+        return 0
+
+    try:
+        df = ef.stock.get_daily_billboard(start_date=trade_date, end_date=trade_date)
+        if df is None or df.empty:
+            logger.warning("Dragon-tiger: no data for %s", trade_date)
+            return 0
+
+        records: list[dict[str, Any]] = []
+        for _, row in df.iterrows():
+            records.append({
+                "code": str(row.get("股票代码", "")),
+                "name": str(row.get("股票名称", "")),
+                "date": str(row.get("上榜日期", "")),
+                "close": float(row.get("收盘价", 0) or 0),
+                "change_pct": float(row.get("涨跌幅", 0) or 0),
+                "turnover": float(row.get("换手率", 0) or 0),
+                "net_buy": float(row.get("龙虎榜净买额", 0) or 0),
+                "reason": str(row.get("上榜原因", "")),
+            })
+
+        path.write_text(json.dumps(records, ensure_ascii=False), "utf-8")
+        logger.info("Dragon-tiger: %d records saved", len(records))
+        return len(records)
+    except Exception as exc:
+        logger.warning("Dragon-tiger failed: %s", exc)
+        return 0
+
+
+def _cache_limit_up(cache_dir: Path, trade_date: str) -> dict[str, Any]:
+    """Download limit-up pool via vendor router (akshare)."""
+    path = cache_dir / f"limit_up_{trade_date}.json"
+    if path.exists():
+        data = json.loads(path.read_text("utf-8"))
+        logger.info("Limit-up: %d stocks (cached)", len(data.get("stocks", [])))
+        return data
+
+    try:
+        from .vendor_router import route_to_vendor
+
+        data = route_to_vendor("get_limit_up_tiers", trade_date=trade_date)
+        if isinstance(data, dict):
+            path.write_text(json.dumps(data, ensure_ascii=False, default=str), "utf-8")
+            logger.info("Limit-up: %d first, %d second, %d third+, %d stocks",
+                        data.get("first_board", 0), data.get("second_board", 0),
+                        data.get("third_plus", 0), len(data.get("stocks", [])))
+            return data
+    except Exception as exc:
+        logger.warning("Limit-up failed: %s", exc)
+
+    return {}
 
 
 def _print_summary(cache_dir: Path) -> None:

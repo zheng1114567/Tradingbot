@@ -950,8 +950,24 @@ def get_sector_constituents_local(sector_name: str = "") -> list[dict[str, Any]]
         raise VendorNotConfiguredError("local_cache requires baostock", vendor="local_cache")
 
 
-def get_daily_local(code: str = "", start_date: str | None = None,
-                    end_date: str | None = None) -> list[dict[str, Any]]:
+def get_dragon_tiger_local(trade_date: str | None = None) -> list[dict[str, Any]]:
+    """Dragon-tiger from local cache."""
+    from .local_cache import get_cached_dragon_tiger
+
+    data = get_cached_dragon_tiger(trade_date)
+    if not data:
+        raise NoMarketDataError("No cached dragon-tiger data — run build_cache first", vendor="local_cache")
+    return data
+
+
+def get_limit_up_tiers_local(trade_date: str | None = None) -> dict[str, Any]:
+    """Limit-up tiers from local cache."""
+    from .local_cache import get_cached_limit_up
+
+    data = get_cached_limit_up(trade_date)
+    if not data or not data.get("stocks"):
+        raise NoMarketDataError("No cached limit-up data — run build_cache first", vendor="local_cache")
+    return data
     """Daily OHLCV from local baostock parquet cache."""
     from .local_cache import get_cached_daily
 
@@ -988,8 +1004,10 @@ def register_all_vendors() -> None:
     register_vendor_impl("get_northbound_flow", "akshare", get_northbound_flow_akshare)
     register_vendor_impl("get_northbound_top10", "akshare", get_northbound_top10_akshare)
     register_vendor_impl("get_limit_up_tiers", "akshare", get_limit_up_tiers_akshare)
+    register_vendor_impl("get_limit_up_tiers", "local_cache", get_limit_up_tiers_local)
     register_vendor_impl("get_dragon_tiger", "akshare", get_dragon_tiger_akshare)
     register_vendor_impl("get_dragon_tiger", "efinance", get_dragon_tiger_efinance)
+    register_vendor_impl("get_dragon_tiger", "local_cache", get_dragon_tiger_local)
     register_vendor_impl("get_margin", "akshare", get_margin_akshare)
     register_vendor_impl("get_sector_constituents", "akshare", get_sector_constituents_akshare)
     register_vendor_impl("get_sector_constituents", "efinance", get_sector_constituents_efinance)

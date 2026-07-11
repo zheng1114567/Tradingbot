@@ -718,6 +718,78 @@ def get_sector_constituents_akshare(sector_name: str = "") -> list[dict[str, Any
 # efinance-based adapters (fallback when eastmoney push2 endpoints are blocked)
 # ------------------------------------------------------------------
 
+# Representative A-share stocks used to build sector rankings via
+# get_belong_board aggregation. One stock from each major sector.
+_EFINANCE_PROBE_STOCKS: list[str] = []
+
+
+def _get_probe_stocks() -> list[str]:
+    """Lazy-init a diverse set of probe stocks for sector discovery."""
+    global _EFINANCE_PROBE_STOCKS
+    if _EFINANCE_PROBE_STOCKS:
+        return _EFINANCE_PROBE_STOCKS
+    _EFINANCE_PROBE_STOCKS = [
+        '000001', '000002', '000858', '002415', '300750', '600519', '601398',
+        '600036', '000333', '002594', '300059', '600030', '601857', '688981',
+        '000725', '002230', '600276', '601318', '000651', '603259', '600900',
+        '300124', '601012', '600104', '000568', '002475', '300433', '600809',
+        '002714', '300498', '600585', '000063', '688111', '601899', '600050',
+        '002352', '300015', '600887', '601088', '600028', '000792', '600941',
+    ]
+    return _EFINANCE_PROBE_STOCKS
+
+
+def get_sector_efinance(top_n: int = 10) -> list[dict[str, Any]]:
+    """Sector ranking via efinance board membership aggregation.
+
+    Calls get_belong_board() for a diverse set of probe stocks and
+    aggregates board change percentages. Uses the push2 slist endpoint
+    which is typically not blocked by DPI (unlike clist).
+    """
+    try:
+        import efinance as ef
+    except ImportError:
+        raise VendorNotConfiguredError("efinance not installed (pip install efinance)", vendor="efinance")
+
+    from collections import defaultdict
+
+    board_changes: dict[str, list[float]] = defaultdict(list)
+    for code in _get_probe_stocks():
+        try:
+            df = ef.stock.get_belong_board(code)
+            if df is None or df.empty:
+                continue
+            for _, row in df.iterrows():
+                board_name = str(row.get("板块名称", ""))
+                chg = row.get("板块涨幅", None)
+                if board_name and chg is not None:
+                    try:
+                        board_changes[board_name].append(float(chg))
+                    except (TypeError, ValueError):
+                        pass
+        except Exception:
+            continue
+
+    rankings: list[dict[str, Any]] = []
+    for name, changes in board_changes.items():
+        if len(changes) >= 2:
+            avg = sum(changes) / len(changes)
+            rankings.append({
+                "sector_name": name,
+                "change_pct": round(avg, 2),
+                "strength_score": round(avg, 2),
+                "data_source": "efinance",
+                "rank": 0,
+            })
+
+    rankings.sort(key=lambda x: x["change_pct"], reverse=True)
+    for i, r in enumerate(rankings):
+        r["rank"] = i + 1
+
+    if not rankings:
+        raise NoMarketDataError("No sector data from efinance probe stocks", vendor="efinance")
+    return rankings[:top_n]
+
 
 def get_dragon_tiger_efinance(trade_date: str | None = None) -> list[dict[str, Any]]:
     """Dragon-tiger list via efinance (uses datacenter API, not push2)."""
@@ -749,11 +821,76 @@ def get_dragon_tiger_efinance(trade_date: str | None = None) -> list[dict[str, A
         raise NoMarketDataError(str(exc), vendor="efinance") from exc
 
 
-def get_sector_constituents_efinance(sector_name: str = "") -> list[dict[str, Any]]:
-    """Get board members via efinance — reverse lookup from board name.
+# Cache for efinance reverse board index (board_name → [{code, name}, ...])
+_EFINANCE_BOARD_INDEX: dict[str, list[dict[str, str]]] | None = None
 
-    This is best-effort: iterates A-share stocks and collects those
-    belonging to the target board. Cached in memory for the session.
+
+def _build_board_index() -> dict[str, list[dict[str, str]]]:
+    """Build board→stocks reverse index from efinance get_belong_board.
+
+    Queries a broad set of A-share stocks and aggregates which stocks
+    belong to each board. Cached in memory for the session lifetime.
+    """
+    global _EFINANCE_BOARD_INDEX
+    if _EFINANCE_BOARD_INDEX is not None:
+        return _EFINANCE_BOARD_INDEX
+
+    try:
+        import efinance as ef
+    except ImportError:
+        _EFINANCE_BOARD_INDEX = {}
+        return _EFINANCE_BOARD_INDEX
+
+    from collections import defaultdict
+
+    # Use probe stocks + expand with more for broader coverage
+    codes = list(_get_probe_stocks())
+    # Add more stocks for better sector coverage
+    extra = [
+        '600000', '600016', '600031', '600048', '600050', '600085', '600111',
+        '600150', '600196', '600309', '600406', '600436', '600438', '600519',
+        '600570', '600588', '600690', '600703', '600745', '600809', '600837',
+        '600887', '600893', '600900', '601006', '601012', '601088', '601111',
+        '601166', '601318', '601328', '601398', '601668', '601857', '601939',
+        '603160', '603259', '603288', '603501', '603986', '688008', '688012',
+        '688036', '688111', '688126', '688169', '688187', '688981',
+        '000063', '000066', '000333', '000568', '000596', '000651', '000725',
+        '000858', '000876', '000895', '002007', '002049', '002142', '002230',
+        '002241', '002271', '002304', '002352', '002415', '002460', '002475',
+        '002594', '002714', '300003', '300015', '300059', '300124', '300347',
+        '300433', '300498', '300750', '300760',
+    ]
+    codes.extend(extra)
+    codes = list(dict.fromkeys(codes))  # deduplicate
+
+    board_index: dict[str, list[dict[str, str]]] = defaultdict(list)
+    for code in codes:
+        try:
+            df = ef.stock.get_belong_board(code)
+            if df is None or df.empty:
+                continue
+            name = str(df.iloc[0].get("股票名称", "")) if len(df) > 0 else ""
+            for _, row in df.iterrows():
+                board_name = str(row.get("板块名称", ""))
+                if board_name:
+                    board_index[board_name].append({
+                        "code": code,
+                        "name": name,
+                        "sector": board_name,
+                    })
+        except Exception:
+            continue
+
+    _EFINANCE_BOARD_INDEX = dict(board_index)
+    logger.info("efinance board index: %d boards from %d stocks", len(_EFINANCE_BOARD_INDEX), len(codes))
+    return _EFINANCE_BOARD_INDEX
+
+
+def get_sector_constituents_efinance(sector_name: str = "") -> list[dict[str, Any]]:
+    """Get board members via efinance reverse index.
+
+    Builds a board→stocks mapping by calling get_belong_board() for
+    ~100 representative A-share stocks and caching the result.
     """
     if not sector_name:
         return []
@@ -763,12 +900,23 @@ def get_sector_constituents_efinance(sector_name: str = "") -> list[dict[str, An
     except ImportError:
         raise VendorNotConfiguredError("efinance not installed (pip install efinance)", vendor="efinance")
 
-    # For now, return empty — the full reverse index is expensive to build.
-    # In practice, akshare's push2-based adapter handles this when the
-    # network allows it. This adapter exists so the vendor chain doesn't
-    # stop at akshare when push2 is blocked.
-    logger.debug("efinance sector_constituents: reverse index not yet implemented for %s", sector_name)
-    return []
+    board_index = _build_board_index()
+    constituents = board_index.get(sector_name, [])
+
+    if not constituents:
+        # Fuzzy match: try partial name matching
+        for bname, stocks in board_index.items():
+            if sector_name in bname or bname in sector_name:
+                constituents = stocks
+                break
+
+    if not constituents:
+        raise NoMarketDataError(
+            f"No constituents for board '{sector_name}' in efinance index",
+            vendor="efinance",
+        )
+
+    return [dict(c) for c in constituents]
 
 
 # ------------------------------------------------------------------
@@ -828,6 +976,7 @@ def register_all_vendors() -> None:
     register_vendor_impl("get_news", "sina", get_news_sina)
     register_vendor_impl("get_sector", "akshare", get_sector_akshare)
     register_vendor_impl("get_sector", "eastmoney", get_sector_eastmoney)
+    register_vendor_impl("get_sector", "efinance", get_sector_efinance)
     register_vendor_impl("get_sector", "local_cache", get_sector_local)
     register_vendor_impl("get_financial", "akshare", get_financial_akshare)
 

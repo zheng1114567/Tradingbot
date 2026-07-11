@@ -94,8 +94,10 @@ TOOL_CATEGORIES = {
         "description": "A股特有数据",
         "tools": [
             "get_northbound_flow",     # 北向资金
+            "get_northbound_top10",    # 北向十大成交
             "get_limit_up_tiers",      # 涨停梯队
             "get_sector",              # 板块数据
+            "get_sector_constituents", # 板块成分股
             "get_dragon_tiger",        # 龙虎榜
             "get_margin",              # 融资融券
         ],
@@ -129,13 +131,27 @@ def get_vendor_for_tool(method: str) -> str:
 
 
 def get_vendor_chain(method: str) -> list[str]:
-    """获取工具方法的供应商降级链"""
+    """获取工具方法的供应商降级链
+
+    优先从 config 读取，然后追加所有已注册但 config 中未列出的供应商。
+    """
+    chain: list[str] = []
     for category, info in TOOL_CATEGORIES.items():
         if method in info["tools"]:
             vendor_config = config.get("data_vendors", {}).get(category, "")
             chain = [v.strip() for v in vendor_config.split(",") if v.strip()]
-            return chain if chain else [DataVendor.AKSHARE.value]
-    return [DataVendor.AKSHARE.value]
+            break
+
+    if not chain:
+        chain = [DataVendor.AKSHARE.value]
+
+    # Append registered vendors not already in the chain
+    registered = list(_VENDOR_IMPLEMENTATIONS.get(method, {}).keys())
+    for vendor in registered:
+        if vendor not in chain:
+            chain.append(vendor)
+
+    return chain
 
 
 # ============================================================
@@ -248,7 +264,9 @@ def route_to_vendor(method: str, *args, **kwargs) -> Any:
             start = time.perf_counter()
             result = impl(*args, **kwargs)
             elapsed_ms = (time.perf_counter() - start) * 1000
-            if result is not None:
+            # Treat None and empty list/dict as "no data" → try next vendor
+            is_empty = result is None or (isinstance(result, (list, dict)) and len(result) == 0)
+            if not is_empty:
                 _record_route_attempt(
                     route_trace,
                     method=method,
@@ -258,9 +276,9 @@ def route_to_vendor(method: str, *args, **kwargs) -> Any:
                     record_count=len(result) if isinstance(result, list) else None,
                 )
                 return result
-            # None 返回值视为无数据
+            # None or empty container → treat as no data
             no_data = NoMarketDataError(
-                f"{vendor}/{method} returned None",
+                f"{vendor}/{method} returned empty",
                 vendor=vendor, method=method
             )
             _record_route_attempt(

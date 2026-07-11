@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from enum import Enum
 from typing import Any, Callable
 
@@ -156,6 +157,33 @@ def get_vendor_impl(method: str, vendor: str) -> Callable | None:
     return _VENDOR_IMPLEMENTATIONS.get(method, {}).get(vendor)
 
 
+def _record_route_attempt(
+    route_trace: list[dict[str, Any]] | None,
+    *,
+    method: str,
+    vendor: str,
+    status: str,
+    elapsed_ms: float | None = None,
+    record_count: int | None = None,
+    error: str | None = None,
+) -> None:
+    """Append one vendor attempt to the optional auditable route trace."""
+    if route_trace is None:
+        return
+    attempt: dict[str, Any] = {
+        "method": method,
+        "vendor": vendor,
+        "status": status,
+    }
+    if elapsed_ms is not None:
+        attempt["elapsed_ms"] = round(elapsed_ms, 3)
+    if record_count is not None:
+        attempt["record_count"] = record_count
+    if error:
+        attempt["error"] = error
+    route_trace.append(attempt)
+
+
 # ============================================================
 # 路由执行
 # ============================================================
@@ -171,6 +199,7 @@ def route_to_vendor(method: str, *args, **kwargs) -> Any:
     5. 无数据 -> 返回 NO_DATA 哨兵
     6. 所有供应商失败 -> 抛异常
     """
+    route_trace = kwargs.pop("_route_trace", None)
     chain = get_vendor_chain(method)
 
     last_no_data: NoMarketDataError | None = None
@@ -180,37 +209,89 @@ def route_to_vendor(method: str, *args, **kwargs) -> Any:
         impl = get_vendor_impl(method, vendor)
         if impl is None:
             logger.warning("No implementation for %s/%s", vendor, method)
+            _record_route_attempt(
+                route_trace,
+                method=method,
+                vendor=vendor,
+                status="missing_impl",
+            )
             continue
 
         try:
+            start = time.perf_counter()
             result = impl(*args, **kwargs)
+            elapsed_ms = (time.perf_counter() - start) * 1000
             if result is not None:
+                _record_route_attempt(
+                    route_trace,
+                    method=method,
+                    vendor=vendor,
+                    status="success",
+                    elapsed_ms=elapsed_ms,
+                    record_count=len(result) if isinstance(result, list) else None,
+                )
                 return result
             # None 返回值视为无数据
             no_data = NoMarketDataError(
                 f"{vendor}/{method} returned None",
                 vendor=vendor, method=method
             )
+            _record_route_attempt(
+                route_trace,
+                method=method,
+                vendor=vendor,
+                status="no_data",
+                elapsed_ms=elapsed_ms,
+                error=str(no_data),
+            )
             if last_no_data is None:
                 last_no_data = no_data
             continue
         except VendorRateLimitError as e:
             logger.warning("Vendor %s rate-limited for %s; trying next", vendor, method)
+            _record_route_attempt(
+                route_trace,
+                method=method,
+                vendor=vendor,
+                status="rate_limited",
+                error=str(e),
+            )
             if first_error is None:
                 first_error = e
             continue
         except VendorNotConfiguredError as e:
             logger.warning("Vendor %s not configured for %s; trying next", vendor, method)
+            _record_route_attempt(
+                route_trace,
+                method=method,
+                vendor=vendor,
+                status="not_configured",
+                error=str(e),
+            )
             if first_error is None:
                 first_error = e
             continue
         except NoMarketDataError as e:
             logger.warning("Vendor %s has no data for %s: %s", vendor, method, e)
+            _record_route_attempt(
+                route_trace,
+                method=method,
+                vendor=vendor,
+                status="no_data",
+                error=str(e),
+            )
             if last_no_data is None:
                 last_no_data = e
             continue
         except Exception as e:
             logger.warning("Vendor %s failed for %s: %s", vendor, method, e)
+            _record_route_attempt(
+                route_trace,
+                method=method,
+                vendor=vendor,
+                status="error",
+                error=str(e),
+            )
             if first_error is None:
                 first_error = e
             continue

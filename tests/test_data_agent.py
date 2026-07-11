@@ -90,6 +90,10 @@ def test_data_agent_persists_layered_trace(tmp_path):
     assert final_payload["cleaned"]["news"]["record_count"] == 1
     assert final_payload["agent_payload"]["tier2_data"]["events"][0]["summary"] == "平安银行零售业务保持稳定。"
     assert final_payload["analysis"]["events"]["filter"]["mode"] == "deterministic"
+    assert final_payload["analysis"]["data_quality"]["daily_consistency"]["status"] == "single_source"
+    assert final_payload["agent_payload"]["tier2_data"]["data_quality"]["daily_consistency"]["confidence_score"] == 0.7
+    assert final_payload["vendor_health"]["attempt_count"] > 0
+    assert "custom_route_fn" in final_payload["vendor_health"]["vendors"]
     assert final_payload["analysis"]["agent_payload"]["tier1_data"]["risk"]["risk_data_available"] is True
     assert final_payload["manifest"]["fields"]["stock.daily"]["available"] is True
     assert result.artifacts["agent_payload"].path.endswith("05_agent_payload\\agent_payload.json") or result.artifacts["agent_payload"].path.endswith("05_agent_payload/agent_payload.json")
@@ -243,6 +247,59 @@ def test_data_agent_uses_llm_to_filter_news(tmp_path):
     assert llm.calls
 
 
+def test_data_agent_reports_cross_source_daily_consistency(tmp_path):
+    def fake_route(method, **kwargs):
+        if method == "get_daily":
+            return [
+                {
+                    "ts_code": kwargs["code"],
+                    "trade_date": "20260710",
+                    "open": 10.0,
+                    "high": 10.5,
+                    "low": 9.9,
+                    "close": 10.2,
+                    "pre_close": 10.0,
+                    "pct_chg": 2.0,
+                    "vol": 1000,
+                    "amount": 10200,
+                    "data_source": "akshare",
+                },
+                {
+                    "ts_code": kwargs["code"],
+                    "trade_date": "20260710",
+                    "open": 10.0,
+                    "high": 10.5,
+                    "low": 9.9,
+                    "close": 10.2005,
+                    "pre_close": 10.0,
+                    "pct_chg": 2.0005,
+                    "vol": 1000,
+                    "amount": 10200,
+                    "data_source": "baostock",
+                },
+            ]
+        if method == "get_news":
+            return []
+        raise AssertionError(method)
+
+    result = DataAgent(route_fn=fake_route, results_dir=str(tmp_path)).run(
+        DataAgentRequest(
+            ticker="000001.SZ",
+            trade_date="2026-07-10",
+            include_market=False,
+            include_capital_flow=False,
+            include_factors=False,
+            include_risk=False,
+            use_llm_news_filter=False,
+        )
+    )
+
+    consistency = result.final_data["analysis"]["data_quality"]["daily_consistency"]
+    assert consistency["status"] == "consistent"
+    assert consistency["sources"] == ["akshare", "baostock"]
+    assert consistency["differences"] == []
+
+
 def test_data_agent_news_filter_falls_back_when_llm_fails(tmp_path):
     def fake_route(method, **kwargs):
         if method == "get_daily":
@@ -267,3 +324,53 @@ def test_data_agent_news_filter_falls_back_when_llm_fails(tmp_path):
     assert len(events) == 1
     assert events[0]["summary"] == "Retail business stable"
     assert result.final_data["analysis"]["events"]["filter"]["mode"] == "fallback"
+
+
+def test_data_agent_llm_filter_uses_keyword_guardrail(tmp_path):
+    def fake_route(method, **kwargs):
+        if method == "get_daily":
+            return []
+        if method == "get_capital_flow":
+            return []
+        if method == "get_news":
+            return [
+                {"title": "Ping An Bank launches AI card", "summary": "Ping An Bank product update", "source": "test"},
+                {"title": "Unrelated sports headline", "summary": "A match result", "source": "test"},
+            ]
+        if method in {"get_st_status", "get_suspended", "get_delisting"}:
+            return []
+        raise AssertionError(method)
+
+    llm = FakeLLM(json.dumps({
+        "decisions": [
+            {
+                "event_id": "news_0001",
+                "keep": False,
+                "relevance": 0.0,
+                "direction": "中性",
+                "confidence": 0.1,
+                "reason": "overly strict model decision",
+            },
+            {
+                "event_id": "news_0002",
+                "keep": False,
+                "relevance": 0.0,
+                "direction": "中性",
+                "confidence": 0.1,
+                "reason": "unrelated",
+            },
+        ]
+    }, ensure_ascii=False))
+
+    result = DataAgent(route_fn=fake_route, results_dir=str(tmp_path), llm_client=llm).run(
+        DataAgentRequest(ticker="000001.SZ", trade_date="2026-07-10", news_keyword="Ping An")
+    )
+
+    events = result.final_data["agent_payload"]["tier2_data"]["events"]
+    trace = result.final_data["analysis"]["events"]["filter"]
+    assert trace["mode"] == "llm_with_keyword_guardrail"
+    assert trace["used_llm"] is True
+    assert trace["guardrail_added_count"] == 1
+    assert len(trace["decisions"]) == 2
+    assert len(events) == 1
+    assert events[0]["summary"] == "Ping An Bank product update"

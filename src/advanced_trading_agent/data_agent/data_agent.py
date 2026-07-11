@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -153,6 +154,7 @@ class DataAgent:
         )
 
         artifacts: dict[str, DataAgentArtifact] = {}
+        route_trace: list[dict[str, Any]] = []
         plan_payload: dict[str, Any] | None = None
         if request.use_react_planner:
             request, plan = self._planner.plan(request)
@@ -183,13 +185,14 @@ class DataAgent:
         }
         artifacts["input"] = self._write_json(run_dir / "01_input" / "request.json", input_payload)
 
-        raw_payload = self._collect_raw(request, manifest)
+        raw_payload = self._collect_raw(request, manifest, route_trace)
         artifacts["raw"] = self._write_json(run_dir / "02_raw" / "raw_data.json", raw_payload)
 
         cleaned_payload = self._clean(raw_payload)
         artifacts["cleaned"] = self._write_json(run_dir / "03_cleaned" / "cleaned_data.json", cleaned_payload)
 
-        analysis_payload = self._analyze(cleaned_payload, request)
+        vendor_health = self._summarize_vendor_health(route_trace)
+        analysis_payload = self._analyze(cleaned_payload, request, route_trace=route_trace)
         artifacts["analysis"] = self._write_json(
             run_dir / "04_analysis" / "analysis_data.json",
             analysis_payload,
@@ -213,6 +216,7 @@ class DataAgent:
             "analysis": analysis_payload,
             "agent_payload": agent_payload,
             "planner": plan_payload,
+            "vendor_health": vendor_health,
             "manifest": manifest.to_dict(),
         }
         artifacts["final"] = self._write_json(run_dir / "06_final" / "response.json", final_payload)
@@ -237,11 +241,17 @@ class DataAgent:
         run_dir.mkdir(parents=True, exist_ok=True)
         return run_dir
 
-    def _collect_raw(self, request: DataAgentRequest, manifest: DataManifest) -> dict[str, Any]:
+    def _collect_raw(
+        self,
+        request: DataAgentRequest,
+        manifest: DataManifest,
+        route_trace: list[dict[str, Any]],
+    ) -> dict[str, Any]:
         daily = self._safe_route(
             "get_daily",
             manifest,
             field_name="stock.daily",
+            route_trace=route_trace,
             code=request.ticker,
             start_date=request.start_date,
             end_date=request.normalized_end_date(),
@@ -252,6 +262,7 @@ class DataAgent:
                 "get_daily",
                 manifest,
                 field_name="market.daily",
+                route_trace=route_trace,
                 code="000001.SH",
                 start_date=request.start_date or request.normalized_end_date(),
                 end_date=request.normalized_end_date(),
@@ -262,6 +273,7 @@ class DataAgent:
                 "get_capital_flow",
                 manifest,
                 field_name="stock.capital_flow",
+                route_trace=route_trace,
                 code=request.ticker,
                 start_date=request.start_date,
                 end_date=request.normalized_end_date(),
@@ -272,6 +284,7 @@ class DataAgent:
                 "get_news",
                 manifest,
                 field_name="news.events",
+                route_trace=route_trace,
                 code=request.ticker,
                 keyword=request.news_keyword,
             )
@@ -279,14 +292,25 @@ class DataAgent:
         suspended: list[str] | dict[str, Any] = []
         delisting: list[str] | dict[str, Any] = []
         if request.include_risk:
-            st_status = self._safe_route("get_st_status", manifest, field_name="risk.st_status")
+            st_status = self._safe_route(
+                "get_st_status",
+                manifest,
+                field_name="risk.st_status",
+                route_trace=route_trace,
+            )
             suspended = self._safe_route(
                 "get_suspended",
                 manifest,
                 field_name="risk.suspended",
+                route_trace=route_trace,
                 trade_date=request.normalized_trade_date(),
             )
-            delisting = self._safe_route("get_delisting", manifest, field_name="risk.delisting")
+            delisting = self._safe_route(
+                "get_delisting",
+                manifest,
+                field_name="risk.delisting",
+                route_trace=route_trace,
+            )
 
         return {
             "stage": "raw",
@@ -300,6 +324,7 @@ class DataAgent:
                 "suspended": suspended,
                 "delisting": delisting,
             },
+            "route_trace": route_trace,
         }
 
     def _safe_route(
@@ -308,11 +333,25 @@ class DataAgent:
         manifest: DataManifest,
         *,
         field_name: str,
+        route_trace: list[dict[str, Any]] | None = None,
         **kwargs: Any,
     ) -> Any:
         vendor_chain = get_vendor_chain(method)
         try:
-            result = self._route_fn(method, **kwargs)
+            route_kwargs = dict(kwargs)
+            if route_trace is not None and self._route_fn is route_to_vendor:
+                route_kwargs["_route_trace"] = route_trace
+            start = time.perf_counter()
+            result = self._route_fn(method, **route_kwargs)
+            elapsed_ms = (time.perf_counter() - start) * 1000
+            if route_trace is not None and self._route_fn is not route_to_vendor:
+                route_trace.append({
+                    "method": method,
+                    "vendor": "custom_route_fn",
+                    "status": "success",
+                    "elapsed_ms": round(elapsed_ms, 3),
+                    "record_count": len(result) if isinstance(result, list) else None,
+                })
             is_no_data = isinstance(result, str) and result.startswith("NO_DATA_AVAILABLE")
             count = len(result) if isinstance(result, list) else None
             manifest.add_field(
@@ -326,6 +365,13 @@ class DataAgent:
             )
             return result
         except Exception as exc:
+            if route_trace is not None and self._route_fn is not route_to_vendor:
+                route_trace.append({
+                    "method": method,
+                    "vendor": "custom_route_fn",
+                    "status": "error",
+                    "error": str(exc),
+                })
             manifest.add_field(
                 field_name,
                 available=False,
@@ -382,7 +428,13 @@ class DataAgent:
             "risk": risk_raw if isinstance(risk_raw, dict) else {},
         }
 
-    def _analyze(self, cleaned_payload: dict[str, Any], request: DataAgentRequest) -> dict[str, Any]:
+    def _analyze(
+        self,
+        cleaned_payload: dict[str, Any],
+        request: DataAgentRequest,
+        *,
+        route_trace: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
         daily_records = cleaned_payload.get("daily", {}).get("records", [])
         market_records = cleaned_payload.get("market", {}).get("records", [])
         news_records = cleaned_payload.get("news", {}).get("records", [])
@@ -420,6 +472,12 @@ class DataAgent:
             factor_records = _records_from_frame(factor_df, limit=request.max_return_records)
 
         market_summary = self._summarize_market(market_df)
+        data_quality = {
+            "daily_consistency": self._build_daily_consistency_report(
+                daily_records,
+                route_trace or [],
+            )
+        }
         risk_summary = self._summarize_risk(
             cleaned_payload.get("risk", {}),
             latest=summary.get("latest") if isinstance(summary.get("latest"), dict) else {},
@@ -433,6 +491,7 @@ class DataAgent:
             daily_records=daily_records,
             factor_records=factor_records,
             event_records=event_records,
+            data_quality=data_quality,
         )
 
         return {
@@ -442,6 +501,7 @@ class DataAgent:
             "market": market_summary,
             "capital": capital_summary,
             "risk": risk_summary,
+            "data_quality": data_quality,
             "events": {
                 "record_count": len(event_records),
                 "records": event_records,
@@ -562,6 +622,7 @@ class DataAgent:
         daily_records: list[dict[str, Any]],
         factor_records: list[dict[str, Any]],
         event_records: list[dict[str, Any]],
+        data_quality: dict[str, Any],
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         tier1 = {
             "market": {
@@ -585,8 +646,145 @@ class DataAgent:
             "events": event_records,
             "backtest_samples": [],
             "data_summary": summary,
+            "data_quality": data_quality,
         }
         return tier1, tier2
+
+    @classmethod
+    def _summarize_vendor_health(cls, route_trace: list[dict[str, Any]]) -> dict[str, Any]:
+        vendors: dict[str, dict[str, Any]] = {}
+        for attempt in route_trace:
+            vendor = str(attempt.get("vendor") or "unknown")
+            method = str(attempt.get("method") or "unknown")
+            status = str(attempt.get("status") or "unknown")
+            summary = vendors.setdefault(
+                vendor,
+                {
+                    "attempt_count": 0,
+                    "success_count": 0,
+                    "error_count": 0,
+                    "methods": [],
+                    "statuses": {},
+                    "last_error": None,
+                },
+            )
+            summary["attempt_count"] += 1
+            if method not in summary["methods"]:
+                summary["methods"].append(method)
+            summary["statuses"][status] = summary["statuses"].get(status, 0) + 1
+            if status == "success":
+                summary["success_count"] += 1
+            elif status != "missing_impl":
+                summary["error_count"] += 1
+            if attempt.get("error"):
+                summary["last_error"] = attempt["error"]
+        return {
+            "attempt_count": len(route_trace),
+            "vendors": vendors,
+            "attempts": route_trace,
+        }
+
+    @classmethod
+    def _build_daily_consistency_report(
+        cls,
+        daily_records: list[dict[str, Any]],
+        route_trace: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        if not daily_records:
+            return {
+                "status": "unavailable",
+                "confidence_score": 0.0,
+                "sources": [],
+                "recommended_action": "block_or_request_daily_data",
+                "differences": [],
+                "route_success_count": cls._route_success_count(route_trace, "get_daily"),
+            }
+
+        sources = sorted({
+            str(record.get("data_source") or record.get("source") or "unknown")
+            for record in daily_records
+        })
+        if len(sources) < 2:
+            return {
+                "status": "single_source",
+                "confidence_score": 0.7,
+                "sources": sources,
+                "recommended_action": "use_single_source_with_manifest_trace",
+                "differences": [],
+                "route_success_count": cls._route_success_count(route_trace, "get_daily"),
+            }
+
+        frame = pd.DataFrame(daily_records)
+        if "trade_date" not in frame.columns:
+            return {
+                "status": "insufficient_keys",
+                "confidence_score": 0.5,
+                "sources": sources,
+                "recommended_action": "review_daily_schema_before_analysis",
+                "differences": [],
+                "route_success_count": cls._route_success_count(route_trace, "get_daily"),
+            }
+
+        checks = {
+            "close": 0.001,
+            "pct_chg": 0.01,
+            "volume": 0.05,
+            "amount": 0.05,
+        }
+        differences: list[dict[str, Any]] = []
+        for trade_date, group in frame.groupby("trade_date", dropna=False):
+            group_sources = {
+                str(record.get("data_source") or record.get("source") or "unknown")
+                for record in group.to_dict("records")
+            }
+            if len(group_sources) < 2:
+                continue
+            for column, threshold in checks.items():
+                if column not in group.columns:
+                    continue
+                values = pd.to_numeric(group[column], errors="coerce").dropna()
+                if len(values) < 2:
+                    continue
+                min_value = float(values.min())
+                max_value = float(values.max())
+                base = max(abs(min_value), 1.0)
+                relative_diff = abs(max_value - min_value) / base
+                if relative_diff > threshold:
+                    differences.append({
+                        "trade_date": cls._json_safe_value(trade_date),
+                        "field": column,
+                        "min": min_value,
+                        "max": max_value,
+                        "relative_diff": relative_diff,
+                        "threshold": threshold,
+                        "sources": sorted(group_sources),
+                    })
+
+        if differences:
+            return {
+                "status": "conflict",
+                "confidence_score": 0.4,
+                "sources": sources,
+                "recommended_action": "review_vendor_conflict_before_trading_decision",
+                "differences": differences,
+                "route_success_count": cls._route_success_count(route_trace, "get_daily"),
+            }
+        return {
+            "status": "consistent",
+            "confidence_score": 0.9,
+            "sources": sources,
+            "recommended_action": "use_primary_vendor_with_cross_source_support",
+            "differences": [],
+            "route_success_count": cls._route_success_count(route_trace, "get_daily"),
+        }
+
+    @staticmethod
+    def _route_success_count(route_trace: list[dict[str, Any]], method: str) -> int:
+        return sum(
+            1
+            for attempt in route_trace
+            if attempt.get("method") == method and attempt.get("status") == "success"
+        )
 
     @classmethod
     def _clean_news(cls, records: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -682,13 +880,24 @@ class DataAgent:
             decisions = self._ask_llm_to_filter_news(llm, news_records, request)
             selected: list[dict[str, Any]] = []
             decision_by_id = {str(item.get("event_id")): item for item in decisions}
+            decision_trace: list[dict[str, Any]] = []
             for record in news_records:
                 decision = decision_by_id.get(str(record.get("event_id")), {})
                 try:
                     relevance = float(decision.get("relevance", 0))
                 except (TypeError, ValueError):
                     relevance = 0.0
-                if not bool(decision.get("keep")) or relevance < request.news_relevance_threshold:
+                keep = bool(decision.get("keep"))
+                decision_trace.append({
+                    "event_id": record.get("event_id"),
+                    "title": record.get("title"),
+                    "keep": keep,
+                    "relevance": relevance,
+                    "direction": decision.get("direction"),
+                    "confidence": self._bounded_float(decision.get("confidence"), default=0.0),
+                    "reason": str(decision.get("reason", ""))[:300],
+                })
+                if not keep or relevance < request.news_relevance_threshold:
                     continue
                 selected.append({
                     **record,
@@ -697,16 +906,27 @@ class DataAgent:
                     "llm_relevance": relevance,
                     "llm_reason": str(decision.get("reason", ""))[:300],
                 })
+            guardrail_records = []
+            if not selected:
+                guardrail_records = self._filter_news_deterministically(news_records, request)
+                for record in guardrail_records:
+                    selected.append({
+                        **record,
+                        "llm_relevance": max(float(record.get("llm_relevance", 0.5)), request.news_relevance_threshold),
+                        "llm_reason": "keyword guardrail after LLM filtered all candidates",
+                    })
             return {
                 "records": selected[: request.max_news_records],
                 "trace": {
-                    "mode": "llm",
+                    "mode": "llm" if not guardrail_records else "llm_with_keyword_guardrail",
                     "used_llm": True,
                     "model": getattr(llm, "model", ""),
                     "provider": getattr(llm, "provider", ""),
                     "input_count": len(news_records),
                     "output_count": len(selected[: request.max_news_records]),
                     "threshold": request.news_relevance_threshold,
+                    "guardrail_added_count": len(guardrail_records),
+                    "decisions": decision_trace,
                 },
             }
         except Exception as exc:
@@ -764,7 +984,9 @@ class DataAgent:
             "trade_date": request.normalized_trade_date(),
             "news_keyword": request.news_keyword,
             "task": (
-                "Select news relevant to this ticker or its sector for downstream trading agents. "
+                "Select news relevant to this ticker, its company, its business, or its sector for downstream trading agents. "
+                "If title or summary directly contains the ticker keyword, company name, or clearly describes this company, keep it unless it is obviously unrelated. "
+                "Return one decision for every candidate in the same event_id space. "
                 "Return only JSON with key decisions: list of objects containing event_id, keep, "
                 "relevance from 0 to 1, direction in 正面/负面/中性, confidence from 0 to 1, and reason."
             ),

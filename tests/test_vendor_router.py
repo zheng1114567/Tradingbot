@@ -92,6 +92,27 @@ class TestVendorChain:
         result = route_to_vendor("get_daily", code="x")
         assert result == {"ok": True}
 
+    def test_route_trace_records_attempts(self):
+        trace = []
+
+        def a(code):
+            raise VendorRateLimitError("limit", vendor="akshare")
+
+        def b(code):
+            return [{"code": code}]
+
+        register_vendor_impl("get_daily", "akshare", a)
+        register_vendor_impl("get_daily", "baostock", b)
+
+        result = route_to_vendor("get_daily", code="000001.SZ", _route_trace=trace)
+
+        assert result == [{"code": "000001.SZ"}]
+        assert trace[0]["vendor"] == "akshare"
+        assert trace[0]["status"] == "rate_limited"
+        assert trace[1]["vendor"] == "baostock"
+        assert trace[1]["status"] == "success"
+        assert trace[1]["record_count"] == 1
+
     def test_fallback_order_across_vendors(self):
         """使用已知的 get_daily 方法测试降级顺序"""
         chain = get_vendor_chain("get_daily")

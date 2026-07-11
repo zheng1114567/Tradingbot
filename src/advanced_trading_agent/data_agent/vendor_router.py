@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from enum import Enum
 from typing import Any, Callable
@@ -145,13 +146,15 @@ def get_vendor_chain(method: str) -> list[str]:
 # 结构: {method_name: {vendor_name: impl_function}}
 _VENDOR_IMPLEMENTATIONS: dict[str, dict[str, Callable]] = {}
 _DEFAULT_VENDOR_REGISTRATION_ATTEMPTED = False
+_VENDOR_LOCK = threading.Lock()
 
 
 def register_vendor_impl(method: str, vendor: str, impl: Callable) -> None:
-    """注册供应商实现"""
-    if method not in _VENDOR_IMPLEMENTATIONS:
-        _VENDOR_IMPLEMENTATIONS[method] = {}
-    _VENDOR_IMPLEMENTATIONS[method][vendor] = impl
+    """注册供应商实现 (thread-safe)"""
+    with _VENDOR_LOCK:
+        if method not in _VENDOR_IMPLEMENTATIONS:
+            _VENDOR_IMPLEMENTATIONS[method] = {}
+        _VENDOR_IMPLEMENTATIONS[method][vendor] = impl
 
 
 def get_vendor_impl(method: str, vendor: str) -> Callable | None:
@@ -307,6 +310,8 @@ def route_to_vendor(method: str, *args, **kwargs) -> Any:
             if last_no_data is None:
                 last_no_data = e
             continue
+        except VendorFatalError:
+            raise
         except Exception as e:
             logger.warning("Vendor %s failed for %s: %s", vendor, method, e)
             _record_route_attempt(

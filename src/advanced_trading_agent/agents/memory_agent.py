@@ -10,11 +10,13 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
 from ..config import config
+from ..core.atomic_write import atomic_write_jsonl, atomic_write_text
 from ..llm.client import LLMClient
 from ..strategy_rules import current_rulebook
 from .contract import basic_self_check, build_node_audit_update
@@ -29,6 +31,8 @@ OutcomeLoader = Callable[[dict[str, Any]], dict[str, Any] | None]
 
 class MemoryStore:
     """Lightweight Memory store backed by Markdown plus JSONL."""
+
+    _lock = threading.Lock()
 
     def __init__(self, log_path: str | None = None, index_path: str | None = None):
         path = log_path or config.get("memory_log_path", "")
@@ -61,13 +65,14 @@ class MemoryStore:
             "updated_at": datetime.now().isoformat(),
         }
 
-        entries = self._load_index_entries()
-        if any(self._index_key(e) == self._index_key(entry) for e in entries):
-            return
+        with self._lock:
+            entries = self._load_index_entries()
+            if any(self._index_key(e) == self._index_key(entry) for e in entries):
+                return
 
-        entries.append(entry)
-        self._write_index_entries(entries)
-        self._write_markdown_entries(entries)
+            entries.append(entry)
+            self._write_index_entries(entries)
+            self._write_markdown_entries(entries)
 
     def load_entries(self) -> list[dict[str, Any]]:
         """Load memory records, preferring JSONL while preserving Markdown fallback."""
@@ -90,35 +95,36 @@ class MemoryStore:
         - "{date}|{ticker}", e.g. "2026-07-10|000001.SZ"
         - "{ticker}", useful for tests or batch injection.
         """
-        entries = self.load_entries()
-        if not entries:
-            return []
+        with self._lock:
+            entries = self.load_entries()
+            if not entries:
+                return []
 
-        resolved: list[dict[str, Any]] = []
-        for entry in entries:
-            if not entry.get("pending"):
-                continue
+            resolved: list[dict[str, Any]] = []
+            for entry in entries:
+                if not entry.get("pending"):
+                    continue
 
-            outcome = self._find_outcome(entry, outcomes or {}, outcome_loader)
-            if outcome is None:
-                continue
+                outcome = self._find_outcome(entry, outcomes or {}, outcome_loader)
+                if outcome is None:
+                    continue
 
-            reflection = self._build_reflection(
-                entry=entry,
-                outcome=outcome,
-                as_of=as_of or datetime.now().date().isoformat(),
-                llm=llm,
-            )
-            entry["pending"] = False
-            entry["status"] = "resolved"
-            entry["outcome"] = outcome
-            entry["reflection"] = reflection
-            entry["updated_at"] = datetime.now().isoformat()
-            resolved.append(entry)
+                reflection = self._build_reflection(
+                    entry=entry,
+                    outcome=outcome,
+                    as_of=as_of or datetime.now().date().isoformat(),
+                    llm=llm,
+                )
+                entry["pending"] = False
+                entry["status"] = "resolved"
+                entry["outcome"] = outcome
+                entry["reflection"] = reflection
+                entry["updated_at"] = datetime.now().isoformat()
+                resolved.append(entry)
 
-        if resolved:
-            self._write_index_entries(entries)
-            self._write_markdown_entries(entries)
+            if resolved:
+                self._write_index_entries(entries)
+                self._write_markdown_entries(entries)
 
         return resolved
 
@@ -147,11 +153,7 @@ class MemoryStore:
     def _write_index_entries(self, entries: list[dict[str, Any]]) -> None:
         if not self._index_path:
             return
-        lines = [
-            json.dumps(self._normalize_entry(entry), ensure_ascii=False, sort_keys=True)
-            for entry in entries
-        ]
-        self._index_path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+        atomic_write_jsonl(self._index_path, [self._normalize_entry(e) for e in entries])
 
     def _load_markdown_entries(self) -> list[dict[str, Any]]:
         if not self._log_path or not self._log_path.exists():
@@ -171,7 +173,7 @@ class MemoryStore:
         if not self._log_path:
             return
         blocks = [self._format_markdown_entry(self._normalize_entry(entry)) for entry in entries]
-        self._log_path.write_text(_SEPARATOR.join(blocks) + (_SEPARATOR if blocks else ""), encoding="utf-8")
+        atomic_write_text(self._log_path, _SEPARATOR.join(blocks) + (_SEPARATOR if blocks else ""))
 
     @staticmethod
     def _normalize_entry(entry: dict[str, Any]) -> dict[str, Any]:

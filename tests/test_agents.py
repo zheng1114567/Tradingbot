@@ -660,9 +660,9 @@ class TestReportAgent:
         finally:
             config.update({"results_dir": original_results_dir})
 
-        assert "## Round 2 圆桌审计" in result["final_report"]
-        assert "Provider: autogen" in result["final_report"]
-        assert "Final Pressure: downgrade" in result["final_report"]
+        assert "## Roundtable Debate Record" in result["final_report"]
+        assert "autogen" in result["final_report"]
+        assert "downgrade" in result["final_report"]
 
 
 class TestApprovalAgent:

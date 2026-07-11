@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import config
+from .core.atomic_write import atomic_write_jsonl
 
 
 @dataclass(frozen=True)
@@ -156,10 +157,9 @@ def load_strategy_proposals(path: str | None = None) -> list[dict[str, Any]]:
 
 
 def write_strategy_proposals(proposals: list[dict[str, Any]], path: str | None = None) -> str:
-    """Persist the strategy audit queue as JSONL."""
+    """Persist the strategy audit queue as JSONL (atomic write)."""
     queue_path = strategy_audit_queue_path(path)
-    lines = [json.dumps(item, ensure_ascii=False, sort_keys=True) for item in proposals]
-    queue_path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+    atomic_write_jsonl(queue_path, proposals)
     return str(queue_path)
 
 

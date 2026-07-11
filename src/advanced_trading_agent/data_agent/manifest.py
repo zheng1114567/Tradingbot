@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from ..config import config
+from ..core.atomic_write import atomic_write_json
 
 
 _SAFE_PATH_PART = re.compile(r"[^A-Za-z0-9_.-]+")
@@ -76,8 +77,5 @@ class DataManifest:
         ticker = _safe_path_part(self.ticker.replace(".", "_"), "unknown_ticker")
         trade_date = _safe_path_part(self.trade_date, "unknown_date")
         path = manifest_dir / f"manifest_{ticker}_{trade_date}.json"
-        path.write_text(
-            json.dumps(self.to_dict(), ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
+        atomic_write_json(path, self.to_dict())
         return path

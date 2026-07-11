@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Any
 
 from ..config import config
+from .atomic_write import atomic_write_json
 
 logger = logging.getLogger(__name__)
 
@@ -181,9 +182,7 @@ class CacheManager:
         """写入缓存"""
         path = self._cache_path(key)
         try:
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump({"_cached_at": time.time(), "data": data},
-                          f, ensure_ascii=False, indent=2)
+            atomic_write_json(path, {"_cached_at": time.time(), "data": data})
         except Exception as e:
             logger.warning("Cache write failed for %s: %s", key, e)
 

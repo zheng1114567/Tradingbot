@@ -14,6 +14,8 @@ from pathlib import Path
 from typing import Any
 
 from ..config import config
+from ..core.atomic_write import atomic_write_json, atomic_write_text
+from ..core.audit import format_audit_trail, format_data_collection_summary, format_roundtable_visualization
 from .contract import basic_self_check, build_node_audit_update
 from .schemas import DecisionType, FinalReport, SystemDecision
 
@@ -76,21 +78,68 @@ def _round2_markdown(state: dict[str, Any]) -> str:
     round2 = state.get("round2_state", {}) or {}
     if not round2.get("contradictions") and not state.get("round2_summary"):
         return ""
+    return format_roundtable_visualization(round2)
 
-    lines = [
-        "",
-        "---",
-        "## Round 2 圆桌审计",
-        f"- Provider: {round2.get('provider', 'none')}",
-        f"- Final Pressure: {round2.get('final_pressure', 'neutral')}",
-    ]
-    if round2.get("fallback_reason"):
-        lines.append(f"- Fallback Reason: {round2['fallback_reason']}")
-    if round2.get("contradictions"):
-        lines.append("- 矛盾点: " + "; ".join(str(c) for c in round2["contradictions"]))
-    summary = state.get("round2_summary", "") or round2.get("summary", "")
-    if summary:
-        lines.extend(["", "```text", str(summary)[:3000], "```"])
+
+def _risk_veto_markdown(state: dict[str, Any]) -> str:
+    """Render risk check vetoes with clear reasons."""
+    lines: list[str] = []
+    for check_name in ("risk_check_1", "risk_check_2", "risk_check_3"):
+        check = state.get(check_name, {}) or {}
+        verdict = check.get("verdict", "")
+        if isinstance(verdict, str):
+            verdict_val = verdict
+        elif hasattr(verdict, "value"):
+            verdict_val = verdict.value
+        else:
+            verdict_val = str(verdict)
+
+        if "VETO" in verdict_val.upper():
+            reasons = check.get("reasons", [])
+            if isinstance(reasons, str):
+                reasons = [reasons]
+            lines.append(f"### {check_name}: VETO")
+            lines.append("")
+            for r in reasons:
+                lines.append(f"- **否决原因**: {r}")
+            lines.append("")
+    return "\n".join(lines)
+
+
+def _data_collection_markdown(state: dict[str, Any]) -> str:
+    """Render data collection summary from tier1 metadata."""
+    tier1 = state.get("tier1_data", {}) or {}
+    data_manifest = tier1.get("_data_manifest") or {}
+    collection_summary = tier1.get("_collection_summary") or {}
+    if not collection_summary:
+        return ""
+    return format_data_collection_summary(collection_summary)
+
+
+def _audit_trail_markdown(state: dict[str, Any]) -> str:
+    """Render audit trail from state."""
+    audit_events = state.get("audit_trail", [])
+    if not audit_events:
+        tier1 = state.get("tier1_data", {}) or {}
+        audit_events = tier1.get("_audit_trail", [])
+    if not audit_events:
+        return ""
+    return format_audit_trail(audit_events)
+
+
+def _failure_markdown(state: dict[str, Any]) -> str:
+    """Render any failures recorded in the state."""
+    errors = state.get("errors", [])
+    if not errors:
+        tier1 = state.get("tier1_data", {}) or {}
+        errors = tier1.get("_errors", [])
+    if not errors:
+        return ""
+    lines = ["## Failures & Warnings", ""]
+    for err in errors:
+        stage = err.get("stage", "unknown")
+        error_msg = err.get("error", str(err))
+        lines.append(f"- **{stage}**: {error_msg}")
     return "\n".join(lines)
 
 
@@ -126,23 +175,28 @@ def create_report_agent(llm=None):
             risk_verdict=decision.risk_verdict.value if hasattr(decision.risk_verdict, 'value') else str(decision.risk_verdict),
         )
 
-        # 生成 Markdown
-        md = report.to_markdown() + _round2_markdown(state)
+        # 生成 Markdown (含完整审计链)
+        sections = [
+            report.to_markdown(),
+            _data_collection_markdown(state),
+            _risk_veto_markdown(state),
+            _round2_markdown(state),
+            _failure_markdown(state),
+            _audit_trail_markdown(state),
+        ]
+        md = "\n\n---\n\n".join(s for s in sections if s)
 
-        # 保存文件
+        # 保存文件 (atomic writes)
         results_dir = Path(config.get("results_dir", "data/results"))
         safe_ticker = _safe_path_part(ticker.replace(".", "_"), "unknown_ticker")
         safe_trade_date = _safe_path_part(trade_date, "unknown_date")
         save_dir = results_dir / safe_ticker
         save_dir.mkdir(parents=True, exist_ok=True)
         report_path = save_dir / f"report_{safe_trade_date}.md"
-        report_path.write_text(md, encoding="utf-8")
+        atomic_write_text(report_path, md)
         audit_trace = _build_audit_trace(state, report=report, report_path=report_path)
         audit_path = save_dir / f"audit_{safe_trade_date}.json"
-        audit_path.write_text(
-            json.dumps(audit_trace, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
+        atomic_write_json(audit_path, audit_trace)
 
         # 写入 Memory
         store = None

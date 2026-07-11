@@ -23,6 +23,7 @@ from .backtest.portfolio import ObservationPortfolioBacktester
 from .backtest.review import ReviewEngine
 from .backtest.scheduler import run_daily_review
 from .config import config
+from .core.atomic_write import atomic_write_text
 from .data_agent.data_agent import DataAgent, DataAgentRequest
 from .graph.workflow import TradingSystem
 from .strategy_rules import load_strategy_proposals, review_strategy_proposal
@@ -104,7 +105,7 @@ def analyze_batch(tickers_file: str, debug: bool = False,
     # 保存汇总
     summary_path = Path(config.get("results_dir", "data/results")) / "batch_summary.md"
     summary_path.parent.mkdir(parents=True, exist_ok=True)
-    summary_path.write_text("\n\n---\n\n".join(reports), encoding="utf-8")
+    atomic_write_text(summary_path, "\n\n---\n\n".join(reports))
     logger.info("Batch summary saved to %s", summary_path)
 
     return reports
@@ -135,7 +136,7 @@ def review_memory(price_file: str | None = None, as_of: str | None = None) -> st
     report = reviewer.format_summary(summary)
     review_path = Path(config.get("results_dir", "data/results")) / "review_summary.md"
     review_path.parent.mkdir(parents=True, exist_ok=True)
-    review_path.write_text(report, encoding="utf-8")
+    atomic_write_text(review_path, report)
     return report
 
 
@@ -156,7 +157,7 @@ def backtest_portfolio(signals_file: str, price_file: str) -> str:
     report = "\n".join(lines)
     results_dir = Path(config.get("results_dir", "data/results"))
     results_dir.mkdir(parents=True, exist_ok=True)
-    (results_dir / "portfolio_backtest_summary.md").write_text(report, encoding="utf-8")
+    atomic_write_text(results_dir / "portfolio_backtest_summary.md", report)
     result.nav.to_csv(results_dir / "portfolio_nav.csv", index=False)
     result.trades.to_csv(results_dir / "portfolio_trades.csv", index=False)
     return report

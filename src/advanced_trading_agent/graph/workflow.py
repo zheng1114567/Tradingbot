@@ -205,11 +205,11 @@ def create_workflow() -> StateGraph:
         {"continue_round2": "Round 2 Debate", "finalize": "Risk Check 3"},
     )
 
-    # 硬风控3: 无论 PASS/HARD_VETO 都进入裁定节点生成报告
+    # 硬风控3: HARD_VETO → 直接生成报告, PASS → 进入裁定
     workflow.add_conditional_edges(
         "Risk Check 3",
         after_risk_check_3,
-        {"finalize": "System Final Decision", "end": "System Final Decision"},
+        {"finalize": "System Final Decision", "end": "Report Agent"},
     )
 
     # 裁定 → 人工审批记录 → 报告 → END
@@ -440,6 +440,9 @@ class TradingSystem:
         tier1["_data_manifest"] = result.final_data.get("manifest")
         tier1["_data_manifest_path"] = result.manifest_path
         tier1["_data_agent_run"] = result.to_dict()
+        tier1["_collection_summary"] = result.collection_summary
+        tier1["_audit_trail"] = result.audit_trail
+        tier1["_errors"] = result.final_data.get("errors", [])
         return tier1, tier2
 
     def analyze(self, ticker: str, trade_date: str | None = None,
@@ -529,13 +532,14 @@ class TradingSystem:
         }
 
         if self.debug:
-            final_state = None
+            final_state: dict[str, Any] = {}
             for chunk in self.workflow.stream(init_state):
                 node_name = list(chunk.keys())[0]
                 logger.info("Completed node: %s", node_name)
                 if chunk:
-                    for k, v in chunk.items():
-                        final_state = v if isinstance(v, dict) else final_state
+                    for _k, v in chunk.items():
+                        if isinstance(v, dict):
+                            final_state.update(v)
         else:
             final_state = self.workflow.invoke(init_state)
 

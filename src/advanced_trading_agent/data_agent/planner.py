@@ -6,9 +6,20 @@ without exposing raw chain-of-thought text.
 """
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass
 from datetime import date
 from typing import Any
+
+from pydantic import BaseModel
+
+
+def _model_dump(obj: Any) -> dict[str, Any]:
+    """Serialize a Pydantic model or dataclass to dict."""
+    if isinstance(obj, BaseModel):
+        return obj.model_dump()
+    if hasattr(obj, "__dataclass_fields__"):
+        return asdict(obj)
+    return dict(obj) if isinstance(obj, dict) else {"value": str(obj)}
 
 from .vendor_router import get_vendor_chain
 
@@ -237,7 +248,7 @@ class DataAgentPlanner:
             "observation": {
                 "required_methods": required_methods,
                 "skipped_methods": skipped_methods,
-                "adjusted_request": asdict(adjusted_request),
+                "adjusted_request": _model_dump(adjusted_request),
                 "next_actions": next_actions,
                 "clarification_questions": clarification_questions,
             },
@@ -247,7 +258,7 @@ class DataAgentPlanner:
             objective=objective,
             required_methods=required_methods,
             skipped_methods=skipped_methods,
-            adjusted_request=asdict(adjusted_request),
+            adjusted_request=_model_dump(adjusted_request),
             trace=trace,
             next_actions=next_actions,
             clarification_questions=clarification_questions,
@@ -278,7 +289,7 @@ class DataAgentPlanner:
     def _normalize_request(request: Any) -> Any:
         if request.end_date or not request.trade_date:
             return request
-        return replace(request, end_date=request.trade_date.replace("-", ""))
+        return request.model_copy(update={"end_date": request.trade_date.replace("-", "")})
 
     @staticmethod
     def _next_action(

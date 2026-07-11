@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import os
+import threading
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
@@ -43,6 +44,7 @@ _ENV_OVERRIDES = {
 
 _BOOL_TRUE = ("true", "1", "yes", "on")
 _BOOL_FALSE = ("false", "0", "no", "off")
+_VALID_PROVIDERS = frozenset({"deepseek", "openai", "anthropic"})
 
 
 def _load_dotenv() -> None:
@@ -77,14 +79,17 @@ def _coerce_env(value: str, reference) -> Any:
 
 
 class Config:
-    """全局配置 — 单例"""
+    """全局配置 — 单例 (thread-safe)"""
 
     _instance: "Config | None" = None
+    _lock = threading.Lock()
 
     def __new__(cls) -> "Config":
         if cls._instance is None:
-            cls._instance = super().__new__(cls)
-            cls._instance._initialized = False
+            with cls._lock:
+                if cls._instance is None:
+                    cls._instance = super().__new__(cls)
+                    cls._instance._initialized = False
         return cls._instance
 
     def __init__(self) -> None:
@@ -186,7 +191,19 @@ class Config:
             if raw is None or raw == "":
                 continue
             try:
-                self._config[config_key] = _coerce_env(raw, self._config.get(config_key))
+                value = _coerce_env(raw, self._config.get(config_key))
+                # Validate provider whitelist
+                if config_key == "llm_provider" and str(value).lower() not in _VALID_PROVIDERS:
+                    raise ValueError(
+                        f"Unsupported LLM provider: {value!r}. "
+                        f"Must be one of: {', '.join(sorted(_VALID_PROVIDERS))}"
+                    )
+                # Validate temperature bounds
+                if config_key == "temperature":
+                    t = float(value)
+                    if t < 0.0 or t > 2.0:
+                        raise ValueError(f"Temperature must be in [0.0, 2.0], got {t}")
+                self._config[config_key] = value
             except ValueError as e:
                 raise ValueError(f"Invalid value for {env_var}: {e}") from e
 

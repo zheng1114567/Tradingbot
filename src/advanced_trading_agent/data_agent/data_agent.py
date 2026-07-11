@@ -14,7 +14,7 @@ import os
 import re
 import time
 from html import unescape
-from dataclasses import asdict, dataclass, field, replace
+from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -22,8 +22,11 @@ from typing import Any, Callable
 import numpy as np
 import pandas as pd
 import requests
+from pydantic import BaseModel, Field, field_validator
 
 from ..config import config
+from ..core.atomic_write import atomic_write_json, atomic_write_text
+from ..core.audit import audit_event, build_data_collection_summary
 from .cleaner import DataCleaner
 from .factors import FactorCalculator
 from .manifest import DataManifest
@@ -93,9 +96,8 @@ def _json_default(value: Any) -> Any:
     raise TypeError(f"Object of type {value.__class__.__name__} is not JSON serializable")
 
 
-@dataclass(frozen=True)
-class DataAgentRequest:
-    """Input boundary for a standalone data-agent run."""
+class DataAgentRequest(BaseModel):
+    """Input boundary for a standalone data-agent run (Pydantic-validated)."""
 
     ticker: str
     trade_date: str | None = None
@@ -111,12 +113,31 @@ class DataAgentRequest:
     sector_keyword: str | None = None
     use_llm_news_filter: bool = True
     fetch_news_full_text: bool = True
-    news_relevance_threshold: float = 0.5
+    news_relevance_threshold: float = Field(default=0.5, ge=0.0, le=1.0)
     use_react_planner: bool = False
     output_dir: str | None = None
-    max_news_records: int = 20
-    max_return_records: int = 20
-    sector_top_n: int = 20
+    max_news_records: int = Field(default=20, ge=1, le=200)
+    max_return_records: int = Field(default=20, ge=1, le=200)
+    sector_top_n: int = Field(default=20, ge=1, le=100)
+
+    @field_validator("ticker")
+    @classmethod
+    def _validate_ticker(cls, v: str) -> str:
+        if not v:
+            return v
+        if not re.match(r"^\d{6}\.(SH|SZ|BJ)$", v, re.IGNORECASE):
+            raise ValueError(f"Invalid ticker format: {v!r}. Expected pattern: 000001.SZ")
+        return v.upper()
+
+    @field_validator("trade_date", "start_date", "end_date")
+    @classmethod
+    def _validate_date(cls, v: str | None) -> str | None:
+        if v is None:
+            return v
+        clean = v.replace("-", "")
+        if not re.match(r"^\d{8}$", clean):
+            raise ValueError(f"Invalid date format: {v!r}. Expected YYYY-MM-DD or YYYYMMDD")
+        return v
 
     def normalized_trade_date(self) -> str:
         return self.trade_date or date.today().isoformat()
@@ -281,6 +302,8 @@ class DataAgentRun:
     response_path: str
     final_data: dict[str, Any]
     plan: dict[str, Any] | None = None
+    collection_summary: dict[str, Any] = field(default_factory=dict)
+    audit_trail: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
@@ -320,6 +343,11 @@ class DataAgent:
 
         artifacts: dict[str, DataAgentArtifact] = {}
         route_trace: list[dict[str, Any]] = []
+        audit_trail: list[dict[str, Any]] = []
+        errors: list[dict[str, Any]] = []
+
+        audit_trail.append(audit_event("data", f"开始数据收集: {request.ticker}", detail={"trade_date": request.normalized_trade_date()}))
+
         plan_payload: dict[str, Any] | None = None
         if request.use_react_planner:
             request, plan = self._planner.plan(request)
@@ -333,7 +361,7 @@ class DataAgent:
         input_payload = {
             "stage": "input",
             "created_at": _utc_now(),
-            "request": asdict(request),
+            "request": request.model_dump(),
             "stock_profile": stock_profile,
             "planner": plan_payload,
             "vendor_chain": {
@@ -352,18 +380,53 @@ class DataAgent:
         }
         artifacts["input"] = self._write_json(run_dir / "01_input" / "request.json", input_payload)
 
-        raw_payload = self._collect_raw(request, manifest, route_trace)
-        artifacts["raw"] = self._write_json(run_dir / "02_raw" / "raw_data.json", raw_payload)
+        # --- Raw collection with error recovery ---
+        try:
+            raw_payload = self._collect_raw(request, manifest, route_trace)
+            artifacts["raw"] = self._write_json(run_dir / "02_raw" / "raw_data.json", raw_payload)
+        except Exception as exc:
+            logger.error("Raw data collection failed: %s", exc)
+            audit_trail.append(audit_event("data", f"数据收集失败: {exc}", level="error", detail={"stage": "raw_collection"}))
+            errors.append({"stage": "raw_collection", "error": str(exc)})
+            raw_payload = {"stage": "raw", "created_at": _utc_now(), "error": str(exc)}
 
-        cleaned_payload = self._clean(raw_payload)
-        artifacts["cleaned"] = self._write_json(run_dir / "03_cleaned" / "cleaned_data.json", cleaned_payload)
-
+        # --- Build collection summary ---
         vendor_health = self._summarize_vendor_health(route_trace)
-        analysis_payload = self._analyze(cleaned_payload, request, route_trace=route_trace)
-        artifacts["analysis"] = self._write_json(
-            run_dir / "04_analysis" / "analysis_data.json",
-            analysis_payload,
-        )
+        collection_summary = build_data_collection_summary(raw_payload, vendor_health, route_trace)
+        audit_trail.append(audit_event("data", f"数据收集完成: {collection_summary.get('categories_with_data', 0)}/{collection_summary.get('total_categories', 0)} 类数据获取成功",
+                                       detail={"failed": collection_summary.get('categories_failed', 0), "empty": collection_summary.get('categories_empty', 0)}))
+
+        if collection_summary.get("categories_failed", 0) > 0:
+            for key, cat in collection_summary.get("categories", {}).items():
+                if cat["status"] == "error":
+                    audit_trail.append(audit_event("data", f"{cat['label']} 获取失败: {cat.get('error', 'unknown')}", level="warning"))
+
+        # --- Clean with error recovery ---
+        try:
+            cleaned_payload = self._clean(raw_payload)
+            artifacts["cleaned"] = self._write_json(run_dir / "03_cleaned" / "cleaned_data.json", cleaned_payload)
+        except Exception as exc:
+            logger.error("Data cleaning failed: %s", exc)
+            audit_trail.append(audit_event("data", f"数据清洗失败: {exc}", level="error"))
+            errors.append({"stage": "cleaning", "error": str(exc)})
+            cleaned_payload = {"stage": "cleaned", "created_at": _utc_now(), "error": str(exc)}
+
+        # --- Analyze with error recovery ---
+        try:
+            analysis_payload = self._analyze(cleaned_payload, request, route_trace=route_trace)
+            artifacts["analysis"] = self._write_json(
+                run_dir / "04_analysis" / "analysis_data.json",
+                analysis_payload,
+            )
+            audit_trail.append(audit_event("data", "因子计算与事件分析完成",
+                                           detail={"factor_count": len(analysis_payload.get("factors", {}).get("records", [])),
+                                                   "event_count": len(analysis_payload.get("events", {}).get("records", []))}))
+        except Exception as exc:
+            logger.error("Analysis failed: %s", exc)
+            audit_trail.append(audit_event("data", f"分析阶段失败: {exc}", level="error"))
+            errors.append({"stage": "analysis", "error": str(exc)})
+            analysis_payload = {"stage": "analysis", "created_at": _utc_now(), "error": str(exc), "agent_payload": {}}
+
         artifacts["news_events"] = self._write_json(
             run_dir / "04_analysis" / "news_events.json",
             {
@@ -393,19 +456,29 @@ class DataAgent:
             "planner": plan_payload,
             "vendor_health": vendor_health,
             "manifest": manifest.to_dict(),
+            "collection_summary": collection_summary,
+            "audit_trail": audit_trail,
+            "errors": errors,
         }
         artifacts["final"] = self._write_json(run_dir / "06_final" / "response.json", final_payload)
 
         manifest_path = manifest.save(results_dir=str(run_dir / "06_final"))
 
+        if errors:
+            audit_trail.append(audit_event("data", f"数据流水线完成，{len(errors)} 个阶段出错", level="warning" if len(errors) < 3 else "error"))
+        else:
+            audit_trail.append(audit_event("data", "数据流水线全部完成", level="info"))
+
         return DataAgentRun(
             run_id=run_dir.name,
-            request=asdict(request),
+            request=request.model_dump(),
             artifacts=artifacts,
             manifest_path=str(manifest_path),
             response_path=artifacts["final"].path,
             final_data=final_payload,
             plan=plan_payload,
+            collection_summary=collection_summary,
+            audit_trail=audit_trail,
         )
 
     def _make_run_dir(self, request: DataAgentRequest) -> Path:
@@ -428,7 +501,7 @@ class DataAgent:
             updates["sector_keyword"] = profile.sector_keyword
             applied_fields.append("sector_keyword")
 
-        effective_request = replace(request, **updates) if updates else request
+        effective_request = request.model_copy(update=updates) if updates else request
         profile_payload = {
             **asdict(profile),
             "applied_fields": applied_fields,
@@ -1546,10 +1619,7 @@ class DataAgent:
 
     def _write_json(self, path: Path, payload: dict[str, Any]) -> DataAgentArtifact:
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2, default=self._json_default),
-            encoding="utf-8",
-        )
+        atomic_write_json(path, payload, default=self._json_default)
         return DataAgentArtifact(
             stage=str(payload.get("stage", path.parent.name)),
             path=str(path),

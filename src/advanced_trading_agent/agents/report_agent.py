@@ -7,6 +7,7 @@ Report Agent — 报告输出层
 from __future__ import annotations
 
 import logging
+import re
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -15,6 +16,14 @@ from ..config import config
 from .schemas import DecisionType, FinalReport, SystemDecision
 
 logger = logging.getLogger(__name__)
+
+
+_SAFE_PATH_PART = re.compile(r"[^A-Za-z0-9_.-]+")
+
+
+def _safe_path_part(value: str, fallback: str) -> str:
+    safe = _SAFE_PATH_PART.sub("_", value).strip("._")
+    return safe or fallback
 
 
 def create_report_agent(llm=None):
@@ -54,9 +63,11 @@ def create_report_agent(llm=None):
 
         # 保存文件
         results_dir = Path(config.get("results_dir", "data/results"))
-        save_dir = results_dir / ticker.replace(".", "_")
+        safe_ticker = _safe_path_part(ticker.replace(".", "_"), "unknown_ticker")
+        safe_trade_date = _safe_path_part(trade_date, "unknown_date")
+        save_dir = results_dir / safe_ticker
         save_dir.mkdir(parents=True, exist_ok=True)
-        report_path = save_dir / f"report_{trade_date}.md"
+        report_path = save_dir / f"report_{safe_trade_date}.md"
         report_path.write_text(md, encoding="utf-8")
 
         # 写入 Memory
@@ -71,7 +82,6 @@ def create_report_agent(llm=None):
         return {
             "final_report": md,
             "final_report_obj": report,
-            "sender": "Report Agent",
         }
 
     return report_node

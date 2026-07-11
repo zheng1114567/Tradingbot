@@ -29,6 +29,19 @@ def create_risk_check_1():
         tier1 = state.get("tier1_data", {})
         risk_data = tier1.get("risk", {})
 
+        if not risk_data or not risk_data.get("risk_data_available", True):
+            return {
+                "risk_check_1": {
+                    "verdict": "SOFT_VETO",
+                    "reasons": [
+                        "风险基础数据缺失，无法确认 ST/停牌/退市状态",
+                        *risk_data.get("risk_data_errors", []),
+                    ],
+                    "suggested": ["补齐风险数据后再做推荐"],
+                },
+                "system_state": "running",
+            }
+
         controller = HardRiskController()
         verdict = controller.check_all(
             code=ticker,
@@ -82,7 +95,14 @@ def create_risk_check_2():
             }
 
         # 流动性检查
-        daily_volume = risk_data.get("daily_volume", 0)
+        daily_volume = risk_data.get("daily_volume")
+        if daily_volume is None:
+            return {
+                "risk_check_2": {
+                    "verdict": "SOFT_VETO",
+                    "reasons": ["流动性数据缺失，无法确认可成交性"],
+                },
+            }
         liquidity_verdict = controller.check_liquidity(daily_volume)
 
         return {
@@ -104,13 +124,15 @@ def create_risk_check_3():
     def risk_check_3_node(state: dict[str, Any]) -> dict[str, Any]:
         ticker = state.get("company_of_interest", "")
         risk_data = state.get("tier1_data", {}).get("risk", {})
+        decision = state.get("system_decision_obj")
+        proposed_pct = getattr(decision, "position", None) or 0.10
 
         controller = HardRiskController()
         verdict = controller.check_all(
             code=ticker,
-            daily_volume_cny=risk_data.get("daily_volume", 0),
+            daily_volume_cny=risk_data.get("daily_volume"),
             current_position_pct=risk_data.get("current_position", 0),
-            proposed_pct=0.10,
+            proposed_pct=proposed_pct,
         )
 
         return {

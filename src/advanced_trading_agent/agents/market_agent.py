@@ -135,7 +135,6 @@ def create_market_agent(llm: LLMClient):
         return {
             "market_report": report.to_markdown() if hasattr(report, 'to_markdown') else str(report),
             "market_report_obj": report,
-            "sender": "Market Agent",
         }
 
     return market_node

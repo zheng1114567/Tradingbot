@@ -41,9 +41,15 @@ def make_base_state(**overrides) -> dict:
             "market": {"index_close": 3000, "index_change_pct": 0.5},
             "sentiment": {"sentiment": "正常", "sentiment_score": 55},
             "capital": {"confirmation": "资金确认", "net_inflow_main": 1e8},
-            "risk": {"st_list": [], "suspended_list": [], "delisting_list": []},
+            "risk": {
+                "st_list": [],
+                "suspended_list": [],
+                "delisting_list": [],
+                "daily_volume": 20_000_000,
+            },
         },
         "tier2_data": {"factors": [], "events": [], "backtest_samples": []},
+        "tier2_decision": {},
         "data_quality_report": None,
         "pit_manifest": None,
         "memory_context": "",
@@ -59,11 +65,12 @@ def make_base_state(**overrides) -> dict:
         "event_report_obj": None,
         "analysis_report_obj": None,
         "backtest_report_obj": None,
-        "round2_state": {
-            "active": False, "round_count": 0, "max_rounds": 8,
-            "questions": [], "contradictions": [],
-            "current_speaker": "", "completed": False,
-        },
+            "round2_state": {
+                "active": False, "round_count": 0, "max_rounds": 8,
+                "questions": [], "contradictions": [],
+                "current_speaker": "", "completed": False, "summary": "",
+            },
+        "round2_summary": "",
         "system_decision_obj": None,
         "system_state": "",
         "final_report": "",
@@ -134,7 +141,12 @@ class TestTradingSystemIntegration:
             "market": {"index_close": 3000, "index_change_pct": 0.5},
             "sentiment": {"sentiment": "正常", "sentiment_score": 55},
             "capital": {"confirmation": "资金确认"},
-            "risk": {"st_list": [], "suspended_list": [], "delisting_list": []},
+            "risk": {
+                "st_list": [],
+                "suspended_list": [],
+                "delisting_list": [],
+                "daily_volume": 20_000_000,
+            },
         }
         tier2 = {}
         system = TradingSystem(debug=False, mode="live")
@@ -170,16 +182,40 @@ class TestTradingSystemIntegration:
                 pytest.skip(f"LangGraph 版本对 sender 字段的限制: {e}")
             pytest.fail(f"工作流抛出未处理异常: {type(e).__name__}: {e}")
 
+    def test_load_data_populates_risk_and_liquidity(self):
+        system = TradingSystem(debug=False, mode="live")
+
+        with patch("advanced_trading_agent.graph.workflow.route_to_vendor") as route:
+            def fake_route(method, *args, **kwargs):
+                if method == "get_daily" and kwargs.get("code") == "000001.SZ":
+                    return [{"ts_code": "000001.SZ", "close": 10, "pct_chg": 1, "amount": 20000}]
+                if method == "get_daily":
+                    return [{"ts_code": "000001.SH", "close": 3000, "pct_chg": 0.5}]
+                if method == "get_st_status":
+                    return []
+                if method == "get_suspended":
+                    return []
+                raise AssertionError(method)
+
+            route.side_effect = fake_route
+            tier1, tier2 = system._load_data("000001.SZ", "2026-07-10")
+
+        assert tier2["price_data"]
+        assert tier1["risk"]["risk_data_available"] is True
+        assert tier1["risk"]["daily_volume"] == 20_000_000
+        assert tier1["_data_manifest"]["fields"]["stock.daily"]["available"] is True
+        assert "risk.st_status" in tier1["_data_manifest"]["fields"]
+
     def test_workflow_state_keys(self):
         """验证 AgentState 的 key 设计完整性"""
         from typing import get_type_hints
         hints = get_type_hints(AgentState)
         required_keys = [
             "company_of_interest", "trade_date", "sender", "run_mode",
-            "tier1_data", "tier2_data",
+            "tier1_data", "tier2_data", "tier2_decision",
             "risk_check_1", "risk_check_2", "risk_check_3",
             "market_report", "event_report", "analysis_report", "backtest_report",
-            "round2_state", "system_decision_obj", "system_state",
+            "round2_state", "round2_summary", "system_decision_obj", "system_state",
             "final_report", "final_report_obj",
         ]
         for key in required_keys:

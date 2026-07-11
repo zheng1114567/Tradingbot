@@ -119,7 +119,6 @@ def create_event_agent(llm: LLMClient):
         return {
             "event_report": report.to_markdown() if hasattr(report, 'to_markdown') else str(report),
             "event_report_obj": report,
-            "sender": "Event Agent",
         }
 
     return event_node

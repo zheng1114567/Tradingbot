@@ -64,6 +64,7 @@ def create_system_agent(llm: LLMClient):
             "data_quality_report": quality,
             "system_state": "running",
             "tier1_data": {**tier1, "winter_mode": winter},
+            "tier2_decision": tier2_decision,
         }
 
     def round2_judge_node(state: dict[str, Any]) -> dict[str, Any]:
@@ -127,6 +128,7 @@ def create_system_agent(llm: LLMClient):
         backtest_rpt = state.get("backtest_report_obj")
         memory_ctx = state.get("memory_context", "")
         round2 = state.get("round2_state", {})
+        round2_table_summary = state.get("round2_summary", "") or round2.get("summary", "")
 
         # 读取硬风控 3 结果 (由 Risk Check 3 节点计算)
         risk3 = state.get("risk_check_3", {})
@@ -171,6 +173,8 @@ def create_system_agent(llm: LLMClient):
             round2_summary = "\n".join(
                 f"- {c}" for c in round2["contradictions"]
             )
+        if round2_table_summary:
+            round2_summary = f"{round2_summary}\n\n{round2_table_summary}".strip()
 
         prompt = f"""你是 System Agent, 负责最终裁定。
 
@@ -182,6 +186,9 @@ def create_system_agent(llm: LLMClient):
 
 ## Round 2 争议
 {round2_summary or '无明显矛盾'}
+
+## Round 2 圆桌要求
+如果圆桌仍存在未消除分歧, 最终裁定必须降级或写入反对意见。
 
 ## 硬风控
 {risk3}
@@ -241,7 +248,6 @@ def create_system_agent(llm: LLMClient):
                 "reasons": risk3_reasons,
             },
             "system_state": "completed",
-            "sender": "System Agent",
         }
 
     return {"init": init_node, "round2_judge": round2_judge_node, "final": final_decision_node}

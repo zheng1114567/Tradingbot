@@ -118,7 +118,6 @@ def create_backtest_agent(llm: LLMClient):
         return {
             "backtest_report": report.to_markdown() if hasattr(report, 'to_markdown') else str(report),
             "backtest_report_obj": report,
-            "sender": "Backtest Agent",
         }
 
     return backtest_node

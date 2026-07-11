@@ -73,6 +73,12 @@ class TestCacheManager:
         cache.set("key", "new")
         assert cache.get("key") == "new"
 
+    def test_cache_key_is_sanitized(self, tmp_path):
+        cache = CacheManager(cache_dir=str(tmp_path))
+        cache.set("../bad:key", {"value": 1})
+        assert cache.get("../bad:key") == {"value": 1}
+        assert cache._cache_path("../bad:key").parent == tmp_path
+
 
 class TestTier1Data:
     """Tier 1 数据模型测试"""

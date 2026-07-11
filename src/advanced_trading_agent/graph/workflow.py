@@ -41,8 +41,10 @@ from ..agents import (
 from ..agents.system_agent import create_system_agent
 from ..config import config
 from ..data_service.collector import register_all_vendors
+from ..data_service.manifest import DataManifest
 from ..data_service.vendor_router import route_to_vendor
 from ..llm.client import LLMClient
+from ..roundtable import AutoGenRoundtable
 from .conditional import (
     after_market,
     after_risk_check_1,
@@ -133,11 +135,8 @@ def create_workflow() -> StateGraph:
     # Round 1 完成 → 硬风控2
     workflow.add_edge("Backtest Agent", "Risk Check 2")
 
-    # 硬风控2 → System Init (System Agent 加载+检查 Memory)
-    workflow.add_edge("Risk Check 2", "System Init")
-
-    # System Init → Round 2 Judge
-    workflow.add_edge("System Init", "Round 2 Judge")
+    # 硬风控2 → Round 2 Judge
+    workflow.add_edge("Risk Check 2", "Round 2 Judge")
 
     # Round 2 Judge: 判断是否进辩论
     workflow.add_conditional_edges(
@@ -150,14 +149,14 @@ def create_workflow() -> StateGraph:
     workflow.add_conditional_edges(
         "Round 2 Debate",
         after_round2_turn,
-        {"continue_round2": "Round 2 Judge", "finalize": "Risk Check 3"},
+        {"continue_round2": "Round 2 Debate", "finalize": "Risk Check 3"},
     )
 
-    # 硬风控3: HARD_VETO → END, PASS → 裁定
+    # 硬风控3: 无论 PASS/HARD_VETO 都进入裁定节点生成报告
     workflow.add_conditional_edges(
         "Risk Check 3",
         after_risk_check_3,
-        {"finalize": "System Final Decision", "end": END},
+        {"finalize": "System Final Decision", "end": "System Final Decision"},
     )
 
     # 裁定 → 报告 → END
@@ -168,14 +167,59 @@ def create_workflow() -> StateGraph:
 
 
 def _create_round2_node(llm: LLMClient):
-    """创建 Round 2 交叉质询节点
+    """创建 Round 2 圆桌质询节点
 
-    一轮交叉质询:
-    1. System Agent 提出矛盾点
-    2. 相关 Agent 被质询
-    3. 被质询 Agent 回答
-    4. 更新 round_count
+    一轮圆桌:
+    1. System Agent 针对矛盾点提出问题
+    2. 选择相关 Agent 发言
+    3. 用各 Agent 的既有报告形成回答
+    4. 写回问题、回答和圆桌总结
     """
+    def _targets_for(contradiction: str) -> list[str]:
+        targets = []
+        lowered = contradiction.lower()
+        if "market" in lowered:
+            targets.append("Market")
+        if "event" in lowered:
+            targets.append("Event")
+        if "analysis" in lowered:
+            targets.append("Analysis")
+        if "backtest" in lowered:
+            targets.append("Backtest")
+        return targets or ["Market", "Event", "Analysis", "Backtest"]
+
+    def _report_for(state: AgentState, target: str) -> str:
+        key = {
+            "Market": "market_report",
+            "Event": "event_report",
+            "Analysis": "analysis_report",
+            "Backtest": "backtest_report",
+        }.get(target, "")
+        report = state.get(key, "")
+        return str(report).strip() or "暂无该 Agent 报告"
+
+    def _fallback_answer(target: str, contradiction: str, report: str) -> str:
+        excerpt = report.replace("\n", " ")[:260]
+        return (
+            f"{target} 回答: 基于当前报告，针对矛盾“{contradiction}”，"
+            f"可引用证据为：{excerpt}"
+        )
+
+    def _build_summary(questions: list[dict[str, Any]]) -> str:
+        if not questions:
+            return ""
+        lines = ["Round 2 圆桌会议总结:"]
+        for idx, item in enumerate(questions, start=1):
+            lines.append(f"{idx}. 矛盾: {item.get('data_source', '')}")
+            lines.append(f"   质询: {item.get('question', '')}")
+            for answer in item.get("answers", []):
+                lines.append(
+                    f"   - {answer.get('target_agent', 'Agent')}: "
+                    f"{answer.get('answer', '')}"
+                )
+        lines.append("结论: 未消除的分歧必须进入最终裁定和风控理由。")
+        return "\n".join(lines)
+
     def round2_node(state: AgentState) -> dict[str, Any]:
         round2 = state.get("round2_state", {})
         count = round2.get("round_count", 0)
@@ -192,7 +236,26 @@ def _create_round2_node(llm: LLMClient):
                 },
             }
 
-        # 提出质询 (LLM 生成问题)
+        try:
+            result = AutoGenRoundtable().run(state)
+            if result.summary:
+                return {
+                    "round2_state": {
+                        **round2,
+                        "round_count": max_rounds,
+                        "questions": result.questions,
+                        "current_speaker": "AutoGenRoundtable",
+                        "completed": True,
+                        "summary": result.summary,
+                        "unresolved_conflicts": result.unresolved_conflicts,
+                        "final_pressure": result.final_pressure,
+                    },
+                    "round2_summary": result.summary,
+                }
+        except Exception as e:
+            logger.warning("AutoGen roundtable failed, falling back to deterministic roundtable: %s", e)
+
+        # 提出质询 (LLM 生成问题, 失败则确定性降级)
         contradiction = contradictions[count % len(contradictions)] if contradictions else ""
         market_rpt = state.get("market_report", "")
         event_rpt = state.get("event_report", "")
@@ -222,13 +285,60 @@ Backtest: {backtest_rpt[:200]}
         except Exception:
             question = f"关于矛盾 '{contradiction[:50]}', 请相关 Agent 提供更多数据支撑。"
 
+        questions = list(round2.get("questions", []))
+        answers = []
+        for target in _targets_for(contradiction):
+            report = _report_for(state, target)
+            answer_prompt = f"""Round 2 圆桌会议 - {target} Agent 发言
+
+矛盾:
+{contradiction}
+
+System 质询:
+{question}
+
+{target} Agent 当前报告:
+{report[:1200]}
+
+请只基于该 Agent 报告回答:
+1. 是否坚持原判断
+2. 支撑证据
+3. 对最终裁定的影响
+回答要简洁。"""
+            try:
+                response = llm.chat([
+                    ("system", f"你是 {target} Agent，在圆桌会议中只基于自己的报告回答。"),
+                    ("human", answer_prompt),
+                ])
+                answer = response if isinstance(response, str) else str(response)
+            except Exception:
+                answer = _fallback_answer(target, contradiction, report)
+            answers.append({
+                "target_agent": target,
+                "answer": answer,
+                "evidence": report[:500],
+            })
+
+        questions.append({
+            "source_agent": "System",
+            "target_agent": ",".join(a["target_agent"] for a in answers),
+            "question": question,
+            "answer": "\n".join(f"{a['target_agent']}: {a['answer']}" for a in answers),
+            "answers": answers,
+            "data_source": contradiction,
+        })
+        summary = _build_summary(questions)
+
         return {
             "round2_state": {
                 **round2,
                 "round_count": count + 1,
+                "questions": questions,
                 "current_speaker": "System",
                 "completed": count + 1 >= max_rounds,
+                "summary": summary,
             },
+            "round2_summary": summary,
         }
 
     return round2_node
@@ -251,35 +361,218 @@ class TradingSystem:
         import logging
         logger = logging.getLogger(__name__)
 
+        def _is_no_data(value: Any) -> bool:
+            return isinstance(value, str) and "NO_DATA_AVAILABLE" in value
+
+        def _latest_record(records: Any) -> dict[str, Any]:
+            if isinstance(records, list) and records:
+                first = records[0]
+                return first if isinstance(first, dict) else {}
+            return {}
+
+        def _daily_amount_cny(row: dict[str, Any]) -> float | None:
+            amount = row.get("amount", row.get("成交额"))
+            if amount is None:
+                return None
+            try:
+                amount_value = float(amount)
+            except (TypeError, ValueError):
+                return None
+            # Tushare daily amount is in thousand CNY; akshare 成交额 is already CNY.
+            if "ts_code" in row:
+                return amount_value * 1000
+            return amount_value
+
+        def _record_count(value: Any) -> int | None:
+            if isinstance(value, list):
+                return len(value)
+            if isinstance(value, dict):
+                return 1
+            return None
+
         # 注册所有供应商 (幂等)
         register_all_vendors()
 
         tier1: dict[str, Any] = {}
         tier2: dict[str, Any] = {}
+        manifest = DataManifest(ticker=ticker, trade_date=trade_date)
+        risk: dict[str, Any] = {
+            "st_list": None,
+            "suspended_list": None,
+            "delisting_list": None,
+            "risk_data_available": False,
+            "risk_data_errors": [],
+        }
 
         # --- Tier 1: 市场摘要 ---
         try:
             market_data = route_to_vendor("get_daily", code="000001.SH",
                                           start_date=trade_date, end_date=trade_date)
-            if isinstance(market_data, list) and market_data:
-                row = market_data[0] if isinstance(market_data[0], dict) else {}
+            if not _is_no_data(market_data):
+                row = _latest_record(market_data)
                 tier1["market"] = {
                     "index_close": row.get("close", 0),
                     "index_change_pct": row.get("pct_chg", 0),
                 }
+                manifest.add_field(
+                    "market.daily",
+                    available=bool(row),
+                    source="vendor_router:get_daily",
+                    vendor_chain=["tushare", "akshare"],
+                    fallback_used=False,
+                    record_count=_record_count(market_data),
+                )
+            else:
+                manifest.add_field(
+                    "market.daily",
+                    available=False,
+                    source="vendor_router:get_daily",
+                    vendor_chain=["tushare", "akshare"],
+                    error=str(market_data),
+                )
         except Exception as e:
             logger.warning("无法加载大盘数据: %s", e)
+            risk["risk_data_errors"].append(f"market_data: {e}")
+            manifest.add_field(
+                "market.daily",
+                available=False,
+                source="vendor_router:get_daily",
+                vendor_chain=["tushare", "akshare"],
+                error=str(e),
+            )
 
         # --- Tier 2: 个股数据 ---
         try:
-            from ..data_service.collector import get_daily_tushare, get_daily_akshare
             # 尝试获取个股行情
             daily = route_to_vendor("get_daily", code=ticker,
                                     start_date=trade_date, end_date=trade_date)
             if isinstance(daily, list) and daily:
                 tier2["price_data"] = daily
+                latest = _latest_record(daily)
+                daily_amount = _daily_amount_cny(latest)
+                if daily_amount is not None:
+                    risk["daily_volume"] = daily_amount
+                manifest.add_field(
+                    "stock.daily",
+                    available=True,
+                    source="vendor_router:get_daily",
+                    vendor_chain=["tushare", "akshare"],
+                    fallback_used=False,
+                    record_count=len(daily),
+                )
+            elif _is_no_data(daily):
+                manifest.add_field(
+                    "stock.daily",
+                    available=False,
+                    source="vendor_router:get_daily",
+                    vendor_chain=["tushare", "akshare"],
+                    error=str(daily),
+                )
+            else:
+                manifest.add_field(
+                    "stock.daily",
+                    available=False,
+                    source="vendor_router:get_daily",
+                    vendor_chain=["tushare", "akshare"],
+                    error="empty daily price response",
+                )
         except Exception as e:
             logger.warning("无法加载个股数据 (%s): %s", ticker, e)
+            risk["risk_data_errors"].append(f"price_data: {e}")
+            manifest.add_field(
+                "stock.daily",
+                available=False,
+                source="vendor_router:get_daily",
+                vendor_chain=["tushare", "akshare"],
+                error=str(e),
+            )
+
+        # --- 风险基础数据: ST / 停牌 / 退市 ---
+        try:
+            st_status = route_to_vendor("get_st_status")
+            if isinstance(st_status, list):
+                risk["st_list"] = st_status
+                manifest.add_field(
+                    "risk.st_status",
+                    available=True,
+                    source="vendor_router:get_st_status",
+                    vendor_chain=["tushare"],
+                    record_count=len(st_status),
+                )
+            else:
+                manifest.add_field(
+                    "risk.st_status",
+                    available=False,
+                    source="vendor_router:get_st_status",
+                    vendor_chain=["tushare"],
+                    error=str(st_status),
+                )
+        except Exception as e:
+            logger.warning("无法加载 ST 状态: %s", e)
+            risk["risk_data_errors"].append(f"st_status: {e}")
+            manifest.add_field(
+                "risk.st_status",
+                available=False,
+                source="vendor_router:get_st_status",
+                vendor_chain=["tushare"],
+                error=str(e),
+            )
+
+        try:
+            suspended = route_to_vendor("get_suspended")
+            if isinstance(suspended, list):
+                risk["suspended_list"] = suspended
+                manifest.add_field(
+                    "risk.suspended",
+                    available=True,
+                    source="vendor_router:get_suspended",
+                    vendor_chain=["tushare"],
+                    record_count=len(suspended),
+                )
+            else:
+                manifest.add_field(
+                    "risk.suspended",
+                    available=False,
+                    source="vendor_router:get_suspended",
+                    vendor_chain=["tushare"],
+                    error=str(suspended),
+                )
+        except Exception as e:
+            logger.warning("无法加载停牌状态: %s", e)
+            risk["risk_data_errors"].append(f"suspended: {e}")
+            manifest.add_field(
+                "risk.suspended",
+                available=False,
+                source="vendor_router:get_suspended",
+                vendor_chain=["tushare"],
+                error=str(e),
+            )
+
+        # 当前没有独立退市供应商时保持 None，让风控按数据缺失处理。
+        if risk.get("st_list") is not None and risk.get("suspended_list") is not None:
+            risk["delisting_list"] = []
+            risk["risk_data_available"] = True
+            manifest.add_field(
+                "risk.delisting",
+                available=True,
+                source="not_configured:default_empty",
+                record_count=0,
+            )
+        else:
+            manifest.add_field(
+                "risk.delisting",
+                available=False,
+                source="not_configured",
+                error="delisting vendor is not configured",
+            )
+        tier1["risk"] = risk
+        tier1["_data_manifest"] = manifest.to_dict()
+        try:
+            manifest_path = manifest.save()
+            tier1["_data_manifest_path"] = str(manifest_path)
+        except Exception as e:
+            logger.warning("无法保存数据 manifest: %s", e)
+            tier1["_data_manifest_save_error"] = str(e)
 
         return tier1, tier2
 
@@ -304,6 +597,14 @@ class TradingSystem:
             tier1_data, tier2_data = self._load_data(ticker, trade_date)
         tier1_data = tier1_data or {}
         tier2_data = tier2_data or {}
+        pit_manifest = tier1_data.pop("_data_manifest", None)
+        manifest_path = tier1_data.pop("_data_manifest_path", None)
+        manifest_save_error = tier1_data.pop("_data_manifest_save_error", None)
+        if isinstance(pit_manifest, dict):
+            if manifest_path:
+                pit_manifest["path"] = manifest_path
+            if manifest_save_error:
+                pit_manifest["save_error"] = manifest_save_error
 
         init_state = {
             "messages": [("human", f"分析 {ticker} {trade_date}")],
@@ -313,8 +614,9 @@ class TradingSystem:
             "run_mode": self.mode,
             "tier1_data": tier1_data or {},
             "tier2_data": tier2_data or {},
+            "tier2_decision": {},
             "data_quality_report": None,
-            "pit_manifest": None,
+            "pit_manifest": pit_manifest,
             "memory_context": "",
             "memory_recall": {},
             "risk_check_1": {},
@@ -336,7 +638,9 @@ class TradingSystem:
                 "contradictions": [],
                 "current_speaker": "",
                 "completed": False,
+                "summary": "",
             },
+            "round2_summary": "",
             "system_decision_obj": None,
             "system_state": "",
             "final_report": "",

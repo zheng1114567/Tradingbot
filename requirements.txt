@@ -11,4 +11,4 @@
 #   pip install -e ".[dev,akshare,tushare,anthropic]"
 
 -e .
-.[dev,akshare,tushare,anthropic]
+.[dev,akshare,tushare,anthropic,autogen]

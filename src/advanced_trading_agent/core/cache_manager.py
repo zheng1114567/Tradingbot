@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import time
 from dataclasses import dataclass, field
 from datetime import date, datetime
@@ -29,6 +30,9 @@ from typing import Any
 from ..config import config
 
 logger = logging.getLogger(__name__)
+
+
+_SAFE_CACHE_KEY = re.compile(r"[^A-Za-z0-9_.-]+")
 
 
 # 估计 token 数 (中文字符 ~2 token/字, 英文 ~0.5 token/字符)
@@ -150,7 +154,10 @@ class CacheManager:
         self.cache_dir.mkdir(parents=True, exist_ok=True)
 
     def _cache_path(self, key: str) -> Path:
-        return self.cache_dir / f"{key}.json"
+        safe_key = _SAFE_CACHE_KEY.sub("_", key).strip("._")
+        if not safe_key:
+            safe_key = "cache"
+        return self.cache_dir / f"{safe_key}.json"
 
     def get(self, key: str) -> Any | None:
         """获取缓存 (如果未过期)"""

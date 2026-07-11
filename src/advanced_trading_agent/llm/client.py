@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import os
+from collections.abc import Sequence
 from typing import Any
 
 from openai import OpenAI
@@ -15,6 +16,12 @@ from openai import OpenAI
 from ..config import config
 
 logger = logging.getLogger(__name__)
+
+
+_ROLE_ALIASES = {
+    "human": "user",
+    "ai": "assistant",
+}
 
 
 class LLMClient:
@@ -62,6 +69,25 @@ class LLMClient:
             self._client = OpenAI(api_key=api_key, base_url=base_url)
 
         return self._client
+
+    @staticmethod
+    def _normalize_messages(messages: Sequence[Any]) -> list[dict[str, str]]:
+        """Accept LangChain-style tuples and return provider-safe chat messages."""
+        normalized: list[dict[str, str]] = []
+        for message in messages:
+            if isinstance(message, dict):
+                role = str(message.get("role", "user"))
+                content = message.get("content", "")
+            elif isinstance(message, tuple) and len(message) == 2:
+                role, content = message
+            else:
+                raise TypeError(f"Unsupported message format: {type(message).__name__}")
+
+            role = _ROLE_ALIASES.get(str(role), str(role))
+            if role not in {"system", "user", "assistant", "tool"}:
+                raise ValueError(f"Unsupported message role: {role}")
+            normalized.append({"role": role, "content": str(content)})
+        return normalized
 
     def _call_openai(self, kwargs: dict[str, Any],
                       response_format: type | None = None) -> str:
@@ -129,12 +155,11 @@ class LLMClient:
         try:
             import json
             parsed = json.loads(content)
-            return response_format(**parsed)
+            return response_format.model_validate(parsed)
         except Exception as e:
-            logger.warning("Failed to parse structured output: %s", e)
-            return content
+            raise ValueError(f"Failed to parse structured output: {e}") from e
 
-    def chat(self, messages: list[dict[str, str]],
+    def chat(self, messages: Sequence[Any],
              response_format: type | None = None,
              temperature: float | None = None,
              max_tokens: int = 4096) -> Any:
@@ -150,9 +175,10 @@ class LLMClient:
             如果指定了 response_format, 返回 Pydantic 实例;
             否则返回 str.
         """
+        normalized_messages = self._normalize_messages(messages)
         kwargs = {
             "model": self.model,
-            "messages": messages,
+            "messages": normalized_messages,
             "temperature": temperature or self.temperature,
             "max_tokens": max_tokens,
         }
@@ -165,7 +191,7 @@ class LLMClient:
             logger.error("LLM call failed: %s", e)
             raise
 
-    def invoke(self, messages: list[dict[str, str]],
+    def invoke(self, messages: Sequence[Any],
                response_format: type | None = None) -> str | Any:
         """便捷调用方法"""
         return self.chat(messages, response_format=response_format)

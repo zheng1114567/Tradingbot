@@ -44,13 +44,6 @@ def analyze_single(ticker: str, trade_date: str | None = None,
     system = TradingSystem(debug=debug)
     final_state, report = system.analyze(ticker, trade_date)
 
-    # 保存决策到 Memory
-    decision_obj = final_state.get("system_decision_obj")
-    from .agents.memory_agent import MemoryStore
-    if decision_obj:
-        store = MemoryStore()
-        store.store_decision(ticker, trade_date, decision_obj)
-
     return report
 
 
@@ -68,29 +61,26 @@ def analyze_batch(tickers_file: str, debug: bool = False,
     with open(tickers_file, "r", encoding="utf-8") as f:
         tickers = [line.strip() for line in f if line.strip()]
 
-    reports: list[str] = []
+    results: list[tuple[int, str]] = []
     logger.info("Batch analyzing %d tickers (max_workers=%d)...", len(tickers), max_workers)
 
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+    with ThreadPoolExecutor(max_workers=max(1, max_workers)) as executor:
         future_map = {
-            executor.submit(analyze_single, ticker, debug=debug): ticker
-            for ticker in tickers
+            executor.submit(analyze_single, ticker, debug=debug): (idx, ticker)
+            for idx, ticker in enumerate(tickers)
         }
         for future in as_completed(future_map):
-            ticker = future_map[future]
+            idx, ticker = future_map[future]
             try:
                 report = future.result()
-                reports.append(report)
+                results.append((idx, report))
                 logger.info("=== Done %s ===", ticker)
             except Exception as e:
                 logger.error("Failed %s: %s", ticker, e)
-                reports.append(f"# {ticker}\n\n**失败**: {e}")
+                results.append((idx, f"# {ticker}\n\n**失败**: {e}"))
 
     # 按原始 ticker 顺序排序
-    ticker_order = {t: i for i, t in enumerate(tickers)}
-    reports.sort(key=lambda r: min(
-        ticker_order.get(t, 999) for t in tickers if t in r
-    ))
+    reports = [report for _, report in sorted(results, key=lambda item: item[0])]
 
     # 保存汇总
     summary_path = Path(config.get("results_dir", "data/results")) / "batch_summary.md"

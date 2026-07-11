@@ -35,6 +35,10 @@ tushare = ["tushare>=1.12.0"]
 akshare = ["akshare>=1.14.0"]
 # LLM 供应商
 anthropic = ["anthropic>=0.84.0"]
+autogen = [
+    "autogen-agentchat>=0.7.0",
+    "autogen-ext[openai]>=0.7.0",
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]

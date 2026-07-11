@@ -108,7 +108,6 @@ def create_analysis_agent(llm: LLMClient):
         return {
             "analysis_report": report.to_markdown() if hasattr(report, 'to_markdown') else str(report),
             "analysis_report_obj": report,
-            "sender": "Analysis Agent",
         }
 
     return analysis_node

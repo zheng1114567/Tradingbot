@@ -22,6 +22,7 @@ class QuestionItem(TypedDict):
     target_agent: str   # 被质询 Agent
     question: str
     answer: str | None
+    answers: list[dict[str, Any]]
     data_source: str  # 质询基于的数据矛盾
 
 
@@ -34,6 +35,7 @@ class Round2State(TypedDict):
     contradictions: list[str]    # 发现的矛盾摘要
     current_speaker: str         # 当前发言 Agent
     completed: bool              # 是否完成
+    summary: str                 # 圆桌会议总结
 
 
 class AgentState(MessagesState):
@@ -50,6 +52,7 @@ class AgentState(MessagesState):
     # === 数据层 ===
     tier1_data: dict
     tier2_data: dict
+    tier2_decision: dict
     data_quality_report: Any | None
     pit_manifest: Any | None
 
@@ -76,6 +79,7 @@ class AgentState(MessagesState):
 
     # === Round 2 辩论 ===
     round2_state: Round2State
+    round2_summary: str
 
     # === System 裁定 ===
     system_decision_obj: Any | None

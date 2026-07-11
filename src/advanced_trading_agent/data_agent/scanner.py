@@ -512,6 +512,66 @@ class MarketScanner:
         return "\n".join(lines)
 
     # ------------------------------------------------------------------
+    # LLM review for scan results
+    # ------------------------------------------------------------------
+
+    def review_with_llm(
+        self,
+        results: list[ScanResult],
+        llm_client: Any | None = None,
+    ) -> str:
+        """LLM review of scan results: risk check + quality assessment.
+
+        Flags delisted stocks, sector concentration, signal quality.
+
+        Returns a Markdown paragraph. Falls back to empty string.
+        """
+        if not results:
+            return ""
+
+        prompt = self._build_review_prompt(results)
+        try:
+            if llm_client is None:
+                from ..llm.client import create_llm
+
+                llm_client = create_llm()
+
+            response = llm_client.chat(
+                [
+                    (
+                        "system",
+                        "你是量化交易系统里的扫描结果审计员。检查候选列表中的异常："
+                        "退市股（名称含'退'）、信号质量、板块集中度。"
+                        "只返回纯文本，300字以内，不加前缀。"
+                        "如果没有问题可以返回空字符串。",
+                    ),
+                    ("human", prompt),
+                ],
+                temperature=0.1,
+                max_tokens=800,
+            )
+            return str(response).strip()
+        except Exception as exc:
+            logger.debug("LLM review failed: %s", exc)
+            return ""
+
+    def _build_review_prompt(self, results: list[ScanResult]) -> str:
+        """Build the LLM review prompt from scan results."""
+        parts = ["以下为市场扫描候选列表，请检查风险和异常：", ""]
+        parts.append(f"## Top 候选 ({len(results)} 只)")
+        for i, r in enumerate(results[:15], 1):
+            parts.append(f"{i}. {r.ticker} {r.name} 评分={r.score} 来源={r.source} 板块={r.sector} {r.reason}")
+
+        parts.append("")
+        parts.append("## 检查清单")
+        parts.append("1. 是否有名称含'退'的股票（退市不可交易）？")
+        parts.append("2. Top 5 是否集中在单一板块（集中度风险）？")
+        parts.append("3. 主要信号来源是啥（板块/涨停/龙虎榜/北向）？信号是否扎实？")
+        parts.append("4. 有无明显异常（退市、停牌、成交量极低）？")
+        parts.append("5. 综合评估：这批候选质量如何？")
+        return "\n".join(parts)
+
+    # ------------------------------------------------------------------
     # Data collection (combined scan + fetch)
     # ------------------------------------------------------------------
 

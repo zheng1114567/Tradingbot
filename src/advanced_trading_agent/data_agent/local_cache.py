@@ -360,3 +360,12 @@ def get_cached_limit_up(trade_date: str | None = None) -> dict[str, Any]:
     if path.exists():
         return json.loads(path.read_text("utf-8"))
     return {}
+
+
+def get_cached_risk_blacklist() -> list[dict[str, str]]:
+    """Read cached risk blacklist (delisted/ST/suspended)."""
+    cache = LocalCache()
+    path = cache.cache_dir / "risk_blacklist.json"
+    if path.exists():
+        return json.loads(path.read_text("utf-8"))
+    return []

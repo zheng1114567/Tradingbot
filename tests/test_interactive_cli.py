@@ -1,6 +1,7 @@
 """Tests for the interactive slash-command CLI."""
 from __future__ import annotations
 
+import json
 from io import StringIO
 
 from advanced_trading_agent import interactive_cli
@@ -10,8 +11,11 @@ def test_help_command_lists_core_slash_commands():
     result = interactive_cli.execute_command("/help")
 
     assert result.should_exit is False
-    assert "/analyze <ticker>" in result.output
-    assert "/data <ticker>" in result.output
+    assert "/a <ticker>" in result.output
+    assert "/data [ticker]" in result.output
+    assert "/date [ticker]" in result.output
+    assert "/dates [ticker]" in result.output
+    assert "/run [ticker]" in result.output
     assert "/status" in result.output
     assert "/exit" in result.output
 
@@ -51,7 +55,26 @@ def test_bare_ticker_runs_analyze_with_skip_backtest_default():
     }]
 
 
-def test_analyze_command_parses_date_debug_and_skip_backtest():
+def test_bare_ticker_accepts_positional_date():
+    calls = []
+
+    def fake_analyze(*args, **kwargs):
+        calls.append({"args": args, "kwargs": kwargs})
+        return "# fake report"
+
+    result = interactive_cli.execute_command(
+        "000001.SZ 2026-07-10",
+        analyze_runner=fake_analyze,
+    )
+
+    assert result.output == "# fake report"
+    assert calls == [{
+        "args": ("000001.SZ", "2026-07-10"),
+        "kwargs": {"debug": False, "skip_backtest": True},
+    }]
+
+
+def test_analyze_alias_parses_positional_date_and_debug():
     calls = []
 
     def fake_analyze(*args, **kwargs):
@@ -59,7 +82,7 @@ def test_analyze_command_parses_date_debug_and_skip_backtest():
         return "analysis ok"
 
     result = interactive_cli.execute_command(
-        "/analyze 000001.SZ --date 2026-07-10 --skip-backtest --debug",
+        "/a 000001.SZ 2026-07-10 --debug",
         analyze_runner=fake_analyze,
     )
 
@@ -67,6 +90,25 @@ def test_analyze_command_parses_date_debug_and_skip_backtest():
     assert calls == [{
         "args": ("000001.SZ", "2026-07-10"),
         "kwargs": {"debug": True, "skip_backtest": True},
+    }]
+
+
+def test_analyze_can_enable_backtest_explicitly():
+    calls = []
+
+    def fake_analyze(*args, **kwargs):
+        calls.append({"args": args, "kwargs": kwargs})
+        return "analysis ok"
+
+    result = interactive_cli.execute_command(
+        "/analyze 000001.SZ 2026-07-10 --with-backtest",
+        analyze_runner=fake_analyze,
+    )
+
+    assert result.output == "analysis ok"
+    assert calls == [{
+        "args": ("000001.SZ", "2026-07-10"),
+        "kwargs": {"debug": False, "skip_backtest": False},
     }]
 
 
@@ -100,9 +142,223 @@ def test_data_command_parses_dataagent_options():
     }]
 
 
+def test_data_alias_accepts_positional_date():
+    calls = []
+
+    def fake_data(*args, **kwargs):
+        calls.append({"args": args, "kwargs": kwargs})
+        return '{"run_id": "run-1"}'
+
+    result = interactive_cli.execute_command(
+        "/d 000001.SZ 2026-07-10",
+        data_runner=fake_data,
+    )
+
+    assert result.output == '{"run_id": "run-1"}'
+    assert calls[0]["args"] == ("000001.SZ",)
+    assert calls[0]["kwargs"]["trade_date"] == "2026-07-10"
+
+
+def test_data_sets_current_context_for_parameterless_analyze():
+    context = interactive_cli.SessionContext()
+    data_calls = []
+    analyze_calls = []
+
+    def fake_data(*args, **kwargs):
+        data_calls.append({"args": args, "kwargs": kwargs})
+        return "data ok"
+
+    def fake_analyze(*args, **kwargs):
+        analyze_calls.append({"args": args, "kwargs": kwargs})
+        return "analysis ok"
+
+    data_result = interactive_cli.execute_command(
+        "/data 000001.SZ 2026-07-10",
+        context=context,
+        data_runner=fake_data,
+    )
+    analyze_result = interactive_cli.execute_command(
+        "/analyze",
+        context=context,
+        analyze_runner=fake_analyze,
+    )
+
+    assert data_result.output == "data ok"
+    assert analyze_result.output == "analysis ok"
+    assert context.ticker == "000001.SZ"
+    assert context.trade_date == "2026-07-10"
+    assert data_calls[0]["args"] == ("000001.SZ",)
+    assert data_calls[0]["kwargs"]["trade_date"] == "2026-07-10"
+    assert analyze_calls == [{
+        "args": ("000001.SZ", "2026-07-10"),
+        "kwargs": {"debug": False, "skip_backtest": True},
+    }]
+
+
+def test_parameterless_data_reuses_current_context():
+    context = interactive_cli.SessionContext(ticker="000001.SZ", trade_date="2026-07-10")
+    calls = []
+
+    def fake_data(*args, **kwargs):
+        calls.append({"args": args, "kwargs": kwargs})
+        return "data ok"
+
+    result = interactive_cli.execute_command(
+        "/data",
+        context=context,
+        data_runner=fake_data,
+    )
+
+    assert result.output == "data ok"
+    assert calls[0]["args"] == ("000001.SZ",)
+    assert calls[0]["kwargs"]["trade_date"] == "2026-07-10"
+
+
+def test_parameterless_analyze_requires_current_context():
+    result = interactive_cli.execute_command("/analyze", context=interactive_cli.SessionContext())
+
+    assert "No current ticker" in result.output
+
+
+def test_dates_command_lists_local_data_dates(tmp_path):
+    run_dir = tmp_path / "data_agent_runs" / "2026-07-10_000001_SZ_20260712_000637"
+    manifest_dir = run_dir / "06_final" / "manifests"
+    manifest_dir.mkdir(parents=True)
+    (manifest_dir / "manifest_000001_SZ_2026-07-10.json").write_text(
+        json.dumps({"ticker": "000001.SZ", "trade_date": "2026-07-10"}),
+        encoding="utf-8",
+    )
+
+    result = interactive_cli.execute_command(
+        f"/dates 000001.SZ --results-dir {tmp_path}",
+    )
+
+    assert "Data dates for 000001.SZ: 1" in result.output
+    assert "2026-07-10" in result.output
+    assert "000001_SZ" in result.output
+
+
+def test_dates_command_reuses_current_context(tmp_path):
+    context = interactive_cli.SessionContext(ticker="000001.SZ", trade_date="2026-07-10")
+    run_dir = tmp_path / "data_agent_runs" / "2026-07-10_000001_SZ_20260712_000637"
+    run_dir.mkdir(parents=True)
+
+    result = interactive_cli.execute_command(
+        f"/dates --results-dir {tmp_path}",
+        context=context,
+    )
+
+    assert "Data dates for 000001.SZ: 1" in result.output
+    assert "2026-07-10" in result.output
+
+
+def test_date_alias_lists_local_data_dates(tmp_path):
+    run_dir = tmp_path / "data_agent_runs" / "2026-07-10_000001_SZ_20260712_000637"
+    run_dir.mkdir(parents=True)
+
+    result = interactive_cli.execute_command(
+        f"/date 000001.SZ --results-dir {tmp_path}",
+    )
+
+    assert "Data dates for 000001.SZ: 1" in result.output
+    assert "2026-07-10" in result.output
+
+
+def test_run_command_runs_data_then_analyze_with_backtest_by_default():
+    context = interactive_cli.SessionContext()
+    calls = []
+
+    def fake_data(*args, **kwargs):
+        calls.append(("data", args, kwargs))
+        return "data ok"
+
+    def fake_analyze(*args, **kwargs):
+        calls.append(("analyze", args, kwargs))
+        return "analysis ok"
+
+    result = interactive_cli.execute_command(
+        "/run 000001.SZ 2026-07-10",
+        context=context,
+        data_runner=fake_data,
+        analyze_runner=fake_analyze,
+    )
+
+    assert "# Full Run Complete" in result.output
+    assert "data ok" in result.output
+    assert "analysis ok" in result.output
+    assert context.ticker == "000001.SZ"
+    assert context.trade_date == "2026-07-10"
+    assert calls[0][0] == "data"
+    assert calls[0][1] == ("000001.SZ",)
+    assert calls[0][2]["trade_date"] == "2026-07-10"
+    assert calls[0][2]["start_date"] == "20260710"
+    assert calls[0][2]["end_date"] == "20260710"
+    assert calls[1] == (
+        "analyze",
+        ("000001.SZ", "2026-07-10"),
+        {"debug": False, "skip_backtest": False},
+    )
+
+
+def test_run_command_can_skip_backtest_explicitly():
+    calls = []
+
+    def fake_data(*args, **kwargs):
+        calls.append(("data", args, kwargs))
+        return "data ok"
+
+    def fake_analyze(*args, **kwargs):
+        calls.append(("analyze", args, kwargs))
+        return "analysis ok"
+
+    result = interactive_cli.execute_command(
+        "/run 000001.SZ 2026-07-10 --skip-backtest --debug",
+        data_runner=fake_data,
+        analyze_runner=fake_analyze,
+    )
+
+    assert "# Full Run Complete" in result.output
+    assert calls[1] == (
+        "analyze",
+        ("000001.SZ", "2026-07-10"),
+        {"debug": True, "skip_backtest": True},
+    )
+
+
+def test_parameterless_run_reuses_current_context():
+    context = interactive_cli.SessionContext(ticker="000001.SZ", trade_date="2026-07-10")
+    calls = []
+
+    def fake_data(*args, **kwargs):
+        calls.append(("data", args, kwargs))
+        return "data ok"
+
+    def fake_analyze(*args, **kwargs):
+        calls.append(("analyze", args, kwargs))
+        return "analysis ok"
+
+    result = interactive_cli.execute_command(
+        "/run",
+        context=context,
+        data_runner=fake_data,
+        analyze_runner=fake_analyze,
+    )
+
+    assert "# Full Run Complete" in result.output
+    assert calls[0][1] == ("000001.SZ",)
+    assert calls[0][2]["trade_date"] == "2026-07-10"
+    assert calls[1][1] == ("000001.SZ", "2026-07-10")
+
+
+def test_parameterless_run_requires_current_context():
+    result = interactive_cli.execute_command("/run", context=interactive_cli.SessionContext())
+
+    assert "No current ticker" in result.output
+
+
 def test_unknown_and_exit_commands_do_not_raise():
     unknown = interactive_cli.execute_command("/missing")
-    exiting = interactive_cli.execute_command("/exit")
+    exiting = interactive_cli.execute_command("/q")
 
     assert "Unknown command" in unknown.output
     assert exiting.should_exit is True

@@ -221,7 +221,10 @@ def _cache_daily_snapshot(
     board_index: dict[str, list[dict[str, str]]],
     trade_date: str,
 ) -> int:
-    """Best-effort: download recent daily data for top stocks from baostock."""
+    """Download recent daily data via mootdx (TCP, bypasses DPI).
+
+    Falls back to baostock if mootdx is not installed.
+    """
     daily_dir = cache_dir / "daily"
     daily_dir.mkdir(parents=True, exist_ok=True)
 
@@ -231,17 +234,69 @@ def _cache_daily_snapshot(
         for s in stocks[:5]:
             all_tickers.add(s["code"])
 
-    # Limit to 200 to avoid overwhelming baostock
-    tickers = sorted(all_tickers)[:200]
+    # Try to load industry_map for full coverage
+    im_path = cache_dir / "industry_map.json"
+    if im_path.exists():
+        industry_map = json.loads(im_path.read_text("utf-8"))
+        all_tickers.update(industry_map.keys())
 
+    # Limit to 500 to control download time
+    tickers = sorted(all_tickers)[:500]
+
+    # Try mootdx first (TCP, no DPI issues)
+    try:
+        from mootdx.quotes import Quotes
+        client = Quotes.factory(market="std")
+        cached = _cache_via_mootdx(client, tickers, daily_dir)
+        if cached > 0:
+            logger.info("Daily data (mootdx): %d stocks cached", cached)
+            return cached
+    except ImportError:
+        logger.debug("mootdx not installed, trying baostock")
+
+    # Fallback to baostock
+    return _cache_via_baostock(tickers, daily_dir, trade_date)
+
+
+def _cache_via_mootdx(client: Any, tickers: list[str], daily_dir: Path) -> int:
+    """Download daily data via mootdx TCP protocol."""
+    import pandas as pd
+
+    cached = 0
+    for ticker in tickers:
+        cache_path = daily_dir / f"{ticker.replace('.', '_')}.parquet"
+        if cache_path.exists():
+            cached += 1
+            continue
+
+        try:
+            code = ticker.split(".")[0]
+            df = client.bars(symbol=code, frequency=9, offset=250)
+            if df is not None and len(df) > 0:
+                df["code"] = ticker
+                df["data_source"] = "mootdx"
+                df.to_parquet(cache_path, index=False)
+                cached += 1
+        except Exception:
+            continue
+        time.sleep(0.3)
+
+    return cached
+
+
+def _cache_via_baostock(
+    tickers: list[str], daily_dir: Path, trade_date: str,
+) -> int:
+    """Download daily data via baostock (fallback)."""
     try:
         import baostock as bs
+        import pandas as pd
+        import datetime as dt
     except ImportError:
         return 0
 
     end_dt = date.fromisoformat(trade_date)
-    import datetime
-    start_dt = end_dt - datetime.timedelta(days=30)
+    start_dt = end_dt - dt.timedelta(days=30)
     cached = 0
 
     bs.login()
@@ -263,8 +318,6 @@ def _cache_daily_snapshot(
                 )
                 if rs.error_code != "0":
                     continue
-
-                import pandas as pd
                 rows = []
                 while rs.next():
                     rows.append(dict(zip(rs.fields, rs.get_row_data())))
@@ -276,14 +329,13 @@ def _cache_daily_snapshot(
                     cached += 1
             except Exception:
                 continue
-            time.sleep(0.5)  # Rate limit
+            time.sleep(0.5)
     finally:
         try:
             bs.logout()
         except Exception:
             pass
 
-    logger.info("Daily data: %d stocks cached", cached)
     return cached
 
 

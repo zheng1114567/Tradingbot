@@ -79,13 +79,16 @@ class DataAgentRequest:
     include_news: bool = True
     include_factors: bool = True
     include_risk: bool = True
+    include_sector_context: bool = True
     news_keyword: str | None = None
+    sector_keyword: str | None = None
     use_llm_news_filter: bool = True
     news_relevance_threshold: float = 0.5
     use_react_planner: bool = False
     output_dir: str | None = None
     max_news_records: int = 20
     max_return_records: int = 20
+    sector_top_n: int = 20
 
     def normalized_trade_date(self) -> str:
         return self.trade_date or date.today().isoformat()
@@ -175,6 +178,7 @@ class DataAgent:
                 "market": get_vendor_chain("get_daily"),
                 "capital_flow": get_vendor_chain("get_capital_flow"),
                 "news": get_vendor_chain("get_news"),
+                "sector_context": get_vendor_chain("get_sector"),
                 "factors": get_vendor_chain("get_factors"),
                 "risk": {
                     "st_status": get_vendor_chain("get_st_status"),
@@ -267,6 +271,15 @@ class DataAgent:
                 start_date=request.start_date or request.normalized_end_date(),
                 end_date=request.normalized_end_date(),
             )
+        sector_context = []
+        if request.include_sector_context:
+            sector_context = self._safe_route(
+                "get_sector",
+                manifest,
+                field_name="sector.context",
+                route_trace=route_trace,
+                top_n=request.sector_top_n,
+            )
         capital_flow = []
         if request.include_capital_flow:
             capital_flow = self._safe_route(
@@ -317,6 +330,7 @@ class DataAgent:
             "created_at": _utc_now(),
             "daily": daily,
             "market": market,
+            "sector_context": sector_context,
             "capital_flow": capital_flow,
             "news": news,
             "risk": {
@@ -402,6 +416,8 @@ class DataAgent:
             market_df = DataCleaner.clean_daily(market_raw)
         else:
             market_df = pd.DataFrame()
+        sector_raw = raw_payload.get("sector_context")
+        sector_context = self._clean_sector_context(sector_raw if isinstance(sector_raw, list) else [])
         risk_raw = raw_payload.get("risk", {})
 
         return {
@@ -416,6 +432,10 @@ class DataAgent:
                 "record_count": int(len(daily_df)),
                 "columns": list(daily_df.columns),
                 "records": _records_from_frame(daily_df),
+            },
+            "sector_context": {
+                "record_count": len(sector_context),
+                "records": sector_context,
             },
             "capital_flow": {
                 "record_count": len(capital_flow),
@@ -437,6 +457,7 @@ class DataAgent:
     ) -> dict[str, Any]:
         daily_records = cleaned_payload.get("daily", {}).get("records", [])
         market_records = cleaned_payload.get("market", {}).get("records", [])
+        sector_records = cleaned_payload.get("sector_context", {}).get("records", [])
         news_records = cleaned_payload.get("news", {}).get("records", [])
         daily_df = pd.DataFrame(daily_records)
         market_df = pd.DataFrame(market_records)
@@ -472,6 +493,7 @@ class DataAgent:
             factor_records = _records_from_frame(factor_df, limit=request.max_return_records)
 
         market_summary = self._summarize_market(market_df)
+        sector_summary = self._summarize_sector_context(sector_records, request)
         data_quality = {
             "daily_consistency": self._build_daily_consistency_report(
                 daily_records,
@@ -486,6 +508,7 @@ class DataAgent:
             request=request,
             summary=summary,
             market_summary=market_summary,
+            sector_summary=sector_summary,
             capital_summary=capital_summary,
             risk_summary=risk_summary,
             daily_records=daily_records,
@@ -499,6 +522,7 @@ class DataAgent:
             "created_at": _utc_now(),
             "summary": summary,
             "market": market_summary,
+            "sector": sector_summary,
             "capital": capital_summary,
             "risk": risk_summary,
             "data_quality": data_quality,
@@ -617,6 +641,7 @@ class DataAgent:
         request: DataAgentRequest,
         summary: dict[str, Any],
         market_summary: dict[str, Any],
+        sector_summary: dict[str, Any],
         capital_summary: dict[str, Any],
         risk_summary: dict[str, Any],
         daily_records: list[dict[str, Any]],
@@ -639,16 +664,122 @@ class DataAgent:
             },
             "capital": capital_summary,
             "risk": risk_summary,
+            "sector": {
+                "status": sector_summary.get("status", "unavailable"),
+                "matched_sector": sector_summary.get("matched_sector"),
+                "match_confidence": sector_summary.get("match_confidence", 0),
+                "top_sectors": sector_summary.get("top_sectors", []),
+            },
         }
         tier2 = {
             "price_data": daily_records,
             "factors": factor_records,
             "events": event_records,
+            "sector_context": sector_summary,
             "backtest_samples": [],
             "data_summary": summary,
             "data_quality": data_quality,
         }
         return tier1, tier2
+
+    @classmethod
+    def _clean_sector_context(cls, records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        cleaned: list[dict[str, Any]] = []
+        for idx, record in enumerate(records, start=1):
+            sector_name = cls._first_present(record, ["sector_name", "板块名称", "行业", "name", "名称"]) or ""
+            change_pct = cls._parse_number(cls._first_present(record, ["change_pct", "涨跌幅", "涨跌幅%", "change"])) or 0
+            strength_score = cls._parse_number(record.get("strength_score"))
+            if strength_score is None:
+                strength_score = change_pct
+            try:
+                rank = int(record.get("rank", idx))
+            except (TypeError, ValueError):
+                rank = idx
+            cleaned.append({
+                "rank": rank,
+                "sector_name": str(sector_name),
+                "change_pct": change_pct,
+                "strength_score": strength_score,
+                "source": record.get("data_source", record.get("source", "")),
+                "raw": record,
+            })
+        return cleaned
+
+    @classmethod
+    def _summarize_sector_context(
+        cls,
+        records: list[dict[str, Any]],
+        request: DataAgentRequest,
+    ) -> dict[str, Any]:
+        if not records:
+            return {
+                "status": "unavailable",
+                "matched_sector": None,
+                "match_confidence": 0.0,
+                "match_strategy": "no_sector_records",
+                "direct_stock_sector_supported": False,
+                "top_sectors": [],
+                "records": [],
+                "reason": "No sector records were returned by the configured free data source.",
+            }
+
+        ranked = sorted(
+            records,
+            key=lambda item: (
+                -float(item.get("strength_score") or 0),
+                int(item.get("rank") or 999999),
+            ),
+        )
+        top_sectors = [
+            {
+                "rank": item.get("rank"),
+                "sector_name": item.get("sector_name", ""),
+                "change_pct": item.get("change_pct", 0),
+                "strength_score": item.get("strength_score", 0),
+                "source": item.get("source", ""),
+            }
+            for item in ranked[:10]
+        ]
+        keywords = [
+            ("sector_keyword", request.sector_keyword),
+            ("news_keyword", request.news_keyword),
+            ("ticker", request.ticker),
+        ]
+        matched: dict[str, Any] | None = None
+        strategy = "top_rank_fallback"
+        confidence = 0.3
+        for label, value in keywords:
+            keyword = str(value or "").strip().lower()
+            if not keyword:
+                continue
+            for item in ranked:
+                sector_name = str(item.get("sector_name") or "").strip()
+                sector_lower = sector_name.lower()
+                if not sector_lower:
+                    continue
+                if keyword in sector_lower or sector_lower in keyword:
+                    matched = item
+                    strategy = f"{label}_match"
+                    confidence = 0.9 if label == "sector_keyword" else 0.75
+                    break
+            if matched is not None:
+                break
+        if matched is None:
+            matched = ranked[0]
+
+        return {
+            "status": "matched" if strategy != "top_rank_fallback" else "fallback_top_sector",
+            "matched_sector": matched.get("sector_name"),
+            "match_confidence": confidence,
+            "match_strategy": strategy,
+            "direct_stock_sector_supported": False,
+            "top_sectors": top_sectors,
+            "records": ranked[: request.sector_top_n],
+            "reason": (
+                "Sector context is built from market-wide sector rankings. "
+                "Without a paid/stock-membership endpoint, ticker-to-sector matching is heuristic."
+            ),
+        }
 
     @classmethod
     def _summarize_vendor_health(cls, route_trace: list[dict[str, Any]]) -> dict[str, Any]:
@@ -1108,7 +1239,9 @@ def run_data_agent(
     output_dir: str | None = None,
     use_react_planner: bool = False,
     news_keyword: str | None = None,
+    sector_keyword: str | None = None,
     use_llm_news_filter: bool = True,
+    include_sector_context: bool = True,
 ) -> DataAgentRun:
     """Convenience entry point for tests and CLI usage."""
 
@@ -1120,6 +1253,8 @@ def run_data_agent(
         output_dir=output_dir,
         use_react_planner=use_react_planner,
         news_keyword=news_keyword,
+        sector_keyword=sector_keyword,
         use_llm_news_filter=use_llm_news_filter,
+        include_sector_context=include_sector_context,
     )
     return DataAgent(results_dir=output_dir).run(request)

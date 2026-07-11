@@ -43,6 +43,8 @@ class DataAgentPlanner:
                 "include_news": getattr(request, "include_news", True),
                 "use_llm_news_filter": getattr(request, "use_llm_news_filter", True),
                 "include_factors": request.include_factors,
+                "include_sector_context": getattr(request, "include_sector_context", True),
+                "sector_keyword": getattr(request, "sector_keyword", None),
             },
         })
 
@@ -63,6 +65,27 @@ class DataAgentPlanner:
                 "action": "require_method",
                 "args": {"method": "get_daily", "code": "000001.SH"},
                 "observation": "required",
+            })
+
+        if getattr(request, "include_sector_context", True):
+            required_methods.append("get_sector")
+            trace.append({
+                "thought": "Sector context gives downstream agents market-wide peer and theme context.",
+                "action": "require_method",
+                "args": {
+                    "method": "get_sector",
+                    "vendor_chain": get_vendor_chain("get_sector"),
+                    "sector_keyword": getattr(request, "sector_keyword", None),
+                },
+                "observation": "required",
+            })
+        else:
+            skipped_methods.append("get_sector")
+            trace.append({
+                "thought": "Sector context was not requested.",
+                "action": "skip_method",
+                "args": {"method": "get_sector"},
+                "observation": "skipped",
             })
 
         if request.include_capital_flow:
@@ -174,6 +197,8 @@ class DataAgentPlanner:
         ]
         if request.include_capital_flow:
             parts.insert(1, "collect capital flow")
+        if getattr(request, "include_sector_context", True):
+            parts.insert(1, "collect sector context")
         if getattr(request, "include_news", True):
             parts.insert(1, "collect news events")
             if getattr(request, "use_llm_news_filter", True):

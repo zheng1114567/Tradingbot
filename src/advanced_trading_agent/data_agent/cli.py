@@ -19,6 +19,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--end-date", help="End date, e.g. 20260710")
     parser.add_argument("--output-dir", help="Output directory, default uses configured results_dir")
     parser.add_argument("--news-keyword", help="Keyword used by news collection and fallback filtering")
+    parser.add_argument("--sector-keyword", help="Keyword used to match sector context, e.g. 银行")
     parser.add_argument("--react-planner", action="store_true", help="Enable ReAct-style data planning trace")
     parser.add_argument(
         "--no-llm-news-filter",
@@ -30,8 +31,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-news", action="store_true", help="Skip news data")
     parser.add_argument("--no-factors", action="store_true", help="Skip factor calculation")
     parser.add_argument("--no-risk", action="store_true", help="Skip ST/suspended/delisting risk data")
+    parser.add_argument("--no-sector-context", action="store_true", help="Skip market-wide sector context")
     parser.add_argument("--max-news-records", type=int, default=20, help="Max news records to keep")
     parser.add_argument("--max-return-records", type=int, default=20, help="Max daily/factor records in outputs")
+    parser.add_argument("--sector-top-n", type=int, default=20, help="Max sector ranking records to keep")
     parser.add_argument("--json", action="store_true", help="Print full DataAgentRun JSON")
     return parser
 
@@ -47,12 +50,15 @@ def run_from_args(args: argparse.Namespace) -> dict[str, Any]:
         include_news=not args.no_news,
         include_factors=not args.no_factors,
         include_risk=not args.no_risk,
+        include_sector_context=not args.no_sector_context,
         news_keyword=args.news_keyword,
+        sector_keyword=args.sector_keyword,
         use_llm_news_filter=not args.no_llm_news_filter,
         use_react_planner=args.react_planner,
         output_dir=args.output_dir,
         max_news_records=args.max_news_records,
         max_return_records=args.max_return_records,
+        sector_top_n=args.sector_top_n,
     )
     result = DataAgent(results_dir=args.output_dir).run(request)
     return result.to_dict()
@@ -64,6 +70,7 @@ def summarize_run(payload: dict[str, Any]) -> dict[str, Any]:
     analysis = final_data.get("analysis", {})
     events = analysis.get("events", {})
     data_quality = analysis.get("data_quality", {})
+    sector = analysis.get("sector", {})
     vendor_health = final_data.get("vendor_health", {})
     return {
         "run_id": payload.get("run_id"),
@@ -73,6 +80,12 @@ def summarize_run(payload: dict[str, Any]) -> dict[str, Any]:
         "news_records": cleaned.get("news", {}).get("record_count"),
         "event_records": events.get("record_count"),
         "news_filter": events.get("filter"),
+        "sector": {
+            "status": sector.get("status"),
+            "matched_sector": sector.get("matched_sector"),
+            "match_confidence": sector.get("match_confidence"),
+            "top_sector_count": len(sector.get("top_sectors", [])),
+        },
         "daily_consistency": data_quality.get("daily_consistency"),
         "vendor_health": {
             "attempt_count": vendor_health.get("attempt_count", 0),

@@ -60,6 +60,8 @@ def test_data_agent_persists_layered_trace(tmp_path):
                     "来源": "akshare",
                 }
             ]
+        if method == "get_sector":
+            return [{"板块名称": "银行", "涨跌幅": 1.2, "rank": 1, "data_source": "test"}]
         if method in {"get_st_status", "get_suspended", "get_delisting"}:
             return []
         raise AssertionError(f"unexpected method: {method}")
@@ -87,6 +89,10 @@ def test_data_agent_persists_layered_trace(tmp_path):
     assert final_payload["analysis"]["summary"]["latest"]["code"] == "000001.SZ"
     assert final_payload["agent_payload"]["tier1_data"]["risk"]["risk_data_available"] is True
     assert final_payload["agent_payload"]["tier2_data"]["price_data"]
+    assert final_payload["cleaned"]["sector_context"]["record_count"] == 1
+    assert final_payload["analysis"]["sector"]["matched_sector"] == "银行"
+    assert final_payload["agent_payload"]["tier1_data"]["sector"]["matched_sector"] == "银行"
+    assert final_payload["agent_payload"]["tier2_data"]["sector_context"]["matched_sector"] == "银行"
     assert final_payload["cleaned"]["news"]["record_count"] == 1
     assert final_payload["agent_payload"]["tier2_data"]["events"][0]["summary"] == "平安银行零售业务保持稳定。"
     assert final_payload["analysis"]["events"]["filter"]["mode"] == "deterministic"
@@ -123,6 +129,8 @@ def test_data_agent_react_planner_persists_plan(tmp_path):
             return []
         if method == "get_news":
             return []
+        if method == "get_sector":
+            return [{"sector_name": "银行", "change_pct": 1.2, "rank": 1, "data_source": "test"}]
         raise AssertionError(f"unexpected method: {method}")
 
     result = DataAgent(route_fn=fake_route, results_dir=str(tmp_path)).run(
@@ -140,6 +148,7 @@ def test_data_agent_react_planner_persists_plan(tmp_path):
     assert result.plan["required_methods"] == [
         "get_daily",
         "get_daily:index",
+        "get_sector",
         "get_news",
         "filter_news:llm",
         "get_st_status",
@@ -151,6 +160,7 @@ def test_data_agent_react_planner_persists_plan(tmp_path):
 
     final_payload = json.loads(open(result.response_path, encoding="utf-8").read())
     assert final_payload["planner"]["trace"][0]["action"] == "inspect_request"
+    assert final_payload["agent_payload"]["tier2_data"]["sector_context"]["matched_sector"] == "银行"
     assert final_payload["input"]["planner"]["skipped_methods"] == [
         "get_capital_flow",
         "compute_factors",

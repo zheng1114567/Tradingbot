@@ -18,6 +18,12 @@ class FakeRun:
                     "news": {"record_count": 1},
                 },
                 "analysis": {
+                    "sector": {
+                        "status": "matched",
+                        "matched_sector": "银行",
+                        "match_confidence": 0.9,
+                        "top_sectors": [{"sector_name": "银行"}],
+                    },
                     "events": {
                         "record_count": 1,
                         "filter": {"mode": "llm", "used_llm": True},
@@ -63,8 +69,13 @@ def test_data_agent_cli_runs_and_prints_summary(monkeypatch, capsys):
         "--react-planner",
         "--news-keyword",
         "Ping An",
+        "--sector-keyword",
+        "Bank",
         "--no-llm-news-filter",
         "--no-market",
+        "--no-sector-context",
+        "--sector-top-n",
+        "7",
     ])
 
     assert exit_code == 0
@@ -77,13 +88,18 @@ def test_data_agent_cli_runs_and_prints_summary(monkeypatch, capsys):
     assert request.output_dir == "data/results"
     assert request.use_react_planner is True
     assert request.news_keyword == "Ping An"
+    assert request.sector_keyword == "Bank"
     assert request.use_llm_news_filter is False
     assert request.include_market is False
+    assert request.include_sector_context is False
+    assert request.sector_top_n == 7
 
     payload = json.loads(capsys.readouterr().out)
     assert payload["run_id"] == "run-1"
     assert payload["daily_records"] == 2
     assert payload["news_filter"]["used_llm"] is True
+    assert payload["sector"]["matched_sector"] == "银行"
+    assert payload["sector"]["top_sector_count"] == 1
     assert payload["daily_consistency"]["status"] == "single_source"
     assert payload["vendor_health"]["attempt_count"] == 3
 

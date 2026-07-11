@@ -52,6 +52,18 @@ dataagent --react-planner --ticker 000001.SZ --date 2026-07-10 --start-date 2026
 dataagent --react-planner --ticker 000001.SZ --date 2026-07-10 --start-date 20260101 --output-dir ./data/results --news-keyword 平安银行
 ```
 
+默认还会采集市场板块榜单，生成 `sector_context` 给 Market / Analysis / System Agent 使用。如果你已经知道标的所属板块，可以显式传入板块关键词，帮助 DataAgent 匹配:
+
+```bash
+dataagent --ticker 000001.SZ --date 2026-07-10 --sector-keyword 银行 --output-dir ./data/results
+```
+
+如果只想测单标的行情，不需要板块上下文:
+
+```bash
+dataagent --ticker 000001.SZ --date 2026-07-10 --no-sector-context
+```
+
 默认会使用 LLM 对新闻相关性、方向、置信度做筛选；如果没有 LLM Key 或调用失败，会自动降级为规则筛选并在 `analysis.events.filter` 里留痕。调试时也可以关闭 LLM 新闻筛选:
 
 ```bash
@@ -69,6 +81,13 @@ data/results/data_agent_runs/<date>_<ticker>_<timestamp>/
 ├── 04_analysis/analysis_data.json # 因子、摘要和分析数据
 ├── 05_agent_payload/agent_payload.json # 给后续 Agent 消费的 Tier 1 / Tier 2 数据
 └── 06_final/response.json         # 汇总返回: input/raw/cleaned/analysis/agent_payload/manifest
+```
+
+Agent 推荐读取 `05_agent_payload/agent_payload.json`:
+
+```text
+tier1_data.market / sentiment / sector / capital / risk
+tier2_data.price_data / factors / events / sector_context / data_quality
 ```
 
 ## 运行

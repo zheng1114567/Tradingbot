@@ -47,6 +47,23 @@ def _records_from_frame(df: pd.DataFrame, limit: int | None = None) -> list[dict
     return json.loads(frame.to_json(orient="records", force_ascii=False, date_format="iso"))
 
 
+def _json_default(value: Any) -> Any:
+    if hasattr(value, "isoformat"):
+        return value.isoformat()
+    if isinstance(value, np.integer):
+        return int(value)
+    if isinstance(value, np.floating):
+        return float(value)
+    if isinstance(value, np.bool_):
+        return bool(value)
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
+    raise TypeError(f"Object of type {value.__class__.__name__} is not JSON serializable")
+
+
 @dataclass(frozen=True)
 class DataAgentRequest:
     """Input boundary for a standalone data-agent run."""
@@ -99,7 +116,7 @@ class DataAgentRun:
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
         payload["artifacts"] = {k: asdict(v) for k, v in self.artifacts.items()}
-        return payload
+        return json.loads(json.dumps(payload, ensure_ascii=False, default=_json_default))
 
 
 class DataAgent:
@@ -575,17 +592,7 @@ class DataAgent:
 
     @staticmethod
     def _json_default(value: Any) -> Any:
-        if pd.isna(value):
-            return None
-        if hasattr(value, "isoformat"):
-            return value.isoformat()
-        if isinstance(value, np.integer):
-            return int(value)
-        if isinstance(value, np.floating):
-            return float(value)
-        if isinstance(value, np.bool_):
-            return bool(value)
-        raise TypeError(f"Object of type {value.__class__.__name__} is not JSON serializable")
+        return _json_default(value)
 
     @staticmethod
     def _parse_number(value: Any) -> float | None:

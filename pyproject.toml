@@ -52,6 +52,7 @@ include = ["advanced_trading_agent*"]
 
 [project.scripts]
 dataagent = "advanced_trading_agent.data_agent.cli:main"
+trading-agent = "advanced_trading_agent.interactive_cli:main"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

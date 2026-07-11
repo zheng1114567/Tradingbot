@@ -88,9 +88,15 @@ class TestVendorChain:
         # 使用名为 "get_daily" 的方法，它匹配 market_data 分类的链
         register_vendor_impl("get_daily", "akshare", a)
         register_vendor_impl("get_daily", "baostock", b)
-        register_vendor_impl("get_daily", "yfinance", c)
-        result = route_to_vendor("get_daily", code="x")
-        assert result == {"ok": True}
+        register_vendor_impl("get_daily", "baostock_backup", c)
+        original = get_vendor_chain("get_daily")
+        from advanced_trading_agent.config import config
+        config.update({"data_vendors": {"market_data": "akshare,baostock,baostock_backup"}})
+        try:
+            result = route_to_vendor("get_daily", code="x")
+            assert result == {"ok": True}
+        finally:
+            config.update({"data_vendors": {"market_data": ",".join(original)}})
 
     def test_route_trace_records_attempts(self):
         trace = []
@@ -116,7 +122,7 @@ class TestVendorChain:
     def test_fallback_order_across_vendors(self):
         """使用已知的 get_daily 方法测试降级顺序"""
         chain = get_vendor_chain("get_daily")
-        assert chain == ["akshare", "baostock", "yfinance"]
+        assert chain == ["akshare", "baostock"]
         # 注册 mock 到链中的第一个供应商
         first_vendor = chain[0]
         def mock_impl(code):
@@ -126,11 +132,12 @@ class TestVendorChain:
         assert result == {"mock": "data"}
 
     def test_configured_chains_are_free_only(self):
-        free_vendors = {"akshare", "baostock", "yfinance"}
+        free_vendors = {"akshare", "baostock", "eastmoney", "sina"}
         for method in [
             "get_daily",
             "get_capital_flow",
             "get_news",
+            "get_sector",
             "get_factors",
             "get_st_status",
             "get_suspended",
@@ -139,6 +146,10 @@ class TestVendorChain:
             chain = get_vendor_chain(method)
             assert chain
             assert set(chain) <= free_vendors
+
+    def test_news_and_sector_have_free_fallbacks(self):
+        assert get_vendor_chain("get_news") == ["akshare", "sina"]
+        assert get_vendor_chain("get_sector") == ["akshare", "eastmoney"]
 
 
 class TestVendorImplRegistration:

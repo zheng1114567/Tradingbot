@@ -244,7 +244,11 @@ class TestAnalysisAgent:
         assert result["sender"] == "Analysis Agent"
 
     def test_llm_fallback(self, mock_llm_fail, base_state):
-        node = create_analysis_agent(mock_llm_fail)
+        class MockTools:
+            def get_factor_data(self, code: str, top_n: int = 20):
+                return []
+
+        node = create_analysis_agent(mock_llm_fail, tools=MockTools())
         result = node(base_state)
         obj = result["analysis_report_obj"]
         assert isinstance(obj, AnalysisReport)
@@ -261,6 +265,23 @@ class TestAnalysisAgent:
         obj = result["analysis_report_obj"]
         # 无因子数据时, 确定性排序为空, LLM 排序被保留
         assert len(obj.stock_rankings) == 1
+
+    def test_negative_factor_score_is_clamped(self, mock_llm, base_state):
+        class MockTools:
+            def get_factor_data(self, code: str, top_n: int = 20):
+                return [{
+                    "code": code,
+                    "name": "负分样本",
+                    "composite_score": -0.5,
+                    "quality_score": 1,
+                    "growth_score": 2,
+                }]
+
+        node = create_analysis_agent(mock_llm, tools=MockTools())
+        result = node(base_state)
+        obj = result["analysis_report_obj"]
+
+        assert obj.stock_rankings[0].composite_score == 0.0
 
 
 # ============================================================

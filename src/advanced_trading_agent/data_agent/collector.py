@@ -1,16 +1,18 @@
 """Free-first data collection adapters.
 
-Default vendor order uses API-key-free data sources:
-akshare -> baostock -> yfinance.
+Default vendor order uses API-key-free A-share data sources:
+akshare -> baostock -> sina/eastmoney fallbacks.
 """
 from __future__ import annotations
 
 import json
 import logging
+import re
 from datetime import date, timedelta
 from typing import Any
 
 import pandas as pd
+import requests
 
 from .vendor_router import (
     NoMarketDataError,
@@ -72,6 +74,33 @@ def _with_source(records: list[dict[str, Any]], source: str, code: str = "") -> 
     return records
 
 
+def _float_or_none(value: Any) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        value = value.replace(",", "").replace("%", "").strip()
+        if value in {"", "-", "--", "None", "nan"}:
+            return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _strip_html(value: str) -> str:
+    text = re.sub(r"<[^>]+>", "", value or "")
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _http_headers() -> dict[str, str]:
+    return {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+        )
+    }
+
+
 def _get_akshare():
     try:
         import akshare as ak
@@ -86,14 +115,6 @@ def _get_baostock():
         return bs
     except ImportError as exc:
         raise VendorNotConfiguredError("baostock not installed (pip install baostock)", vendor="baostock") from exc
-
-
-def _get_yfinance():
-    try:
-        import yfinance as yf
-        return yf
-    except ImportError as exc:
-        raise VendorNotConfiguredError("yfinance not installed (pip install yfinance)", vendor="yfinance") from exc
 
 
 def get_daily_akshare(
@@ -177,38 +198,6 @@ def get_daily_baostock(
             pass
 
 
-def get_daily_yfinance(
-    code: str,
-    start_date: str | None = None,
-    end_date: str | None = None,
-) -> list[dict[str, Any]]:
-    """Daily OHLCV from Yahoo Finance for cross-market fallback."""
-
-    yf = _get_yfinance()
-    start = _fmt_iso(start_date, date.today() - timedelta(days=365))
-    end = _fmt_iso(end_date, date.today() + timedelta(days=1))
-    try:
-        df = yf.download(code, start=start, end=end, progress=False, auto_adjust=False)
-        if df is None or df.empty:
-            raise NoMarketDataError(f"No daily data for {code}", symbol=code, vendor="yfinance")
-        df = df.reset_index()
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = [col[0] for col in df.columns]
-        if "Adj Close" in df.columns:
-            df = df.drop(columns=["Adj Close"])
-        if {"Close", "Volume"}.issubset(df.columns):
-            df["amount"] = pd.to_numeric(df["Close"], errors="coerce") * pd.to_numeric(
-                df["Volume"], errors="coerce"
-            )
-            df["amount_estimated"] = True
-        return _with_source(df.to_dict("records"), "yfinance", code)
-    except NoMarketDataError:
-        raise
-    except Exception as exc:
-        logger.warning("yfinance get_daily failed for %s: %s", code, exc)
-        raise NoMarketDataError(str(exc), symbol=code, vendor="yfinance") from exc
-
-
 def get_capital_flow_akshare(
     code: str,
     start_date: str | None = None,
@@ -251,7 +240,7 @@ def get_news_akshare(
     code6 = _digits(code or keyword or sector or "")
     records: list[dict[str, Any]] = []
     if not code6:
-        return records
+        raise NoMarketDataError("AkShare news requires a stock code", symbol=code or "", vendor="akshare")
 
     try:
         df = ak.stock_news_em(symbol=code6)
@@ -290,6 +279,76 @@ def get_news_akshare(
 
     if keyword:
         records = [record for record in records if keyword.lower() in json.dumps(record, ensure_ascii=False).lower()]
+    if not records:
+        raise NoMarketDataError(f"No AkShare news for {code or keyword or sector}", symbol=code or "", vendor="akshare")
+    return records[:limit]
+
+
+def get_news_sina(
+    code: str | None = None,
+    sector: str | None = None,
+    keyword: str | None = None,
+    days: int = 2,
+    limit: int = 50,
+    include_announcements: bool = True,
+) -> list[dict[str, Any]]:
+    if not code:
+        raise NoMarketDataError("Sina news requires a stock code", symbol="", vendor="sina")
+
+    symbol = f"{_market_suffix(code)}{_digits(code)}"
+    urls = [
+        (
+            "https://vip.stock.finance.sina.com.cn/corp/view/vCB_AllNewsStock.php",
+            {"symbol": symbol},
+        ),
+        (
+            f"https://vip.stock.finance.sina.com.cn/corp/go.php/vCB_AllNewsStock/symbol/{symbol}.phtml",
+            None,
+        ),
+    ]
+    records: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    last_error: Exception | None = None
+    for url, params in urls:
+        try:
+            response = requests.get(url, params=params, headers=_http_headers(), timeout=10)
+            response.raise_for_status()
+            response.encoding = response.apparent_encoding or response.encoding or "gb18030"
+            text = response.text
+        except Exception as exc:
+            last_error = exc
+            logger.warning("sina news failed for %s: %s", symbol, exc)
+            continue
+
+        for match in re.finditer(
+            r"<a[^>]+href=[\"'](?P<url>https?://[^\"']+)[\"'][^>]*>(?P<title>.*?)</a>",
+            text,
+            flags=re.IGNORECASE | re.DOTALL,
+        ):
+            title = _strip_html(match.group("title"))
+            link = match.group("url").strip()
+            if len(title) < 4 or link in seen:
+                continue
+            candidate = {
+                "title": title,
+                "summary": title,
+                "source": "sina",
+                "time": "",
+                "url": link,
+                "type": "news",
+                "code": code,
+                "data_source": "sina",
+            }
+            if keyword and keyword.lower() not in json.dumps(candidate, ensure_ascii=False).lower():
+                continue
+            seen.add(link)
+            records.append(candidate)
+            if len(records) >= limit:
+                return records
+
+    if not records:
+        detail = f": {last_error}" if last_error else ""
+        raise NoMarketDataError(f"No Sina news for {code}{detail}", symbol=code, vendor="sina")
     return records[:limit]
 
 
@@ -298,7 +357,7 @@ def get_sector_akshare(top_n: int = 10) -> list[dict[str, Any]]:
     try:
         df = ak.stock_board_concept_name_em()
         if df is None or df.empty:
-            return []
+            raise NoMarketDataError("No AkShare sector data", vendor="akshare")
         records = []
         for idx, row in enumerate(df.head(top_n).to_dict("records"), start=1):
             change = row.get("涨跌幅", row.get("change_pct", 0))
@@ -314,10 +373,64 @@ def get_sector_akshare(top_n: int = 10) -> list[dict[str, Any]]:
                 "strength_score": change_pct,
                 "data_source": "akshare",
             })
+        if not records:
+            raise NoMarketDataError("No AkShare sector data", vendor="akshare")
         return records
     except Exception as exc:
         logger.warning("akshare sector failed: %s", exc)
-        return []
+        raise NoMarketDataError(str(exc), vendor="akshare") from exc
+
+
+def get_sector_eastmoney(top_n: int = 10) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    specs = [
+        ("industry", "m:90+t:2+f:!50"),
+        ("concept", "m:90+t:3+f:!50"),
+    ]
+    last_error: Exception | None = None
+    for sector_type, fs in specs:
+        try:
+            response = requests.get(
+                "https://push2.eastmoney.com/api/qt/clist/get",
+                params={
+                    "pn": 1,
+                    "pz": max(top_n, 20),
+                    "po": 1,
+                    "np": 1,
+                    "fltt": 2,
+                    "invt": 2,
+                    "fid": "f3",
+                    "fs": fs,
+                    "fields": "f12,f14,f3,f62,f128,f136,f152",
+                    "ut": "bd1d9ddb04089700cf9c27f6f7426281",
+                },
+                headers=_http_headers(),
+                timeout=10,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            rows = (payload.get("data") or {}).get("diff") or []
+            for row in rows:
+                change_pct = _float_or_none(row.get("f3")) or 0.0
+                records.append({
+                    "rank": len(records) + 1,
+                    "sector_code": row.get("f12", ""),
+                    "sector_name": row.get("f14", ""),
+                    "sector_type": sector_type,
+                    "change_pct": change_pct,
+                    "strength_score": change_pct,
+                    "net_inflow_main": _float_or_none(row.get("f62")),
+                    "data_source": "eastmoney",
+                })
+        except Exception as exc:
+            last_error = exc
+            logger.warning("eastmoney sector failed for %s: %s", sector_type, exc)
+            continue
+
+    if not records:
+        detail = f": {last_error}" if last_error else ""
+        raise NoMarketDataError(f"No Eastmoney sector data{detail}", vendor="eastmoney")
+    return records[:top_n]
 
 
 def get_financial_akshare(code: str) -> list[dict[str, Any]]:
@@ -520,11 +633,12 @@ def register_all_vendors() -> None:
 
     register_vendor_impl("get_daily", "akshare", get_daily_akshare)
     register_vendor_impl("get_daily", "baostock", get_daily_baostock)
-    register_vendor_impl("get_daily", "yfinance", get_daily_yfinance)
 
     register_vendor_impl("get_capital_flow", "akshare", get_capital_flow_akshare)
     register_vendor_impl("get_news", "akshare", get_news_akshare)
+    register_vendor_impl("get_news", "sina", get_news_sina)
     register_vendor_impl("get_sector", "akshare", get_sector_akshare)
+    register_vendor_impl("get_sector", "eastmoney", get_sector_eastmoney)
     register_vendor_impl("get_financial", "akshare", get_financial_akshare)
 
     register_vendor_impl("get_suspended", "akshare", get_suspended_akshare)
@@ -539,7 +653,6 @@ def register_all_vendors() -> None:
 
     register_vendor_impl("get_factors", "akshare", get_factors_computed)
     register_vendor_impl("get_factors", "baostock", get_factors_computed)
-    register_vendor_impl("get_factors", "yfinance", get_factors_computed)
     register_vendor_impl("check_crowding", "akshare", check_crowding_stub)
     register_vendor_impl("find_similar", "akshare", find_similar_stub)
 

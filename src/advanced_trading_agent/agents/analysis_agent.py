@@ -21,6 +21,17 @@ from .schemas import AnalysisReport, StockRanking
 logger = logging.getLogger(__name__)
 
 
+def _normalize_score(value: Any, default: float = 5.0) -> float:
+    """Normalize noisy vendor factor scores to the StockRanking 0-10 contract."""
+    if value is None:
+        return default
+    try:
+        score = float(value)
+    except (TypeError, ValueError):
+        return default
+    return max(0.0, min(10.0, score))
+
+
 def create_analysis_agent(llm: LLMClient, tools: AnalysisTools | None = None):
     """创建 Analysis Agent 节点函数"""
 
@@ -53,15 +64,17 @@ def create_analysis_agent(llm: LLMClient, tools: AnalysisTools | None = None):
             warnings = []
             if f.get("factor_warning"):
                 warnings.append(str(f.get("factor_warning", "")))
-            if f.get("liquidity_score", 1) and f["liquidity_score"] < 3:
+            liquidity_score = f.get("liquidity_score", 1)
+            valuation_score = f.get("valuation_score", 5)
+            if liquidity_score and liquidity_score < 3:
                 warnings.append("流动性不足")
-            if f.get("valuation_score", 5) and f["valuation_score"] > 8:
+            if valuation_score and valuation_score > 8:
                 warnings.append("估值偏高")
 
             rankings.append(StockRanking(
                 code=f.get("code", ""),
                 name=f.get("name", ""),
-                composite_score=f.get("composite_score", 5) or 5,
+                composite_score=_normalize_score(f.get("composite_score")),
                 main_driver=f"质量:{f.get('quality_score', 'N/A')} "
                             f"成长:{f.get('growth_score', 'N/A')}",
                 warnings=warnings,

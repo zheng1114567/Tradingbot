@@ -44,6 +44,17 @@ from ..risk.hard_risk import HardRiskController, RiskVerdictType
 logger = logging.getLogger(__name__)
 
 
+def _normalize_score(value: Any, default: float = 5.0) -> float:
+    """Normalize noisy factor scores to the StockRanking 0-10 contract."""
+    if value is None:
+        return default
+    try:
+        score = float(value)
+    except (TypeError, ValueError):
+        return default
+    return max(0.0, min(10.0, score))
+
+
 class SimulationAgent:
     """规则模拟 Agent — 代替真实 LLM"""
 
@@ -96,7 +107,7 @@ class SimulationAgent:
             StockRanking(
                 code=f.get("code", ""),
                 name=f.get("name", ""),
-                composite_score=f.get("composite_score", 5) or 5,
+                composite_score=_normalize_score(f.get("composite_score")),
                 main_driver=f"综合分{f.get('composite_score', 'N/A')}",
                 warnings=(
                     ["流动性不足"] if (f.get("liquidity_score") or 5) < 3

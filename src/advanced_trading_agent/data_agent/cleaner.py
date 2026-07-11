@@ -21,7 +21,7 @@ class DataCleaner:
         if not data:
             return pd.DataFrame()
         df = pd.DataFrame(data)
-        # 列名标准化 (akshare / baostock / yfinance 字段不同)
+        # 列名标准化 (akshare / baostock 字段不同)
         df = DataCleaner._standardize_columns(df)
         if "code" not in df.columns:
             df["code"] = ""
@@ -69,7 +69,7 @@ class DataCleaner:
             "volume": "volume",
             "turn": "turnover_rate",
             "amount": "amount",
-            # yfinance -> 标准
+            # 兼容英文 OHLCV 字段
             "Date": "trade_date",
             "Open": "open",
             "High": "high",

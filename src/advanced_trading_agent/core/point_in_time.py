@@ -13,7 +13,7 @@ Point-in-time 数据点位强制校验
 - 回测时每个样本只能读取当时的 point_in_time_manifest
 - 若关键字段缺失 → 系统输出数据报告, 不给交易建议
 
-借鉴 TradingAgents' yfinance_news.py 的 news_window 回溯安全模式,
+借鉴 TradingAgents 的 news_window 回溯安全模式,
 但这里做了更严格的 point-in-time 框架。
 """
 from __future__ import annotations

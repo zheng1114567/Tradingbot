@@ -11,16 +11,16 @@ pip install -e .
 
 复制 `.env.example` 为 `.env`, 填入:
 - LLM API Key (DeepSeek)
-- 如只测试 DataAgent，不需要行情 API Key；默认走 AkShare/BaoStock/YFinance 免费数据源
+- 如只测试 DataAgent，不需要行情 API Key；默认走 AkShare/BaoStock/Sina/Eastmoney 这些 A 股免费数据源
 
 ### DataAgent 需要接入的 API
 
 - `akshare`: 默认免费主数据源，无需 API Key。主要用于 A 股行情、新闻、板块、涨停梯队和部分资金流数据。
   - 文档: `https://akshare.akfamily.xyz/`
+- `eastmoney`: 免费东方财富板块榜单兜底，无需 API Key。主要用于 `sector_context`。
+- `sina`: 免费新浪个股新闻兜底，无需 API Key。主要用于 AkShare 新闻为空时补 `news.events`。
 - `baostock`: 免费 A 股历史行情和停牌状态兜底，无需 API Key。
   - 文档: `http://baostock.com/baostock/index.php/Python_API%E6%96%87%E6%A1%A3`
-- `yfinance`: 免费跨市场行情兜底，无需 API Key，主要用于美股、港股、ETF、指数等。
-  - 文档: `https://ranaroussi.github.io/yfinance/`
 - `DEEPSEEK_API_KEY`: 完整多 Agent 分析默认 LLM key；单独测试 DataAgent 不需要。
   - API Key: `https://platform.deepseek.com/api_keys`
   - 文档: `https://api-docs.deepseek.com/`
@@ -111,7 +111,7 @@ src/advanced_trading_agent/
 ├── data_agent/            # DataAgent 数据层
 │   ├── schema.py          # Tier 1/Tier 2 Schema (Pydantic)
 │   ├── vendor_router.py   # 多供应商路由 + 降级
-│   ├── collector.py       # 数据采集 (akshare/baostock/yfinance)
+│   ├── collector.py       # 数据采集 (akshare/baostock/sina/eastmoney)
 │   ├── data_agent.py      # 独立 DataAgent: 输入→原始→清洗→分析→最终返回
 │   ├── cleaner.py         # 数据清洗
 │   └── factors.py         # 因子计算

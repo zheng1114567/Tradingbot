@@ -35,11 +35,9 @@ dev = [
 # 免费数据源
 akshare = ["akshare>=1.14.0"]
 baostock = ["baostock>=0.8.9"]
-yfinance = ["yfinance>=0.2.40"]
 data = [
     "akshare>=1.14.0",
     "baostock>=0.8.9",
-    "yfinance>=0.2.40",
 ]
 # LLM 供应商
 anthropic = ["anthropic>=0.84.0", "langchain-anthropic>=1.0.0"]

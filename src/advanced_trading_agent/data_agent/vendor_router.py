@@ -2,7 +2,7 @@
 数据供应商路由 — 免费数据源优先
 
 核心设计:
-- 按工具粒度配置数据源 (e.g. "market_data": "akshare,baostock,yfinance")
+- 按工具粒度配置数据源 (e.g. "market_data": "akshare,baostock")
 - 有序降级链: 第一个挂了自动试下一个
 - 错误类型分级: 决定是否终止运行
 
@@ -67,7 +67,8 @@ class VendorFatalError(VendorError):
 class DataVendor(str, Enum):
     AKSHARE = "akshare"
     BAOSTOCK = "baostock"
-    YFINANCE = "yfinance"
+    EASTMONEY = "eastmoney"
+    SINA = "sina"
 
 
 # 工具分类

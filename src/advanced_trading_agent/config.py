@@ -122,12 +122,12 @@ class Config:
             "output_language": "Chinese",
             # 数据
             "data_vendors": {
-                "market_data": "akshare,baostock,yfinance",   # 免费优先
+                "market_data": "akshare,baostock",            # A股免费源优先
                 "fundamental_data": "akshare,baostock",
-                "news_data": "akshare",
+                "news_data": "akshare,sina",
                 "capital_flow": "akshare",
-                "a_share_specific": "akshare",
-                "analysis": "akshare,baostock,yfinance",
+                "a_share_specific": "akshare,eastmoney",
+                "analysis": "akshare,baostock",
                 "risk_data": "akshare,baostock",
             },
             # 风控

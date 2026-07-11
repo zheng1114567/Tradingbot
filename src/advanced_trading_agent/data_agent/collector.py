@@ -5,6 +5,7 @@ akshare -> baostock -> yfinance.
 """
 from __future__ import annotations
 
+import json
 import logging
 from datetime import date, timedelta
 from typing import Any
@@ -238,18 +239,58 @@ def get_capital_flow_akshare(
         raise NoMarketDataError(str(exc), symbol=code, vendor="akshare") from exc
 
 
-def get_news_akshare(sector: str | None = None, keyword: str | None = None) -> list[dict[str, Any]]:
+def get_news_akshare(
+    code: str | None = None,
+    sector: str | None = None,
+    keyword: str | None = None,
+    days: int = 2,
+    limit: int = 50,
+    include_announcements: bool = True,
+) -> list[dict[str, Any]]:
     ak = _get_akshare()
+    code6 = _digits(code or keyword or sector or "")
+    records: list[dict[str, Any]] = []
+    if not code6:
+        return records
+
     try:
-        df = ak.stock_info_global()
+        df = ak.stock_news_em(symbol=code6)
         if df is not None and not df.empty:
-            records = _with_source(df.to_dict("records"), "akshare")
-            if keyword:
-                records = [record for record in records if keyword in str(record)]
-            return records
+            for row in df.head(limit).to_dict("records"):
+                records.append({
+                    "title": row.get("新闻标题") or row.get("标题") or row.get("title") or "",
+                    "summary": row.get("新闻内容") or row.get("内容") or row.get("summary") or row.get("新闻标题") or "",
+                    "source": row.get("文章来源") or row.get("来源") or row.get("source") or "akshare",
+                    "time": row.get("发布时间") or row.get("time") or "",
+                    "url": row.get("新闻链接") or row.get("url") or "",
+                    "type": "news",
+                    "code": code,
+                    "data_source": "akshare",
+                })
     except Exception as exc:
-        logger.warning("akshare news failed: %s", exc)
-    return []
+        logger.warning("akshare stock_news_em failed for %s: %s", code6, exc)
+
+    if include_announcements and len(records) < limit:
+        try:
+            df = ak.stock_announcement_em(symbol=code6)
+            if df is not None and not df.empty:
+                for row in df.head(max(0, limit - len(records))).to_dict("records"):
+                    records.append({
+                        "title": row.get("公告标题") or row.get("title") or "",
+                        "summary": row.get("公告标题") or row.get("summary") or "",
+                        "source": "akshare",
+                        "time": row.get("公告时间") or row.get("time") or "",
+                        "url": row.get("公告链接") or row.get("url") or "",
+                        "type": "announcement",
+                        "code": code,
+                        "data_source": "akshare",
+                    })
+        except Exception as exc:
+            logger.warning("akshare stock_announcement_em failed for %s: %s", code6, exc)
+
+    if keyword:
+        records = [record for record in records if keyword.lower() in json.dumps(record, ensure_ascii=False).lower()]
+    return records[:limit]
 
 
 def get_sector_akshare(top_n: int = 10) -> list[dict[str, Any]]:

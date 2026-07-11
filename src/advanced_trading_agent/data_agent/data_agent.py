@@ -272,6 +272,7 @@ class DataAgent:
                 "get_news",
                 manifest,
                 field_name="news.events",
+                code=request.ticker,
                 keyword=request.news_keyword,
             )
         st_status: list[str] | dict[str, Any] = []

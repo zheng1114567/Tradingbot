@@ -545,17 +545,18 @@ def get_northbound_flow_akshare(trade_date: str | None = None) -> dict[str, Any]
     return {"net_inflow": 0, "data_source": "akshare", "note": "northbound data unavailable"}
 
 
-def get_limit_up_tiers_akshare(trade_date: str | None = None) -> dict[str, int]:
+def get_limit_up_tiers_akshare(trade_date: str | None = None) -> dict[str, Any]:
     td = _fmt_yyyymmdd(trade_date, date.today())
     try:
         ak = _get_akshare()
         df = ak.stock_zt_pool_em(date=td)
         if df is None or df.empty:
-            return {"first_board": 0, "second_board": 0, "third_plus": 0}
+            return {"first_board": 0, "second_board": 0, "third_plus": 0, "stocks": []}
 
         first_board = 0
         second_board = 0
         third_plus = 0
+        stocks: list[dict[str, Any]] = []
         for record in df.to_dict("records"):
             board_count = record.get("连板数", record.get("连续涨停", 1))
             try:
@@ -568,15 +569,23 @@ def get_limit_up_tiers_akshare(trade_date: str | None = None) -> dict[str, int]:
                 second_board += 1
             else:
                 third_plus += 1
+            stocks.append({
+                "code": str(record.get("代码", "")),
+                "name": str(record.get("名称", "")),
+                "board_count": board_count,
+                "turnover": _float_or_none(record.get("换手率", record.get("换手", 0))),
+                "change_pct": _float_or_none(record.get("涨跌幅", 0)),
+            })
         return {
             "first_board": first_board,
             "second_board": second_board,
             "third_plus": third_plus,
+            "stocks": stocks,
             "data_source": "akshare",
         }
     except Exception as exc:
         logger.warning("limit-up tiers failed: %s", exc)
-        return {"first_board": 0, "second_board": 0, "third_plus": 0, "data_source": "akshare"}
+        return {"first_board": 0, "second_board": 0, "third_plus": 0, "stocks": [], "data_source": "akshare"}
 
 
 def get_dragon_tiger_akshare(trade_date: str | None = None) -> list[dict[str, Any]]:
@@ -656,6 +665,55 @@ def find_similar_stub(sentiment: str = "", sector: str = "", event_type: str = "
     }
 
 
+def get_northbound_top10_akshare(trade_date: str | None = None) -> list[dict[str, Any]]:
+    """Top 10 northbound-bought stocks via akshare (hsgt_top10_em)."""
+    ak = _get_akshare()
+    try:
+        fn = getattr(ak, "stock_hsgt_top10_em", None)
+        if fn is None:
+            return []
+        td = _fmt_yyyymmdd(trade_date, date.today())
+        df = fn(date=td)
+        if df is not None and not df.empty:
+            results: list[dict[str, Any]] = []
+            for record in df.head(20).to_dict("records"):
+                results.append({
+                    "code": str(record.get("代码", "")),
+                    "name": str(record.get("名称", "")),
+                    "net_buy": _float_or_none(record.get("净买入", record.get("净买入额", 0))),
+                    "change_pct": _float_or_none(record.get("涨跌幅", 0)),
+                })
+            return results
+    except Exception as exc:
+        logger.warning("akshare northbound top10 failed: %s", exc)
+    return []
+
+
+def get_sector_constituents_akshare(sector_name: str = "") -> list[dict[str, Any]]:
+    """Get constituent stocks of a concept/industry board via akshare."""
+    if not sector_name:
+        return []
+    ak = _get_akshare()
+    for fn_name in ("stock_board_concept_cons_em", "stock_board_industry_cons_em"):
+        fn = getattr(ak, fn_name, None)
+        if fn is None:
+            continue
+        try:
+            df = fn(symbol=sector_name)
+            if df is not None and not df.empty:
+                results: list[dict[str, Any]] = []
+                for record in df.head(30).to_dict("records"):
+                    results.append({
+                        "code": str(record.get("代码", "")),
+                        "name": str(record.get("名称", "")),
+                        "sector": sector_name,
+                    })
+                return results
+        except Exception as exc:
+            logger.debug("akshare %s(%s) failed: %s", fn_name, sector_name, exc)
+    return []
+
+
 def register_all_vendors() -> None:
     """Register free vendor adapters."""
 
@@ -675,9 +733,11 @@ def register_all_vendors() -> None:
     register_vendor_impl("get_delisting", "akshare", get_delisting_akshare)
 
     register_vendor_impl("get_northbound_flow", "akshare", get_northbound_flow_akshare)
+    register_vendor_impl("get_northbound_top10", "akshare", get_northbound_top10_akshare)
     register_vendor_impl("get_limit_up_tiers", "akshare", get_limit_up_tiers_akshare)
     register_vendor_impl("get_dragon_tiger", "akshare", get_dragon_tiger_akshare)
     register_vendor_impl("get_margin", "akshare", get_margin_akshare)
+    register_vendor_impl("get_sector_constituents", "akshare", get_sector_constituents_akshare)
 
     register_vendor_impl("get_factors", "akshare", get_factors_computed)
     register_vendor_impl("get_factors", "baostock", get_factors_computed)

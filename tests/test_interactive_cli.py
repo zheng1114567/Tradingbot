@@ -11,15 +11,13 @@ def test_help_command_lists_core_slash_commands():
     result = interactive_cli.execute_command("/help")
 
     assert result.should_exit is False
-    assert "/a <ticker>" in result.output
-    assert "/data [ticker]" in result.output
-    assert "/datas [ticker]" in result.output
-    assert "/data <natural language request>" in result.output
-    assert "/date [ticker]" in result.output
-    assert "/dates [ticker]" in result.output
-    assert "/run [ticker]" in result.output
+    assert "/a <代码>" in result.output
+    assert "/d <代码>" in result.output
+    assert "/scan" in result.output
+    assert "/run <代码>" in result.output
     assert "/status" in result.output
     assert "/exit" in result.output
+    assert "/help" in result.output
 
 
 def test_bom_prefixed_slash_command_is_not_treated_as_ticker():
@@ -34,7 +32,7 @@ def test_bom_prefixed_slash_command_is_not_treated_as_ticker():
         analyze_runner=fake_analyze,
     )
 
-    assert "Advanced Trading Agent CLI" in result.output
+    assert "TRADESIGHT" in result.output
     assert calls == []
 
 
@@ -527,5 +525,5 @@ def test_repl_reads_multiple_commands_until_exit():
     rendered = output.getvalue()
     assert exit_code == 0
     assert rendered.count("ata> ") == 2
-    assert "Advanced Trading Agent CLI" in rendered
+    assert "TRADESIGHT" in rendered
     assert "bye" in rendered

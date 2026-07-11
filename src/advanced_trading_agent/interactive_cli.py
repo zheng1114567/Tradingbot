@@ -19,64 +19,42 @@ from .data_agent.planner import DataAgentPlanner
 from .main import analyze_single, run_standalone_data_agent
 
 
-HELP_TEXT = """\
-Advanced Trading Agent CLI
-
-Slash commands:
-  /help
-      Show this help.
-
-  <ticker> [YYYY-MM-DD]
-      Fast path. Analyze a ticker and skip backtest by default.
-      Example: 000001.SZ 2026-07-10
-
-  /a <ticker> [YYYY-MM-DD]
-  /analyze [ticker] [YYYY-MM-DD] [--with-backtest] [--debug]
-      Run the full multi-agent analysis workflow.
-      Example: /a 000001.SZ 2026-07-10
-      If ticker is omitted, analyze the current ticker set by /data or a previous analysis.
-
-  /d <ticker> [YYYY-MM-DD]
-  /data [ticker] [--date YYYY-MM-DD] [--start-date YYYYMMDD] [--end-date YYYYMMDD]
-  /datas [ticker] [--date YYYY-MM-DD] [--start-date YYYYMMDD] [--end-date YYYYMMDD]
-      Run DataAgent only and print its persisted artifact summary.
-      Example: /d 000001.SZ 2026-07-10
-      If ticker is omitted, refresh data for the current ticker.
-
-  /data <natural language request>
-      Ask the DataAgent in natural language. The LLM maps the request to a data task,
-      with deterministic fallback if the LLM is unavailable.
-      Examples:
-        /data 分析今天收盘后的数据 000001.SZ
-        /data 拉一下平安银行今年的数据
-        /data 最近一段时间有哪些表现比较好的股票
-
-  /date [ticker]
-  /dates [ticker]
-      Show which trade dates exist in local DataAgent artifacts.
-      Example: /dates 000001.SZ
-
-  /run [ticker] [YYYY-MM-DD] [--skip-backtest] [--debug]
-      Run the normal end-to-end flow: data collection, analysis, report, and memory write.
-      Example: /run 000001.SZ
-      If ticker is omitted, run the current ticker. Date defaults to today.
-      Backtest is included by default for /run.
-
-  /s or /status
-      Show configured runtime paths and defaults.
-
-  /config
-      Show selected configuration values.
-
-  /clear
-      Print ANSI clear-screen sequence.
-
-  /q, /exit, or /quit
-      Exit the session.
-
-Tip:
-  Backtest is skipped by default in the interactive CLI. Add --with-backtest only when needed.
-"""
+HELP_TEXT = "\n".join([
+    "",
+    "  ╔══════════════════════════════════════════════════════════════╗",
+    "  ║                    TRADESIGHT  命令参考                       ║",
+    "  ╠══════════════════════════════════════════════════════════════╣",
+    "  ║                                                              ║",
+    "  ║  市场发现                                                    ║",
+    "  ║    /scan          扫描市场热点板块和强势股                    ║",
+    "  ║    /market        同 /scan                                   ║",
+    "  ║                                                              ║",
+    "  ║  分析                                                        ║",
+    "  ║    /a <代码>      分析指定股票 (简写)                         ║",
+    "  ║    /run <代码>    完整流水线: 数据 + 分析 + 报告              ║",
+    "  ║                                                              ║",
+    "  ║  数据                                                        ║",
+    "  ║    /d <代码>      采集并持久化数据 (简写)                     ║",
+    "  ║    /dates <代码>  列出本地已有的交易日                        ║",
+    "  ║                                                              ║",
+    "  ║  信息                                                        ║",
+    "  ║    /status        查看运行时配置和路径                        ║",
+    "  ║    /config        查看选定的配置项                            ║",
+    "  ║    /help          显示此帮助                                  ║",
+    "  ║                                                              ║",
+    "  ║  会话                                                        ║",
+    "  ║    /clear         清屏                                        ║",
+    "  ║    /q, /exit      退出                                        ║",
+    "  ║                                                              ║",
+    "  ╚══════════════════════════════════════════════════════════════╝",
+    "",
+    "  示例:",
+    "    /scan                     发现市场热点",
+    "    /a 000001.SZ              快速分析平安银行",
+    "    /run 000001.SZ            完整流水线 (含回测)",
+    "    /d 000001.SZ --start 20260101 --end 20260712",
+    "",
+])
 
 
 @dataclass(frozen=True)
@@ -698,6 +676,27 @@ def format_dates_summary(payload: dict[str, object]) -> str:
     return "\n".join(lines)
 
 
+def _handle_scan(
+    args: list[str],
+    *,
+    context: SessionContext,
+    analyze_runner: AnalyzeRunner,
+) -> CommandResult:
+    """Handle /scan — discover hot stocks and optionally analyze them."""
+    from .data_agent.scanner import MarketScanner
+
+    scanner = MarketScanner(top_sectors=5, top_n=15)
+    results = scanner.scan()
+
+    if not results:
+        return CommandResult("No hot stocks found. The market may be quiet today.")
+
+    output = scanner.format_results(results)
+    output += "\n\nUse /a <ticker> to analyze any of these candidates."
+
+    return CommandResult(output)
+
+
 def execute_command(
     line: str,
     *,
@@ -829,13 +828,30 @@ def execute_command(
             report,
         ]))
 
+    if command in {"/scan", "/scanner", "/market"}:
+        return _handle_scan(args, context=context, analyze_runner=analyze_runner)
+
     return CommandResult(f"Unknown command: {command}\nRun /help to see available commands.")
 
 
 def banner() -> str:
     return "\n".join([
-        "Advanced Trading Agent",
-        "Type /help for commands. Type /exit to quit.",
+        "",
+        "  ╔══════════════════════════════════════════════════════════════╗",
+        "  ║                                                              ║",
+        "  ║    ████████╗██████╗  █████╗ ██████╗ ███████╗███████╗██╗ ██████╗ ██╗  ██╗████████╗",
+        "  ║    ╚══██╔══╝██╔══██╗██╔══██╗██╔══██╗██╔════╝██╔════╝██║██╔════╝ ██║  ██║╚══██╔══╝",
+        "  ║       ██║   ██████╔╝███████║██║  ██║█████╗  ███████╗██║██║  ███╗███████║   ██║",
+        "  ║       ██║   ██╔══██╗██╔══██║██║  ██║██╔══╝  ╚════██║██║██║   ██║██╔══██║   ██║",
+        "  ║       ██║   ██║  ██║██║  ██║██████╔╝███████╗███████║██║╚██████╔╝██║  ██║   ██║",
+        "  ║       ╚═╝   ╚═╝  ╚═╝╚═╝  ╚═╝╚═════╝ ╚══════╝╚══════╝╚═╝ ╚═════╝ ╚═╝  ╚═╝   ╚═╝",
+        "  ║",
+        "  ║            A股多智能体量化分析系统  |  Multi-Agent A-Share Analysis",
+        "  ║",
+        "  ╚══════════════════════════════════════════════════════════════╝",
+        "",
+        "  /help 查看命令  |  /scan 发现热点  |  /exit 退出",
+        "",
     ])
 
 

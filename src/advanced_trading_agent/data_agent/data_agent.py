@@ -329,7 +329,7 @@ class DataAgent:
         self._llm_client = llm_client
         self._profile_resolver = profile_resolver or StockProfileResolver()
 
-    def run(self, request: DataAgentRequest) -> DataAgentRun:
+    def run(self, request: DataAgentRequest, raw_data: dict[str, Any] | None = None) -> DataAgentRun:
         # Ensure the free vendor adapters are available when DataAgent is used standalone.
         from .collector import register_all_vendors
 
@@ -382,7 +382,10 @@ class DataAgent:
 
         # --- Raw collection with error recovery ---
         try:
-            raw_payload = self._collect_raw(request, manifest, route_trace)
+            if raw_data is not None:
+                raw_payload = self._adopt_raw(raw_data, request, manifest, route_trace)
+            else:
+                raw_payload = self._collect_raw(request, manifest, route_trace)
             artifacts["raw"] = self._write_json(run_dir / "02_raw" / "raw_data.json", raw_payload)
         except Exception as exc:
             logger.error("Raw data collection failed: %s", exc)
@@ -509,6 +512,63 @@ class DataAgent:
             "effective_sector_keyword": effective_request.sector_keyword,
         }
         return effective_request, profile_payload
+
+    def _adopt_raw(
+        self,
+        raw_data: dict[str, Any],
+        request: DataAgentRequest,
+        manifest: DataManifest,
+        route_trace: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Normalize pre-collected raw data into the standard raw payload format.
+
+        When data is collected by MarketScanner.scan_and_collect(), this
+        adapter merges the shared and per-ticker portions into a single
+        payload matching _collect_raw's return shape.
+        """
+        if "route_trace" in raw_data:
+            incoming = raw_data["route_trace"]
+            if isinstance(incoming, list):
+                route_trace.extend(incoming)
+
+        daily = raw_data.get("daily", [])
+        market = raw_data.get("market", [])
+        sector_context = raw_data.get("sector_context", [])
+        capital_flow = raw_data.get("capital_flow", [])
+        news = raw_data.get("news", [])
+        risk = raw_data.get("risk", {})
+
+        if request.fetch_news_full_text and isinstance(news, list) and news:
+            news = self._enrich_news_full_text(news)
+
+        field_checks = [
+            ("stock.daily", daily),
+            ("market.daily", market),
+            ("sector.context", sector_context),
+            ("stock.capital_flow", capital_flow),
+            ("news.events", news),
+        ]
+        for field_name, value in field_checks:
+            available = isinstance(value, list) and len(value) > 0
+            manifest.add_field(
+                field_name,
+                available=available,
+                source="scan_bundle",
+                vendor_chain=[],
+                record_count=len(value) if isinstance(value, list) else None,
+            )
+
+        return {
+            "stage": "raw",
+            "created_at": _utc_now(),
+            "daily": daily,
+            "market": market,
+            "sector_context": sector_context,
+            "capital_flow": capital_flow,
+            "news": news,
+            "risk": risk if isinstance(risk, dict) else {},
+            "route_trace": route_trace,
+        }
 
     def _collect_raw(
         self,

@@ -25,6 +25,7 @@ from .backtest.scheduler import run_daily_review
 from .config import config
 from .core.atomic_write import atomic_write_text
 from .data_agent.data_agent import DataAgent, DataAgentRequest
+from .data_agent.scanner import MarketScanner, ScanBundle
 from .graph.workflow import TradingSystem
 from .strategy_rules import load_strategy_proposals, review_strategy_proposal
 
@@ -214,6 +215,140 @@ def audit_strategy_proposal(
     return json.dumps(record, ensure_ascii=False, indent=2)
 
 
+def scan_and_analyze(top_n: int = 10, trade_date: str | None = None,
+                    debug: bool = False, skip_backtest: bool = False) -> str:
+    """Scan for hot stocks, collect data during scan, then analyze top candidates.
+
+    Uses the combined scan+collect flow: MarketScanner.scan_and_collect()
+    fetches raw data for top candidates in the same pass, eliminating
+    redundant vendor calls when DataAgent runs later.
+
+    An LLM-generated market summary is included at the top of the report.
+    Results are cached by trade_date — re-running the same date returns
+    the cached report immediately.
+
+    Returns a consolidated Markdown report.
+    """
+    trade_date = trade_date or str(date.today())
+    results_dir = Path(config.get("results_dir", "data/results"))
+    results_dir.mkdir(parents=True, exist_ok=True)
+    scan_path = results_dir / f"scan_report_{trade_date}.md"
+
+    # Cache hit: return existing report for the same trade date
+    if scan_path.exists():
+        logger.info("Scan report already exists for %s, returning cached.", trade_date)
+        return scan_path.read_text(encoding="utf-8")
+
+    scanner = MarketScanner(top_sectors=5, top_n=top_n)
+    bundle = scanner.scan_and_collect(trade_date, top_n=top_n)
+
+    if not bundle.results:
+        return "# Market Scan\n\nNo hot stocks found."
+
+    # LLM market summary (always on)
+    llm_summary = scanner.summarize_with_llm(bundle.results)
+
+    lines = [
+        "# 市场扫描与深度分析报告",
+        "",
+        f"**交易日期**: {trade_date}",
+        "",
+        "---",
+        "",
+        "## 市场综述 (AI)",
+        "",
+        llm_summary,
+        "",
+        "---",
+        "",
+        scanner.format_results(bundle.results),
+        "",
+        "---",
+        "",
+        f"## 逐标深度分析 (Top {min(len(bundle.results), top_n)})",
+        "",
+    ]
+
+    for i, r in enumerate(bundle.results[:top_n], 1):
+        logger.info("Analyzing %d/%d: %s %s", i, len(bundle.results[:top_n]), r.ticker, r.name)
+        lines.append(f"### {i}. {r.ticker} {r.name} (score: {r.score:.1f})")
+        lines.append(f"*{r.reason}*")
+        lines.append("")
+        try:
+            report = _analyze_from_bundle(r.ticker, trade_date, bundle, debug=debug, skip_backtest=skip_backtest)
+            lines.append(report)
+        except Exception as exc:
+            logger.error("Analysis failed for %s: %s", r.ticker, exc)
+            lines.append(f"**Analysis failed**: {exc}")
+        lines.append("")
+        lines.append("---")
+        lines.append("")
+
+    report = "\n".join(lines)
+    atomic_write_text(scan_path, report)
+    logger.info("Scan report saved to %s", scan_path)
+
+    return report
+
+
+def _analyze_from_bundle(
+    ticker: str,
+    trade_date: str,
+    bundle: "ScanBundle",
+    debug: bool = False,
+    skip_backtest: bool = False,
+) -> str:
+    """Run DataAgent with pre-collected data, then feed tier1/tier2 to TradingSystem.
+
+    Assembles the raw_data payload from the ScanBundle's shared and
+    per-ticker portions so DataAgent skips _collect_raw entirely.
+    """
+    from .data_agent.data_agent import DataAgent, DataAgentRequest
+
+    shared = bundle.shared_raw
+    ticker_raw = bundle.ticker_data.get(ticker, {})
+
+    raw_data = {
+        "daily": ticker_raw.get("daily", []),
+        "market": shared.get("market", []),
+        "sector_context": shared.get("sector_context", []),
+        "capital_flow": ticker_raw.get("capital_flow", []),
+        "news": ticker_raw.get("news", []),
+        "risk": shared.get("risk", {}),
+        "route_trace": bundle.route_trace,
+    }
+
+    da_result = DataAgent().run(
+        DataAgentRequest(
+            ticker=ticker,
+            trade_date=trade_date,
+            start_date=trade_date,
+            end_date=trade_date,
+            include_market=True,
+            include_capital_flow=True,
+            include_news=True,
+            include_factors=True,
+            include_risk=True,
+            use_react_planner=False,
+        ),
+        raw_data=raw_data,
+    )
+
+    payload = da_result.final_data.get("analysis", {}).get("agent_payload", {})
+    tier1 = payload.get("tier1_data", {})
+    tier2 = payload.get("tier2_data", {})
+
+    system = TradingSystem(debug=debug)
+    _, report = system.analyze(
+        ticker,
+        trade_date,
+        tier1_data=tier1,
+        tier2_data=tier2,
+        skip_backtest=skip_backtest,
+    )
+    return report
+
+
 def main():
     parser = argparse.ArgumentParser(description="多智能体量化交易分析系统")
     parser.add_argument("--ticker", "-t", help="股票代码 (如 000001.SZ)")
@@ -241,6 +376,8 @@ def main():
     parser.add_argument("--skip-backtest", action="store_true", help="跳过 Backtest Agent，仅保留可审计占位报告")
     parser.add_argument("--debug", action="store_true", help="调试模式")
     parser.add_argument("--json", action="store_true", help="JSON 输出")
+    parser.add_argument("--scan", action="store_true", help="扫描热点板块和强势股，自动分析 Top-N")
+    parser.add_argument("--scan-top-n", type=int, default=10, help="扫描后分析 Top N 只股票 (默认 10)")
 
     args = parser.parse_args()
 
@@ -287,6 +424,15 @@ def main():
             ))
         else:
             print(list_strategy_audit_queue())
+        return
+
+    if args.scan:
+        print(scan_and_analyze(
+            top_n=args.scan_top_n,
+            trade_date=args.date,
+            debug=args.debug,
+            skip_backtest=args.skip_backtest,
+        ))
         return
 
     if args.batch:

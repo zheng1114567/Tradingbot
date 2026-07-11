@@ -41,9 +41,7 @@ from ..agents import (
 )
 from ..agents.system_agent import create_system_agent
 from ..config import config
-from ..data_agent.collector import register_all_vendors
-from ..data_agent.manifest import DataManifest
-from ..data_agent.vendor_router import route_to_vendor
+from ..data_agent.data_agent import DataAgent, DataAgentRequest
 from ..llm.client import LLMClient
 from ..roundtable import AutoGenRoundtable
 from .conditional import (
@@ -372,224 +370,27 @@ class TradingSystem:
     def _load_data(ticker: str, trade_date: str) -> tuple[dict, dict]:
         """自动加载 Tier 1 / Tier 2 数据, 返回 (tier1_data, tier2_data)
 
-        优先使用传入的自定义数据; 未传则尝试从供应商加载。
+        统一通过 DataAgent 采集、清洗、分析并生成后续 Agent 消费结构。
         """
-        import logging
-        logger = logging.getLogger(__name__)
-
-        def _is_no_data(value: Any) -> bool:
-            return isinstance(value, str) and "NO_DATA_AVAILABLE" in value
-
-        def _latest_record(records: Any) -> dict[str, Any]:
-            if isinstance(records, list) and records:
-                first = records[0]
-                return first if isinstance(first, dict) else {}
-            return {}
-
-        def _daily_amount_cny(row: dict[str, Any]) -> float | None:
-            amount = row.get("amount", row.get("成交额"))
-            if amount is None:
-                return None
-            try:
-                amount_value = float(amount)
-            except (TypeError, ValueError):
-                return None
-            # Tushare daily amount is in thousand CNY; akshare 成交额 is already CNY.
-            if "ts_code" in row:
-                return amount_value * 1000
-            return amount_value
-
-        def _record_count(value: Any) -> int | None:
-            if isinstance(value, list):
-                return len(value)
-            if isinstance(value, dict):
-                return 1
-            return None
-
-        # 注册所有供应商 (幂等)
-        register_all_vendors()
-
-        tier1: dict[str, Any] = {}
-        tier2: dict[str, Any] = {}
-        manifest = DataManifest(ticker=ticker, trade_date=trade_date)
-        risk: dict[str, Any] = {
-            "st_list": None,
-            "suspended_list": None,
-            "delisting_list": None,
-            "risk_data_available": False,
-            "risk_data_errors": [],
-        }
-
-        # --- Tier 1: 市场摘要 ---
-        try:
-            market_data = route_to_vendor("get_daily", code="000001.SH",
-                                          start_date=trade_date, end_date=trade_date)
-            if not _is_no_data(market_data):
-                row = _latest_record(market_data)
-                tier1["market"] = {
-                    "index_close": row.get("close", 0),
-                    "index_change_pct": row.get("pct_chg", 0),
-                }
-                manifest.add_field(
-                    "market.daily",
-                    available=bool(row),
-                    source="vendor_router:get_daily",
-                    vendor_chain=["tushare", "akshare"],
-                    fallback_used=False,
-                    record_count=_record_count(market_data),
-                )
-            else:
-                manifest.add_field(
-                    "market.daily",
-                    available=False,
-                    source="vendor_router:get_daily",
-                    vendor_chain=["tushare", "akshare"],
-                    error=str(market_data),
-                )
-        except Exception as e:
-            logger.warning("无法加载大盘数据: %s", e)
-            risk["risk_data_errors"].append(f"market_data: {e}")
-            manifest.add_field(
-                "market.daily",
-                available=False,
-                source="vendor_router:get_daily",
-                vendor_chain=["tushare", "akshare"],
-                error=str(e),
+        result = DataAgent().run(
+            DataAgentRequest(
+                ticker=ticker,
+                trade_date=trade_date,
+                start_date=trade_date,
+                end_date=trade_date,
+                include_market=True,
+                include_capital_flow=True,
+                include_factors=True,
+                include_risk=True,
+                use_react_planner=True,
             )
-
-        # --- Tier 2: 个股数据 ---
-        try:
-            # 尝试获取个股行情
-            daily = route_to_vendor("get_daily", code=ticker,
-                                    start_date=trade_date, end_date=trade_date)
-            if isinstance(daily, list) and daily:
-                tier2["price_data"] = daily
-                latest = _latest_record(daily)
-                daily_amount = _daily_amount_cny(latest)
-                if daily_amount is not None:
-                    risk["daily_volume"] = daily_amount
-                manifest.add_field(
-                    "stock.daily",
-                    available=True,
-                    source="vendor_router:get_daily",
-                    vendor_chain=["tushare", "akshare"],
-                    fallback_used=False,
-                    record_count=len(daily),
-                )
-            elif _is_no_data(daily):
-                manifest.add_field(
-                    "stock.daily",
-                    available=False,
-                    source="vendor_router:get_daily",
-                    vendor_chain=["tushare", "akshare"],
-                    error=str(daily),
-                )
-            else:
-                manifest.add_field(
-                    "stock.daily",
-                    available=False,
-                    source="vendor_router:get_daily",
-                    vendor_chain=["tushare", "akshare"],
-                    error="empty daily price response",
-                )
-        except Exception as e:
-            logger.warning("无法加载个股数据 (%s): %s", ticker, e)
-            risk["risk_data_errors"].append(f"price_data: {e}")
-            manifest.add_field(
-                "stock.daily",
-                available=False,
-                source="vendor_router:get_daily",
-                vendor_chain=["tushare", "akshare"],
-                error=str(e),
-            )
-
-        # --- 风险基础数据: ST / 停牌 / 退市 ---
-        try:
-            st_status = route_to_vendor("get_st_status")
-            if isinstance(st_status, list):
-                risk["st_list"] = st_status
-                manifest.add_field(
-                    "risk.st_status",
-                    available=True,
-                    source="vendor_router:get_st_status",
-                    vendor_chain=["tushare"],
-                    record_count=len(st_status),
-                )
-            else:
-                manifest.add_field(
-                    "risk.st_status",
-                    available=False,
-                    source="vendor_router:get_st_status",
-                    vendor_chain=["tushare"],
-                    error=str(st_status),
-                )
-        except Exception as e:
-            logger.warning("无法加载 ST 状态: %s", e)
-            risk["risk_data_errors"].append(f"st_status: {e}")
-            manifest.add_field(
-                "risk.st_status",
-                available=False,
-                source="vendor_router:get_st_status",
-                vendor_chain=["tushare"],
-                error=str(e),
-            )
-
-        try:
-            suspended = route_to_vendor("get_suspended")
-            if isinstance(suspended, list):
-                risk["suspended_list"] = suspended
-                manifest.add_field(
-                    "risk.suspended",
-                    available=True,
-                    source="vendor_router:get_suspended",
-                    vendor_chain=["tushare"],
-                    record_count=len(suspended),
-                )
-            else:
-                manifest.add_field(
-                    "risk.suspended",
-                    available=False,
-                    source="vendor_router:get_suspended",
-                    vendor_chain=["tushare"],
-                    error=str(suspended),
-                )
-        except Exception as e:
-            logger.warning("无法加载停牌状态: %s", e)
-            risk["risk_data_errors"].append(f"suspended: {e}")
-            manifest.add_field(
-                "risk.suspended",
-                available=False,
-                source="vendor_router:get_suspended",
-                vendor_chain=["tushare"],
-                error=str(e),
-            )
-
-        # 当前没有独立退市供应商时保持 None，让风控按数据缺失处理。
-        if risk.get("st_list") is not None and risk.get("suspended_list") is not None:
-            risk["delisting_list"] = []
-            risk["risk_data_available"] = True
-            manifest.add_field(
-                "risk.delisting",
-                available=True,
-                source="not_configured:default_empty",
-                record_count=0,
-            )
-        else:
-            manifest.add_field(
-                "risk.delisting",
-                available=False,
-                source="not_configured",
-                error="delisting vendor is not configured",
-            )
-        tier1["risk"] = risk
-        tier1["_data_manifest"] = manifest.to_dict()
-        try:
-            manifest_path = manifest.save()
-            tier1["_data_manifest_path"] = str(manifest_path)
-        except Exception as e:
-            logger.warning("无法保存数据 manifest: %s", e)
-            tier1["_data_manifest_save_error"] = str(e)
-
+        )
+        payload = result.final_data.get("analysis", {}).get("agent_payload", {})
+        tier1 = payload.get("tier1_data", {})
+        tier2 = payload.get("tier2_data", {})
+        tier1["_data_manifest"] = result.final_data.get("manifest")
+        tier1["_data_manifest_path"] = result.manifest_path
+        tier1["_data_agent_run"] = result.to_dict()
         return tier1, tier2
 
     def analyze(self, ticker: str, trade_date: str | None = None,

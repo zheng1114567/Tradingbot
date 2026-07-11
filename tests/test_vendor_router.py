@@ -1,8 +1,4 @@
-"""供应商路由测试 — 测试错误处理和降级链
-
-注意: 未知方法的默认供应商链为 ["tushare"]。
-已知行情方法默认免费优先，供应商链从 akshare 开始。
-"""
+"""供应商路由测试 — 测试免费数据源错误处理和降级链."""
 import pytest
 from advanced_trading_agent.data_agent.vendor_router import (
     DataVendor,
@@ -27,48 +23,48 @@ class TestVendorChain:
     def test_simple_success(self):
         def impl(code):
             return {"price": 10}
-        register_vendor_impl("test_method", "tushare", impl)
+        register_vendor_impl("test_method", "akshare", impl)
         result = route_to_vendor("test_method", code="000001")
         assert result == {"price": 10}
 
     def test_fallback_on_rate_limit(self):
-        """频道限制时应尝试下一个供应商 (默认链为 tushare)"""
+        """频道限制时应尝试下一个供应商 (未知方法默认链为 akshare)"""
         results = []
-        def primary_tushare(code):
-            results.append("tushare")
-            raise VendorRateLimitError("rate limit", vendor="tushare")
-        register_vendor_impl("test_fallback_method", "tushare", primary_tushare)
-        # 默认链只有 tushare, 失败后无其他 vendor → 抛异常
+        def primary_akshare(code):
+            results.append("akshare")
+            raise VendorRateLimitError("rate limit", vendor="akshare")
+        register_vendor_impl("test_fallback_method", "akshare", primary_akshare)
+        # 默认链只有 akshare, 失败后无其他 vendor → 抛异常
         with pytest.raises(VendorFatalError):
             route_to_vendor("test_fallback_method", code="000001")
-        assert results == ["tushare"]
+        assert results == ["akshare"]
 
     def test_fallback_on_not_configured(self):
         def primary(code):
             raise VendorNotConfiguredError("no key", vendor="primary")
-        register_vendor_impl("test_method", "tushare", primary)
-        # 只有 tushare 被尝试，它抛异常后没有其他 vendor
+        register_vendor_impl("test_method", "akshare", primary)
+        # 只有 akshare 被尝试，它抛异常后没有其他 vendor
         with pytest.raises(VendorFatalError):
             route_to_vendor("test_method", code="000001")
 
     def test_no_data_returns_sentinel(self):
         def primary(code):
-            raise NoMarketDataError("no data", symbol="000001", vendor="tushare")
-        register_vendor_impl("test_method", "tushare", primary)
+            raise NoMarketDataError("no data", symbol="000001", vendor="akshare")
+        register_vendor_impl("test_method", "akshare", primary)
         result = route_to_vendor("test_method", code="000001")
         assert "NO_DATA_AVAILABLE" in str(result)
 
     def test_all_vendors_fail_fatal(self):
         def primary(code):
-            raise VendorRateLimitError("limit", vendor="tushare")
-        register_vendor_impl("test_method", "tushare", primary)
+            raise VendorRateLimitError("limit", vendor="akshare")
+        register_vendor_impl("test_method", "akshare", primary)
         with pytest.raises(VendorFatalError):
             route_to_vendor("test_method", code="000001")
 
     def test_none_return_treated_as_no_data(self):
         def primary(code):
             return None
-        register_vendor_impl("test_method", "tushare", primary)
+        register_vendor_impl("test_method", "akshare", primary)
         result = route_to_vendor("test_method", code="000001")
         assert "NO_DATA_AVAILABLE" in str(result)
 
@@ -90,18 +86,16 @@ class TestVendorChain:
             order.append("c")
             return {"ok": True}
         # 使用名为 "get_daily" 的方法，它匹配 market_data 分类的链
-        # 也可直接注册到 tushare + akshare
-        register_vendor_impl("test_method", "a", a)
-        register_vendor_impl("test_method", "b", b)
-        register_vendor_impl("test_method", "tushare", c)
-        result = route_to_vendor("test_method", code="x")
+        register_vendor_impl("get_daily", "akshare", a)
+        register_vendor_impl("get_daily", "baostock", b)
+        register_vendor_impl("get_daily", "yfinance", c)
+        result = route_to_vendor("get_daily", code="x")
         assert result == {"ok": True}
 
     def test_fallback_order_across_vendors(self):
         """使用已知的 get_daily 方法测试降级顺序"""
         chain = get_vendor_chain("get_daily")
-        assert len(chain) >= 1
-        assert chain[0] == "akshare"
+        assert chain == ["akshare", "baostock", "yfinance"]
         # 注册 mock 到链中的第一个供应商
         first_vendor = chain[0]
         def mock_impl(code):
@@ -109,6 +103,21 @@ class TestVendorChain:
         register_vendor_impl("get_daily", first_vendor, mock_impl)
         result = route_to_vendor("get_daily", code="000001.SZ")
         assert result == {"mock": "data"}
+
+    def test_configured_chains_are_free_only(self):
+        free_vendors = {"akshare", "baostock", "yfinance"}
+        for method in [
+            "get_daily",
+            "get_capital_flow",
+            "get_news",
+            "get_factors",
+            "get_st_status",
+            "get_suspended",
+            "get_delisting",
+        ]:
+            chain = get_vendor_chain(method)
+            assert chain
+            assert set(chain) <= free_vendors
 
 
 class TestVendorImplRegistration:

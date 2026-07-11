@@ -11,15 +11,16 @@ pip install -e .
 
 复制 `.env.example` 为 `.env`, 填入:
 - LLM API Key (DeepSeek)
-- 如只测试 DataAgent，可先不填任何付费行情 token；默认走 AkShare 免费数据源
+- 如只测试 DataAgent，不需要行情 API Key；默认走 AkShare/BaoStock/YFinance 免费数据源
 
 ### DataAgent 需要接入的 API
 
-- `akshare`: 默认免费数据源，无需 API Key，但需要安装 `pip install -e ".[akshare]"` 或 `pip install akshare`。主要用于行情、新闻、板块、涨停梯队和部分资金流数据。
+- `akshare`: 默认免费主数据源，无需 API Key。主要用于 A 股行情、新闻、板块、涨停梯队和部分资金流数据。
   - 文档: `https://akshare.akfamily.xyz/`
-- `TUSHARE_TOKEN`: 可选增强/备用数据源，不作为默认必需项。部分接口依赖积分或付费权限，适合后续补齐更稳定的 A 股专业数据。
-  - 注册/Token: `https://tushare.pro/register`
-  - 文档: `https://tushare.pro/document/1?doc_id=40`
+- `baostock`: 免费 A 股历史行情和停牌状态兜底，无需 API Key。
+  - 文档: `http://baostock.com/baostock/index.php/Python_API%E6%96%87%E6%A1%A3`
+- `yfinance`: 免费跨市场行情兜底，无需 API Key，主要用于美股、港股、ETF、指数等。
+  - 文档: `https://ranaroussi.github.io/yfinance/`
 - `DEEPSEEK_API_KEY`: 完整多 Agent 分析默认 LLM key；单独测试 DataAgent 不需要。
   - API Key: `https://platform.deepseek.com/api_keys`
   - 文档: `https://api-docs.deepseek.com/`
@@ -48,7 +49,8 @@ data/results/data_agent_runs/<date>_<ticker>_<timestamp>/
 ├── 02_raw/raw_data.json           # 原始供应商数据
 ├── 03_cleaned/cleaned_data.json   # 标准化、清洗后的数据
 ├── 04_analysis/analysis_data.json # 因子、摘要和分析数据
-└── 05_final/response.json         # 汇总返回: input/raw/cleaned/analysis/manifest
+├── 05_agent_payload/agent_payload.json # 给后续 Agent 消费的 Tier 1 / Tier 2 数据
+└── 06_final/response.json         # 汇总返回: input/raw/cleaned/analysis/agent_payload/manifest
 ```
 
 ## 运行
@@ -72,7 +74,7 @@ src/advanced_trading_agent/
 ├── data_agent/            # DataAgent 数据层
 │   ├── schema.py          # Tier 1/Tier 2 Schema (Pydantic)
 │   ├── vendor_router.py   # 多供应商路由 + 降级
-│   ├── collector.py       # 数据采集 (tushare/akshare)
+│   ├── collector.py       # 数据采集 (akshare/baostock/yfinance)
 │   ├── data_agent.py      # 独立 DataAgent: 输入→原始→清洗→分析→最终返回
 │   ├── cleaner.py         # 数据清洗
 │   └── factors.py         # 因子计算

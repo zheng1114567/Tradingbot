@@ -11,7 +11,7 @@ def test_manifest_records_fields_and_soft_vetoes(tmp_path):
         "stock.daily",
         available=False,
         source="vendor_router:get_daily",
-        vendor_chain=["tushare", "akshare"],
+        vendor_chain=["akshare", "baostock", "yfinance"],
         error="NO_DATA_AVAILABLE",
     )
 

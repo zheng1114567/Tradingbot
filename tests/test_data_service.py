@@ -53,6 +53,50 @@ class TestCleaner:
         result = DataCleaner.detect_limit_up_down(df)
         assert result.iloc[0]["is_limit_up"]  # +10% = 涨停
 
+    def test_clean_daily_normalizes_free_vendor_fields(self):
+        data = [
+            {
+                "date": "2026-07-10",
+                "code": "sh.600000",
+                "open": "10.0",
+                "high": "10.5",
+                "low": "9.8",
+                "close": "10.2",
+                "preclose": "10.0",
+                "pctChg": "2.0",
+                "volume": "1000",
+                "amount": "10200",
+                "turn": "0.5",
+            }
+        ]
+        result = DataCleaner.clean_daily(data)
+        assert "trade_date" in result.columns
+        assert "pre_close" in result.columns
+        assert "pct_chg" in result.columns
+        assert "turnover_rate" in result.columns
+        assert result.iloc[0]["pct_chg"] == 2.0
+
+
+class TestFactors:
+    """测试因子公式单位."""
+
+    def test_volatility_uses_decimal_returns(self):
+        df = pd.DataFrame({"pct_chg": [1.0] * 20 + [2.0]})
+        result = FactorCalculator.volatility(df.copy(), periods=20)
+        expected = (df["pct_chg"] / 100).rolling(20).std().iloc[-1] * (252 ** 0.5)
+        assert result.iloc[-1]["volatility"] == pytest.approx(expected)
+        assert result.iloc[-1]["volatility"] < 1
+
+    def test_turnover_and_amihud_use_decimal_scale(self):
+        df = pd.DataFrame({
+            "pct_chg": [1.0] * 21,
+            "amount": [1000.0] * 21,
+            "turnover_rate": [2.5] * 21,
+        })
+        result = FactorCalculator.run_all(df.copy())
+        assert result.iloc[-1]["turnover"] == pytest.approx(0.025)
+        assert result.iloc[-1]["amihud"] == pytest.approx(0.00001)
+
 
 class TestVendorRouter:
     """测试供应商路由"""
@@ -61,7 +105,7 @@ class TestVendorRouter:
         """测试无数据时返回哨兵"""
         def mock_impl(code):
             return None
-        register_vendor_impl("test_method", "tushare", mock_impl)
+        register_vendor_impl("test_method", "akshare", mock_impl)
         result = route_to_vendor("test_method", code="000001")
         assert "NO_DATA_AVAILABLE" in str(result)
 

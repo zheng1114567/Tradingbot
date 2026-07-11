@@ -8,7 +8,7 @@
 #   pip install -r requirements.lock
 #
 # 开发依赖
-#   pip install -e ".[dev,akshare,tushare,anthropic]"
+#   pip install -e ".[dev,data,anthropic]"
 
 -e .
-.[dev,akshare,tushare,anthropic,autogen]
+.[dev,data,anthropic,autogen]

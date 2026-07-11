@@ -177,14 +177,43 @@ class TestTradingSystemIntegration:
     def test_system_routes_full_flow_no_crash(self):
         """完整工作流不崩溃 (各 Agent 的降级路径确保即使数据缺失也不抛异常)
 
-        注意: 真实运行需要 API key, 无 key 时所有 LLM 调用走降级路径。
+        注意: workflow 单测不依赖真实网络，DataAgent 在自身测试中单独覆盖。
         """
         system = TradingSystem(debug=False, mode="live")
         try:
-            state, report = system.analyze(
-                ticker="000001.SZ", trade_date="2026-07-10",
-                tier1_data={}, tier2_data={},
-            )
+            with patch.object(system, "_load_data") as load_data:
+                load_data.return_value = (
+                    {
+                        "market": {"index_close": 3000, "index_change_pct": 0.5},
+                        "sentiment": {"sentiment": "正常", "sentiment_score": 55},
+                        "capital": {"confirmation": "资金确认", "net_inflow_main": 1e8},
+                        "risk": {
+                            "st_list": [],
+                            "suspended_list": [],
+                            "delisting_list": [],
+                            "daily_volume": 20_000_000,
+                            "risk_data_available": True,
+                            "risk_data_errors": [],
+                        },
+                    },
+                    {
+                        "price_data": [
+                            {
+                                "code": "000001.SZ",
+                                "close": 10,
+                                "pct_chg": 1,
+                                "amount": 20_000_000,
+                            }
+                        ],
+                        "factors": [],
+                        "events": [],
+                        "backtest_samples": [],
+                    },
+                )
+                state, report = system.analyze(
+                    ticker="000001.SZ", trade_date="2026-07-10",
+                    tier1_data={}, tier2_data={},
+                )
             assert True
         except Exception as e:
             # sender 字段在 LangGraph 特定版本可能触发 InvalidUpdateError
@@ -197,19 +226,44 @@ class TestTradingSystemIntegration:
     def test_load_data_populates_risk_and_liquidity(self):
         system = TradingSystem(debug=False, mode="live")
 
-        with patch("advanced_trading_agent.graph.workflow.route_to_vendor") as route:
-            def fake_route(method, *args, **kwargs):
-                if method == "get_daily" and kwargs.get("code") == "000001.SZ":
-                    return [{"ts_code": "000001.SZ", "close": 10, "pct_chg": 1, "amount": 20000}]
-                if method == "get_daily":
-                    return [{"ts_code": "000001.SH", "close": 3000, "pct_chg": 0.5}]
-                if method == "get_st_status":
-                    return []
-                if method == "get_suspended":
-                    return []
-                raise AssertionError(method)
-
-            route.side_effect = fake_route
+        with patch("advanced_trading_agent.graph.workflow.DataAgent") as data_agent_cls:
+            run = MagicMock()
+            run.final_data = {
+                "analysis": {
+                    "agent_payload": {
+                        "tier1_data": {
+                            "market": {"index_close": 3000, "index_change_pct": 0.5},
+                            "sentiment": {"sentiment": "正常", "sentiment_score": 55},
+                            "capital": {"confirmation": "资金确认", "net_inflow_main": 1e8},
+                            "risk": {
+                                "st_list": [],
+                                "suspended_list": [],
+                                "delisting_list": [],
+                                "daily_volume": 20_000_000,
+                                "risk_data_available": True,
+                                "risk_data_errors": [],
+                            },
+                        },
+                        "tier2_data": {
+                            "price_data": [
+                                {
+                                    "code": "000001.SZ",
+                                    "close": 10,
+                                    "pct_chg": 1,
+                                    "amount": 20_000_000,
+                                }
+                            ],
+                            "factors": [],
+                            "events": [],
+                            "backtest_samples": [],
+                        },
+                    },
+                },
+                "manifest": {"fields": {"stock.daily": {"available": True}, "risk.st_status": {"available": True}}},
+            }
+            run.manifest_path = "manifest.json"
+            run.to_dict.return_value = {"run_id": "test"}
+            data_agent_cls.return_value.run.return_value = run
             tier1, tier2 = system._load_data("000001.SZ", "2026-07-10")
 
         assert tier2["price_data"]

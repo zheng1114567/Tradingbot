@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import logging
-from datetime import date, datetime
+from datetime import date
 from typing import Any
 
 import pandas as pd
@@ -21,12 +21,20 @@ class DataCleaner:
         if not data:
             return pd.DataFrame()
         df = pd.DataFrame(data)
-        # 列名标准化 (tushare / akshare 字段不同)
+        # 列名标准化 (akshare / baostock / yfinance 字段不同)
         df = DataCleaner._standardize_columns(df)
+        if "code" not in df.columns:
+            df["code"] = ""
         # 时间索引
         if "trade_date" in df.columns:
-            df["trade_date"] = pd.to_datetime(df["trade_date"])
+            df["trade_date"] = pd.to_datetime(df["trade_date"], errors="coerce")
             df = df.sort_values("trade_date")
+        for col in [
+            "open", "high", "low", "close", "pre_close", "change", "pct_chg",
+            "volume", "amount", "turnover_rate",
+        ]:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
         # 缺失值: 回测数据禁止用未来值回填过去。
         df = df.ffill()
         # 异常值
@@ -36,21 +44,13 @@ class DataCleaner:
 
     @staticmethod
     def _standardize_columns(df: pd.DataFrame) -> pd.DataFrame:
-        """标准化列名 (tushare -> 统一格式, akshare -> 统一格式)"""
+        """标准化列名为后续 Agent 统一消费的字段."""
         rename_map = {
-            # tushare -> 标准
+            # common legacy/normalized fields
             "ts_code": "code",
-            "trade_date": "trade_date",
-            "open": "open",
-            "high": "high",
-            "low": "low",
-            "close": "close",
-            "pre_close": "pre_close",
-            "change": "change",
-            "pct_chg": "pct_chg",
             "vol": "volume",
-            "amount": "amount",
             # akshare -> 标准
+            "代码": "code",
             "开盘": "open",
             "收盘": "close",
             "最高": "high",
@@ -59,7 +59,28 @@ class DataCleaner:
             "涨跌额": "change",
             "成交量": "volume",
             "成交额": "amount",
+            "换手率": "turnover_rate",
             "日期": "trade_date",
+            # baostock -> 标准
+            "date": "trade_date",
+            "code": "code",
+            "preclose": "pre_close",
+            "pctChg": "pct_chg",
+            "volume": "volume",
+            "turn": "turnover_rate",
+            "amount": "amount",
+            # yfinance -> 标准
+            "Date": "trade_date",
+            "Open": "open",
+            "High": "high",
+            "Low": "low",
+            "Close": "close",
+            "Volume": "volume",
+            # already-standard fields
+            "trade_date": "trade_date",
+            "pre_close": "pre_close",
+            "pct_chg": "pct_chg",
+            "turnover_rate": "turnover_rate",
         }
         # 只重命名存在的列
         existing = {k: v for k, v in rename_map.items() if k in df.columns}
@@ -78,7 +99,7 @@ class DataCleaner:
             code = str(row.get("code", ""))
             if "ST" in code:  # 同时匹配 ST 和 *ST
                 limit = 5.0
-            elif code.startswith("68") or code.startswith("30"):  # 科创/创业板
+            elif code.startswith(("68", "30", "300", "301")):  # 科创/创业板
                 limit = 20.0
             else:
                 limit = 10.0

@@ -54,6 +54,15 @@ class DataAgentPlanner:
             "observation": "required",
         })
 
+        if getattr(request, "include_market", True):
+            required_methods.append("get_daily:index")
+            trace.append({
+                "thought": "Market index data is needed by Market Agent tier-1 context.",
+                "action": "require_method",
+                "args": {"method": "get_daily", "code": "000001.SH"},
+                "observation": "required",
+            })
+
         if request.include_capital_flow:
             required_methods.append("get_capital_flow")
             trace.append({
@@ -88,6 +97,26 @@ class DataAgentPlanner:
                 "thought": "Factor analysis was not requested.",
                 "action": "skip_method",
                 "args": {"method": "compute_factors"},
+                "observation": "skipped",
+            })
+
+        if getattr(request, "include_risk", True):
+            required_methods.extend(["get_st_status", "get_suspended", "get_delisting"])
+            trace.append({
+                "thought": "Risk gates need ST, suspended, and delisting lists before agents recommend.",
+                "action": "require_method",
+                "args": {
+                    "methods": ["get_st_status", "get_suspended", "get_delisting"],
+                    "vendor_chain": get_vendor_chain("get_st_status"),
+                },
+                "observation": "required",
+            })
+        else:
+            skipped_methods.extend(["get_st_status", "get_suspended", "get_delisting"])
+            trace.append({
+                "thought": "Risk pre-check data was not requested.",
+                "action": "skip_method",
+                "args": {"methods": ["get_st_status", "get_suspended", "get_delisting"]},
                 "observation": "skipped",
             })
 

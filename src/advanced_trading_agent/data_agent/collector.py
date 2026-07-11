@@ -1,16 +1,17 @@
-"""
-数据采集 — tushare + akshare 双供应商
+"""Free-first data collection adapters.
 
-通过 VendorRouter 统一路由, 支持降级链。
+Default vendor order uses API-key-free data sources:
+akshare -> baostock -> yfinance.
 """
 from __future__ import annotations
 
 import logging
-from datetime import date, datetime, timedelta
+from datetime import date, timedelta
 from typing import Any
 
+import pandas as pd
+
 from .vendor_router import (
-    DataVendor,
     NoMarketDataError,
     VendorNotConfiguredError,
     VendorRateLimitError,
@@ -20,321 +21,427 @@ from .vendor_router import (
 logger = logging.getLogger(__name__)
 
 
-# ============================================================
-# 供应商实现
-# ============================================================
+def _fmt_yyyymmdd(value: str | None, default: date) -> str:
+    return (value or default.strftime("%Y%m%d")).replace("-", "")
 
-def _get_tushare():
-    """延迟加载 tushare (API key 可能未配置)"""
-    import os
-    token = os.environ.get("TUSHARE_TOKEN")
-    if not token:
-        raise VendorNotConfiguredError("TUSHARE_TOKEN not set", vendor="tushare")
-    try:
-        import tushare as ts
-        ts.set_token(token)
-        return ts
-    except ImportError:
-        raise VendorNotConfiguredError("tushare not installed (pip install tushare)", vendor="tushare")
+
+def _fmt_iso(value: str | None, default: date) -> str:
+    raw = value or default.isoformat()
+    if len(raw) == 8 and raw.isdigit():
+        return f"{raw[:4]}-{raw[4:6]}-{raw[6:]}"
+    return raw
+
+
+def _digits(code: str) -> str:
+    return code.split(".")[0].replace("sh", "").replace("sz", "")
+
+
+def _market_suffix(code: str) -> str:
+    upper = code.upper()
+    if upper.endswith(".SH") or upper.startswith("SH"):
+        return "sh"
+    if upper.endswith(".SZ") or upper.startswith("SZ"):
+        return "sz"
+    if upper.endswith(".BJ") or upper.startswith("BJ"):
+        return "bj"
+    digits = _digits(code)
+    if digits.startswith(("5", "6", "9")):
+        return "sh"
+    return "sz"
+
+
+def _baostock_code(code: str) -> str:
+    return f"{_market_suffix(code)}.{_digits(code)}"
+
+
+def _ak_index_symbol(code: str) -> str | None:
+    digits = _digits(code)
+    if digits in {"000001", "000300", "000905", "000852"} and _market_suffix(code) == "sh":
+        return f"sh{digits}"
+    if digits.startswith(("399", "159")) and _market_suffix(code) == "sz":
+        return f"sz{digits}"
+    return None
+
+
+def _with_source(records: list[dict[str, Any]], source: str, code: str = "") -> list[dict[str, Any]]:
+    for record in records:
+        record.setdefault("data_source", source)
+        if code:
+            record.setdefault("code", code)
+    return records
 
 
 def _get_akshare():
-    """延迟加载 akshare"""
     try:
-        import akshare as ak  # noqa
+        import akshare as ak
         return ak
-    except ImportError:
-        raise VendorNotConfiguredError("akshare not installed (pip install akshare)", vendor="akshare")
+    except ImportError as exc:
+        raise VendorNotConfiguredError("akshare not installed (pip install akshare)", vendor="akshare") from exc
 
 
-# ============================================================
-# 行情数据
-# ============================================================
-
-def get_daily_tushare(code: str, start_date: str | None = None,
-                      end_date: str | None = None) -> list[dict[str, Any]]:
-    """从 tushare 获取日K数据"""
-    pro = _get_tushare().pro_api()
-    end = end_date or date.today().strftime("%Y%m%d")
-    start = start_date or (date.today() - timedelta(days=365)).strftime("%Y%m%d")
+def _get_baostock():
     try:
-        df = pro.daily(ts_code=code, start_date=start, end_date=end)
-        if df is None or df.empty:
-            raise NoMarketDataError(f"No daily data for {code}", symbol=code, vendor="tushare")
-        return df.to_dict("records")
-    except Exception as e:
-        if "over频次" in str(e) or "次数" in str(e):
-            raise VendorRateLimitError(str(e), vendor="tushare") from e
-        raise
+        import baostock as bs
+        return bs
+    except ImportError as exc:
+        raise VendorNotConfiguredError("baostock not installed (pip install baostock)", vendor="baostock") from exc
 
 
-def get_daily_akshare(code: str, start_date: str | None = None,
-                      end_date: str | None = None) -> list[dict[str, Any]]:
-    """从 akshare 获取日K数据 (A股)"""
+def _get_yfinance():
+    try:
+        import yfinance as yf
+        return yf
+    except ImportError as exc:
+        raise VendorNotConfiguredError("yfinance not installed (pip install yfinance)", vendor="yfinance") from exc
+
+
+def get_daily_akshare(
+    code: str,
+    start_date: str | None = None,
+    end_date: str | None = None,
+) -> list[dict[str, Any]]:
+    """Daily OHLCV from AkShare for A-share stocks and major indexes."""
+
     ak = _get_akshare()
-    end = end_date or date.today().strftime("%Y%m%d")
-    start = start_date or (date.today() - timedelta(days=365)).strftime("%Y%m%d")
+    end = _fmt_yyyymmdd(end_date, date.today())
+    start = _fmt_yyyymmdd(start_date, date.today() - timedelta(days=365))
+    symbol = _digits(code)
     try:
-        # akshare 需要去掉后缀 .SZ / .SH
-        symbol = code.replace(".SZ", "").replace(".SH", "").replace(".BJ", "")
-        df = ak.stock_zh_a_hist(symbol=symbol, period="daily",
-                                start_date=start, end_date=end, adjust="qfq")
+        index_symbol = _ak_index_symbol(code)
+        if index_symbol:
+            df = ak.stock_zh_index_daily(symbol=index_symbol)
+            if df is not None and not df.empty:
+                df = df.rename(columns={"date": "trade_date"})
+                df["trade_date"] = pd.to_datetime(df["trade_date"], errors="coerce")
+                start_ts = pd.to_datetime(start)
+                end_ts = pd.to_datetime(end)
+                df = df[(df["trade_date"] >= start_ts) & (df["trade_date"] <= end_ts)]
+                if "amount" not in df.columns and {"close", "volume"}.issubset(df.columns):
+                    df["amount"] = pd.to_numeric(df["close"], errors="coerce") * pd.to_numeric(
+                        df["volume"], errors="coerce"
+                    )
+                records = df.to_dict("records")
+                if records:
+                    return _with_source(records, "akshare", code)
+
+        df = ak.stock_zh_a_hist(
+            symbol=symbol,
+            period="daily",
+            start_date=start,
+            end_date=end,
+            adjust="qfq",
+        )
         if df is None or df.empty:
             raise NoMarketDataError(f"No daily data for {code}", symbol=code, vendor="akshare")
-        return df.to_dict("records")
-    except Exception as e:
-        logger.warning("akshare get_daily failed for %s: %s", code, e)
-        raise NoMarketDataError(str(e), symbol=code, vendor="akshare") from e
-
-
-# ============================================================
-# 资金流向
-# ============================================================
-
-def get_capital_flow_tushare(code: str, start_date: str | None = None,
-                              end_date: str | None = None) -> list[dict[str, Any]]:
-    """从 tushare 获取个股资金流"""
-    pro = _get_tushare().pro_api()
-    end = end_date or date.today().strftime("%Y%m%d")
-    start = start_date or (date.today() - timedelta(days=30)).strftime("%Y%m%d")
-    try:
-        df = pro.moneyflow(ts_code=code, start_date=start, end_date=end)
-        if df is None or df.empty:
-            raise NoMarketDataError(f"No capital flow for {code}", symbol=code, vendor="tushare")
-        return df.to_dict("records")
-    except Exception as e:
-        if "over频次" in str(e):
-            raise VendorRateLimitError(str(e), vendor="tushare") from e
+        return _with_source(df.to_dict("records"), "akshare", code)
+    except NoMarketDataError:
         raise
+    except Exception as exc:
+        logger.warning("akshare get_daily failed for %s: %s", code, exc)
+        raise NoMarketDataError(str(exc), symbol=code, vendor="akshare") from exc
 
 
-def get_capital_flow_akshare(code: str, start_date: str | None = None,
-                              end_date: str | None = None) -> list[dict[str, Any]]:
-    """从 akshare 获取个股资金流 (A股)"""
-    ak = _get_akshare()
-    symbol = code.replace(".SZ", "").replace(".SH", "").replace(".BJ", "")
+def get_daily_baostock(
+    code: str,
+    start_date: str | None = None,
+    end_date: str | None = None,
+) -> list[dict[str, Any]]:
+    """Daily OHLCV from BaoStock as a free A-share fallback."""
+
+    bs = _get_baostock()
+    start = _fmt_iso(start_date, date.today() - timedelta(days=365))
+    end = _fmt_iso(end_date, date.today())
+    login_result = bs.login()
+    if getattr(login_result, "error_code", "0") != "0":
+        raise VendorRateLimitError(getattr(login_result, "error_msg", "baostock login failed"), vendor="baostock")
     try:
-        df = ak.stock_individual_fund_flow(stock=symbol, market="sh" if symbol.startswith("6") else "sz")
+        rs = bs.query_history_k_data_plus(
+            _baostock_code(code),
+            "date,code,open,high,low,close,preclose,volume,amount,pctChg,turn",
+            start_date=start,
+            end_date=end,
+            frequency="d",
+            adjustflag="2",
+        )
+        rows: list[dict[str, Any]] = []
+        while getattr(rs, "error_code", "0") == "0" and rs.next():
+            rows.append(dict(zip(rs.fields, rs.get_row_data())))
+        if not rows:
+            raise NoMarketDataError(f"No daily data for {code}", symbol=code, vendor="baostock")
+        return _with_source(rows, "baostock", code)
+    finally:
+        try:
+            bs.logout()
+        except Exception:
+            pass
+
+
+def get_daily_yfinance(
+    code: str,
+    start_date: str | None = None,
+    end_date: str | None = None,
+) -> list[dict[str, Any]]:
+    """Daily OHLCV from Yahoo Finance for cross-market fallback."""
+
+    yf = _get_yfinance()
+    start = _fmt_iso(start_date, date.today() - timedelta(days=365))
+    end = _fmt_iso(end_date, date.today() + timedelta(days=1))
+    try:
+        df = yf.download(code, start=start, end=end, progress=False, auto_adjust=False)
+        if df is None or df.empty:
+            raise NoMarketDataError(f"No daily data for {code}", symbol=code, vendor="yfinance")
+        df = df.reset_index()
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = [col[0] for col in df.columns]
+        if "Adj Close" in df.columns:
+            df = df.drop(columns=["Adj Close"])
+        if {"Close", "Volume"}.issubset(df.columns):
+            df["amount"] = pd.to_numeric(df["Close"], errors="coerce") * pd.to_numeric(
+                df["Volume"], errors="coerce"
+            )
+            df["amount_estimated"] = True
+        return _with_source(df.to_dict("records"), "yfinance", code)
+    except NoMarketDataError:
+        raise
+    except Exception as exc:
+        logger.warning("yfinance get_daily failed for %s: %s", code, exc)
+        raise NoMarketDataError(str(exc), symbol=code, vendor="yfinance") from exc
+
+
+def get_capital_flow_akshare(
+    code: str,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    trade_date: str | None = None,
+) -> list[dict[str, Any]] | dict[str, Any]:
+    """Individual A-share capital flow from AkShare."""
+
+    if not code:
+        return {
+            "net_inflow_main": 0,
+            "confirmation": "未知",
+            "data_source": "akshare",
+            "note": "capital flow requires a stock code",
+        }
+    ak = _get_akshare()
+    symbol = _digits(code)
+    try:
+        df = ak.stock_individual_fund_flow(stock=symbol, market="sh" if _market_suffix(code) == "sh" else "sz")
         if df is None or df.empty:
             raise NoMarketDataError(f"No capital flow for {code}", symbol=code, vendor="akshare")
-        return df.to_dict("records")
-    except Exception as e:
-        logger.warning("akshare capital_flow failed for %s: %s", code, e)
-        raise NoMarketDataError(str(e), symbol=code, vendor="akshare") from e
+        records = _with_source(df.to_dict("records"), "akshare", code)
+        return records
+    except NoMarketDataError:
+        raise
+    except Exception as exc:
+        logger.warning("akshare capital_flow failed for %s: %s", code, exc)
+        raise NoMarketDataError(str(exc), symbol=code, vendor="akshare") from exc
 
 
-# ============================================================
-# 新闻数据
-# ============================================================
-
-def get_news_akshare(sector: str | None = None,
-                     keyword: str | None = None) -> list[dict[str, Any]]:
-    """从 akshare 获取财经新闻"""
+def get_news_akshare(sector: str | None = None, keyword: str | None = None) -> list[dict[str, Any]]:
     ak = _get_akshare()
     try:
         df = ak.stock_info_global()
         if df is not None and not df.empty:
-            records = df.to_dict("records")
+            records = _with_source(df.to_dict("records"), "akshare")
             if keyword:
-                records = [r for r in records if keyword in str(r)]
+                records = [record for record in records if keyword in str(record)]
             return records
-    except Exception as e:
-        logger.warning("akshare news failed: %s", e)
+    except Exception as exc:
+        logger.warning("akshare news failed: %s", exc)
     return []
 
 
-# ============================================================
-# 板块数据
-# ============================================================
-
-def get_sector_tushare() -> list[dict[str, Any]]:
-    """从 tushare 获取板块数据"""
-    pro = _get_tushare().pro_api()
-    try:
-        df = pro.ths_member()
-        if df is not None and not df.empty:
-            return df.to_dict("records")
-    except Exception as e:
-        logger.warning("tushare sector failed: %s", e)
-    return []
-
-
-def get_sector_akshare() -> list[dict[str, Any]]:
-    """从 akshare 获取板块数据"""
+def get_sector_akshare(top_n: int = 10) -> list[dict[str, Any]]:
     ak = _get_akshare()
     try:
         df = ak.stock_board_concept_name_em()
-        if df is not None and not df.empty:
-            return df.to_dict("records")
-    except Exception as e:
-        logger.warning("akshare sector failed: %s", e)
+        if df is None or df.empty:
+            return []
+        records = []
+        for idx, row in enumerate(df.head(top_n).to_dict("records"), start=1):
+            change = row.get("涨跌幅", row.get("change_pct", 0))
+            try:
+                change_pct = float(change)
+            except (TypeError, ValueError):
+                change_pct = 0.0
+            records.append({
+                **row,
+                "rank": idx,
+                "sector_name": row.get("板块名称", row.get("sector_name", "")),
+                "change_pct": change_pct,
+                "strength_score": change_pct,
+                "data_source": "akshare",
+            })
+        return records
+    except Exception as exc:
+        logger.warning("akshare sector failed: %s", exc)
+        return []
+
+
+def get_financial_akshare(code: str) -> list[dict[str, Any]]:
+    """Best-effort free financial indicators from AkShare."""
+
+    ak = _get_akshare()
+    symbol = _digits(code)
+    for fn_name in ("stock_financial_analysis_indicator", "stock_financial_abstract"):
+        fn = getattr(ak, fn_name, None)
+        if fn is None:
+            continue
+        try:
+            df = fn(symbol=symbol)
+            if df is not None and not df.empty:
+                return _with_source(df.to_dict("records"), "akshare", code)
+        except Exception as exc:
+            logger.debug("akshare %s failed for %s: %s", fn_name, code, exc)
+    raise NoMarketDataError(f"No financial data for {code}", symbol=code, vendor="akshare")
+
+
+def get_st_status_akshare() -> list[str]:
+    ak = _get_akshare()
+    try:
+        fn = getattr(ak, "stock_zh_a_st_em", None)
+        if fn is None:
+            return []
+        df = fn()
+        if df is None or df.empty:
+            return []
+        code_col = "代码" if "代码" in df.columns else "code"
+        return [str(code) for code in df[code_col].dropna().tolist()]
+    except Exception as exc:
+        logger.warning("akshare ST list failed: %s", exc)
+        return []
+
+
+def get_suspended_baostock(trade_date: str | None = None) -> list[str]:
+    bs = _get_baostock()
+    day = _fmt_iso(trade_date, date.today())
+    login_result = bs.login()
+    if getattr(login_result, "error_code", "0") != "0":
+        raise VendorRateLimitError(getattr(login_result, "error_msg", "baostock login failed"), vendor="baostock")
+    try:
+        rs = bs.query_all_stock(day=day)
+        suspended: list[str] = []
+        while getattr(rs, "error_code", "0") == "0" and rs.next():
+            row = dict(zip(rs.fields, rs.get_row_data()))
+            status = row.get("tradeStatus", row.get("tradestatus", "1"))
+            if status not in {"1", "交易"}:
+                suspended.append(str(row.get("code", "")))
+        return suspended
+    except Exception as exc:
+        logger.warning("baostock suspended list failed: %s", exc)
+        return []
+    finally:
+        try:
+            bs.logout()
+        except Exception:
+            pass
+
+
+def get_suspended_akshare(trade_date: str | None = None) -> list[str]:
+    """AkShare does not expose one stable suspended-list endpoint; return empty best effort."""
+
     return []
 
 
-# ============================================================
-# 基本面数据
-# ============================================================
+def get_delisting_akshare() -> list[str]:
+    """Best-effort delisting risk list using free AkShare ST data."""
 
-def get_financial_tushare(code: str) -> list[dict[str, Any]]:
-    """从 tushare 获取财务数据"""
-    pro = _get_tushare().pro_api()
-    try:
-        df = pro.fina_indicator(ts_code=code)
-        if df is not None and not df.empty:
-            return df.to_dict("records")
-    except Exception as e:
-        if "over频次" in str(e):
-            raise VendorRateLimitError(str(e), vendor="tushare") from e
-        logger.warning("tushare financial failed for %s: %s", code, e)
-    raise NoMarketDataError(f"No financial data for {code}", symbol=code, vendor="tushare")
-
-
-# ============================================================
-# 风险数据
-# ============================================================
-
-def get_suspended_tushare() -> list[dict[str, Any]]:
-    """获取停牌股票列表"""
-    pro = _get_tushare().pro_api()
-    try:
-        today = date.today().strftime("%Y%m%d")
-        df = pro.suspend(suspend_date=today)
-        if df is not None and not df.empty:
-            return df["ts_code"].tolist()
-    except Exception as e:
-        logger.warning("tushare suspend failed: %s", e)
-    return []
-
-
-def get_st_status_tushare() -> list[str]:
-    """获取 ST 股票列表"""
-    pro = _get_tushare().pro_api()
-    try:
-        today = date.today().strftime("%Y%m%d")
-        df = pro.namechange(change_date=today)
-        if df is not None and not df.empty:
-            st_codes = df[df["name"].str.contains("ST|*ST", na=False)]["ts_code"].tolist()
-            return st_codes
-    except Exception as e:
-        logger.warning("tushare namechange failed: %s", e)
-    return []
-
-
-# ============================================================
-# A股特有数据 (北向资金/涨停梯队/龙虎榜/融资融券)
-# ============================================================
-
-def get_northbound_flow_tushare(trade_date: str | None = None) -> dict[str, Any]:
-    """获取北向资金流向 (A股特有)"""
-    pro = _get_tushare().pro_api()
-    td = trade_date or date.today().strftime("%Y%m%d")
-    try:
-        df = pro.moneyflow_hsgt(start_date=td, end_date=td)
-        if df is not None and not df.empty:
-            return df.to_dict("records")[0]
-    except Exception as e:
-        logger.warning("tushare northbound failed: %s", e)
-    return {"net_inflow": 0, "note": "北向资金数据不可用"}
+    return get_st_status_akshare()
 
 
 def get_northbound_flow_akshare(trade_date: str | None = None) -> dict[str, Any]:
-    """从 akshare 获取北向资金"""
-    import akshare as ak
+    ak = _get_akshare()
     try:
         df = ak.stock_hsgt_north_net_flow_in_em(symbol="北上")
         if df is not None and not df.empty:
-            return df.to_dict("records")[0]
-    except Exception as e:
-        logger.warning("akshare northbound failed: %s", e)
-    return {"net_inflow": 0}
+            record = df.to_dict("records")[-1]
+            record["data_source"] = "akshare"
+            return record
+    except Exception as exc:
+        logger.warning("akshare northbound failed: %s", exc)
+    return {"net_inflow": 0, "data_source": "akshare", "note": "northbound data unavailable"}
 
 
 def get_limit_up_tiers_akshare(trade_date: str | None = None) -> dict[str, int]:
-    """涨停梯队分析 — 使用 akshare 东方财富涨停板数据
-
-    返回首板/二板/三板及以上数量。
-    """
-    td = trade_date or date.today().strftime("%Y%m%d")
-    td = td.replace("-", "")
+    td = _fmt_yyyymmdd(trade_date, date.today())
     try:
-        import akshare as ak
+        ak = _get_akshare()
         df = ak.stock_zt_pool_em(date=td)
         if df is None or df.empty:
-            logger.info("涨停板数据为空 (交易日: %s)", td)
             return {"first_board": 0, "second_board": 0, "third_plus": 0}
 
-        # 从 "封板资金"、"涨停统计" 等列判断连板数
-        # akshare 返回的列中包含 "连板数" 或 "board" 相关字段
-        records = df.to_dict("records")
         first_board = 0
         second_board = 0
         third_plus = 0
-        for r in records:
-            board_count = r.get("连板数", r.get("连续涨停", 0))
-            if board_count == 0:
-                # 很多情况下连板数为 0 也是首板
-                first_board += 1
-            elif board_count == 1:
+        for record in df.to_dict("records"):
+            board_count = record.get("连板数", record.get("连续涨停", 1))
+            try:
+                board_count = int(board_count)
+            except (TypeError, ValueError):
+                board_count = 1
+            if board_count <= 1:
                 first_board += 1
             elif board_count == 2:
                 second_board += 1
             else:
                 third_plus += 1
+        return {
+            "first_board": first_board,
+            "second_board": second_board,
+            "third_plus": third_plus,
+            "data_source": "akshare",
+        }
+    except Exception as exc:
+        logger.warning("limit-up tiers failed: %s", exc)
+        return {"first_board": 0, "second_board": 0, "third_plus": 0, "data_source": "akshare"}
 
-        return {"first_board": first_board, "second_board": second_board, "third_plus": third_plus}
-    except ImportError:
-        logger.warning("akshare not installed, using default limit-up data")
-        return {"first_board": 0, "second_board": 0, "third_plus": 0}
-    except Exception as e:
-        logger.warning("涨停板数据获取失败: %s", e)
-        return {"first_board": 0, "second_board": 0, "third_plus": 0}
+
+def get_dragon_tiger_akshare(trade_date: str | None = None) -> list[dict[str, Any]]:
+    ak = _get_akshare()
+    td = _fmt_yyyymmdd(trade_date, date.today())
+    for fn_name in ("stock_lhb_detail_em", "stock_lhb_stock_statistic_em"):
+        fn = getattr(ak, fn_name, None)
+        if fn is None:
+            continue
+        try:
+            df = fn(date=td)
+            if df is not None and not df.empty:
+                return _with_source(df.head(20).to_dict("records"), "akshare")
+        except Exception as exc:
+            logger.debug("akshare %s failed: %s", fn_name, exc)
+    return []
 
 
-def get_sector_tushare_full(top_n: int = 10) -> list[dict[str, Any]]:
-    """获取板块完整数据 (含涨跌幅排名)"""
+def get_margin_akshare(trade_date: str | None = None) -> list[dict[str, Any]]:
+    ak = _get_akshare()
     try:
-        import tushare as ts
-        pro = _get_tushare().pro_api()
-        df = pro.ths_index()
+        df = ak.stock_margin_detail_sse(date=_fmt_yyyymmdd(trade_date, date.today()))
         if df is not None and not df.empty:
-            return df.head(top_n).to_dict("records")
-    except Exception as e:
-        logger.warning("tushare sector full failed: %s", e)
+            return _with_source(df.head(20).to_dict("records"), "akshare")
+    except Exception as exc:
+        logger.warning("akshare margin failed: %s", exc)
     return []
 
 
 def get_factors_computed(code: str = "", sector: str = "") -> list[dict[str, Any]]:
-    """因子数据 — 通过 FactorCalculator 从行情数据实时计算
-
-    1. 获取近 365 天的日K
-    2. 用 FactorCalculator 计算六因子
-    3. 返回最新一期的因子值
-    """
     if not code:
         return []
 
     from .cleaner import DataCleaner
     from .factors import FactorCalculator
+    from .vendor_router import route_to_vendor
 
     try:
-        # 通过路由获取日K (优先 tushare, 降级 akshare)
-        from .vendor_router import route_to_vendor
         daily = route_to_vendor("get_daily", code=code)
         if isinstance(daily, str) or not daily:
             return []
-
         df = DataCleaner.clean_daily(daily)
         if df.empty:
             return []
-
-        # 计算因子
         df = FactorCalculator.run_all(df)
-        if df.empty:
-            return []
-
-        # 取最新一行
         latest = df.iloc[-1].to_dict()
-        result = [{
+        return [{
             "code": code,
             "name": latest.get("name", ""),
             "sector": sector,
@@ -346,88 +453,54 @@ def get_factors_computed(code: str = "", sector: str = "") -> list[dict[str, Any
             "liquidity_score": latest.get("amihud"),
             "composite_score": latest.get("composite_score"),
             "factor_warning": None,
+            "data_source": latest.get("data_source", ""),
         }]
-        return result
-    except Exception as e:
-        logger.warning("因子计算失败 %s: %s", code, e)
+    except Exception as exc:
+        logger.warning("factor calculation failed for %s: %s", code, exc)
         return []
 
 
 def check_crowding_stub(sector: str = "") -> dict[str, Any]:
-    """因子拥挤度 (stub)"""
-    return {"is_crowded": False, "warnings": []}
+    return {"is_crowded": False, "warnings": [], "data_source": "deterministic_stub"}
 
 
-def find_similar_stub(sentiment: str = "", sector: str = "",
-                       event_type: str = "") -> dict[str, Any]:
-    """相似历史情境 (stub)"""
-    return {"sample_size": 0, "win_rate": 0, "avg_excess_return": 0, "confidence": "low"}
+def find_similar_stub(sentiment: str = "", sector: str = "", event_type: str = "") -> dict[str, Any]:
+    return {
+        "sample_size": 0,
+        "win_rate": 0,
+        "avg_excess_return": 0,
+        "confidence": "low",
+        "data_source": "deterministic_stub",
+    }
 
 
-def get_dragon_tiger_tushare(trade_date: str | None = None) -> list[dict[str, Any]]:
-    """龙虎榜数据 (A股特有)"""
-    pro = _get_tushare().pro_api()
-    td = trade_date or date.today().strftime("%Y%m%d")
-    try:
-        df = pro.lhb(start_date=td, end_date=td)
-        if df is not None and not df.empty:
-            return df.to_dict("records")[:20]
-    except Exception as e:
-        logger.warning("tushare dragon_tiger failed: %s", e)
-    return []
+def register_all_vendors() -> None:
+    """Register free vendor adapters."""
 
-
-def get_margin_tushare(trade_date: str | None = None) -> list[dict[str, Any]]:
-    """融资融券数据 (A股特有)"""
-    pro = _get_tushare().pro_api()
-    td = trade_date or date.today().strftime("%Y%m%d")
-    try:
-        df = pro.margin(start_date=td, end_date=td)
-        if df is not None and not df.empty:
-            return df.to_dict("records")[:20]
-    except Exception as e:
-        logger.warning("tushare margin failed: %s", e)
-    return []
-
-
-# ============================================================
-# 注册供应商实现
-# ============================================================
-
-def register_all_vendors():
-    """注册所有供应商实现到路由系统"""
-    # 行情
-    register_vendor_impl("get_daily", "tushare", get_daily_tushare)
     register_vendor_impl("get_daily", "akshare", get_daily_akshare)
-    # 资金流
-    register_vendor_impl("get_capital_flow", "tushare", get_capital_flow_tushare)
+    register_vendor_impl("get_daily", "baostock", get_daily_baostock)
+    register_vendor_impl("get_daily", "yfinance", get_daily_yfinance)
+
     register_vendor_impl("get_capital_flow", "akshare", get_capital_flow_akshare)
-    # 新闻
     register_vendor_impl("get_news", "akshare", get_news_akshare)
-    # 板块
-    register_vendor_impl("get_sector", "tushare", get_sector_tushare_full)
     register_vendor_impl("get_sector", "akshare", get_sector_akshare)
-    # 财务
-    register_vendor_impl("get_financial", "tushare", get_financial_tushare)
-    # 风控
-    register_vendor_impl("get_suspended", "tushare", get_suspended_tushare)
-    register_vendor_impl("get_st_status", "tushare", get_st_status_tushare)
-    # A股特有: 北向资金
-    register_vendor_impl("get_northbound_flow", "tushare", get_northbound_flow_tushare)
+    register_vendor_impl("get_financial", "akshare", get_financial_akshare)
+
+    register_vendor_impl("get_suspended", "akshare", get_suspended_akshare)
+    register_vendor_impl("get_suspended", "baostock", get_suspended_baostock)
+    register_vendor_impl("get_st_status", "akshare", get_st_status_akshare)
+    register_vendor_impl("get_delisting", "akshare", get_delisting_akshare)
+
     register_vendor_impl("get_northbound_flow", "akshare", get_northbound_flow_akshare)
-    # A股特有: 涨停梯队
-    register_vendor_impl("get_limit_up_tiers", "tushare", get_limit_up_tiers_akshare)
     register_vendor_impl("get_limit_up_tiers", "akshare", get_limit_up_tiers_akshare)
-    # A股特有: 龙虎榜
-    register_vendor_impl("get_dragon_tiger", "tushare", get_dragon_tiger_tushare)
-    # A股特有: 融资融券
-    register_vendor_impl("get_margin", "tushare", get_margin_tushare)
-    # 分析数据
-    register_vendor_impl("get_factors", "tushare", get_factors_computed)
+    register_vendor_impl("get_dragon_tiger", "akshare", get_dragon_tiger_akshare)
+    register_vendor_impl("get_margin", "akshare", get_margin_akshare)
+
     register_vendor_impl("get_factors", "akshare", get_factors_computed)
-    register_vendor_impl("check_crowding", "tushare", check_crowding_stub)
-    register_vendor_impl("find_similar", "tushare", find_similar_stub)
+    register_vendor_impl("get_factors", "baostock", get_factors_computed)
+    register_vendor_impl("get_factors", "yfinance", get_factors_computed)
+    register_vendor_impl("check_crowding", "akshare", check_crowding_stub)
+    register_vendor_impl("find_similar", "akshare", find_similar_stub)
 
 
-# 自动注册
 register_all_vendors()

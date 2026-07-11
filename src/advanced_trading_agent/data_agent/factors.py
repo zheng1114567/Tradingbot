@@ -7,9 +7,6 @@
 from __future__ import annotations
 
 import logging
-from datetime import date, datetime
-from typing import Any
-
 import numpy as np
 import pandas as pd
 
@@ -117,7 +114,8 @@ class FactorCalculator:
     def volatility(df: pd.DataFrame, periods: int = 20) -> pd.DataFrame:
         """N 日年化波动率"""
         if "pct_chg" in df.columns and len(df) > periods:
-            df["volatility"] = df["pct_chg"].rolling(periods).std() * np.sqrt(252)
+            returns = df["pct_chg"] / 100
+            df["volatility"] = returns.rolling(periods).std() * np.sqrt(252)
         return df
 
     @staticmethod
@@ -137,16 +135,18 @@ class FactorCalculator:
         """换手率"""
         if "turnover" in df.columns:
             return df
-        if "volume" in df.columns and "close" in df.columns:
-            # 简单估算: 成交额/流通市值 近似
-            df["turnover"] = df["volume"] * df["close"]
+        if "turnover_rate" in df.columns:
+            df["turnover"] = df["turnover_rate"] / 100
+        elif "volume" in df.columns and "float_shares" in df.columns:
+            df["turnover"] = df["volume"] / df["float_shares"].replace(0, np.nan)
         return df
 
     @staticmethod
     def amihud_illiquidity(df: pd.DataFrame, periods: int = 20) -> pd.DataFrame:
         """Amihud 非流动性指标 (越大越不流动)"""
         if "pct_chg" in df.columns and "amount" in df.columns and len(df) > periods:
-            df["amihud"] = (df["pct_chg"].abs() / df["amount"].replace(0, np.nan))
+            ret = df["pct_chg"].abs() / 100
+            df["amihud"] = ret / df["amount"].replace(0, np.nan)
             df["amihud"] = df["amihud"].replace([np.inf, -np.inf], np.nan)
         return df
 
@@ -188,7 +188,10 @@ class FactorCalculator:
             valid = df[factor].notna() & (~np.isinf(df[factor].replace([np.inf, -np.inf], np.nan)))
             if valid.sum() < 10:
                 continue
-            z = (df[factor] - df[factor].mean()) / df[factor].std().replace(0, np.nan)
+            std = df.loc[valid, factor].std()
+            if pd.isna(std) or std == 0:
+                continue
+            z = (df[factor] - df.loc[valid, factor].mean()) / std
             score += z.fillna(0) * weight
         df["composite_score"] = score
         return df
@@ -208,6 +211,7 @@ class FactorCalculator:
         df = FactorCalculator.ma_trend(df)
         df = FactorCalculator.volatility(df)
         df = FactorCalculator.max_drawdown(df)
+        df = FactorCalculator.turnover_rate(df)
         df = FactorCalculator.amihud_illiquidity(df)
         df = FactorCalculator.composite_score(df)
         n_added = len(df.columns) - n_before

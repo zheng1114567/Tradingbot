@@ -16,6 +16,7 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+import numpy as np
 import pandas as pd
 
 from ..config import config
@@ -54,8 +55,10 @@ class DataAgentRequest:
     trade_date: str | None = None
     start_date: str | None = None
     end_date: str | None = None
+    include_market: bool = True
     include_capital_flow: bool = True
     include_factors: bool = True
+    include_risk: bool = True
     use_react_planner: bool = False
     output_dir: str | None = None
     max_return_records: int = 20
@@ -114,6 +117,10 @@ class DataAgent:
         self._planner = planner or DataAgentPlanner()
 
     def run(self, request: DataAgentRequest) -> DataAgentRun:
+        # Ensure the free vendor adapters are available when DataAgent is used standalone.
+        from .collector import register_all_vendors
+
+        register_all_vendors()
         run_dir = self._make_run_dir(request)
         manifest = DataManifest(
             ticker=request.ticker,
@@ -138,8 +145,14 @@ class DataAgent:
             "planner": plan_payload,
             "vendor_chain": {
                 "daily": get_vendor_chain("get_daily"),
+                "market": get_vendor_chain("get_daily"),
                 "capital_flow": get_vendor_chain("get_capital_flow"),
                 "factors": get_vendor_chain("get_factors"),
+                "risk": {
+                    "st_status": get_vendor_chain("get_st_status"),
+                    "suspended": get_vendor_chain("get_suspended"),
+                    "delisting": get_vendor_chain("get_delisting"),
+                },
             },
         }
         artifacts["input"] = self._write_json(run_dir / "01_input" / "request.json", input_payload)
@@ -155,6 +168,15 @@ class DataAgent:
             run_dir / "04_analysis" / "analysis_data.json",
             analysis_payload,
         )
+        agent_payload = {
+            "stage": "agent_payload",
+            "created_at": _utc_now(),
+            **analysis_payload.get("agent_payload", {}),
+        }
+        artifacts["agent_payload"] = self._write_json(
+            run_dir / "05_agent_payload" / "agent_payload.json",
+            agent_payload,
+        )
 
         final_payload = {
             "stage": "final",
@@ -163,12 +185,13 @@ class DataAgent:
             "raw": raw_payload,
             "cleaned": cleaned_payload,
             "analysis": analysis_payload,
+            "agent_payload": agent_payload,
             "planner": plan_payload,
             "manifest": manifest.to_dict(),
         }
-        artifacts["final"] = self._write_json(run_dir / "05_final" / "response.json", final_payload)
+        artifacts["final"] = self._write_json(run_dir / "06_final" / "response.json", final_payload)
 
-        manifest_path = manifest.save(results_dir=str(run_dir / "05_final"))
+        manifest_path = manifest.save(results_dir=str(run_dir / "06_final"))
 
         return DataAgentRun(
             run_id=run_dir.name,
@@ -197,6 +220,16 @@ class DataAgent:
             start_date=request.start_date,
             end_date=request.normalized_end_date(),
         )
+        market = []
+        if request.include_market:
+            market = self._safe_route(
+                "get_daily",
+                manifest,
+                field_name="market.daily",
+                code="000001.SH",
+                start_date=request.start_date or request.normalized_end_date(),
+                end_date=request.normalized_end_date(),
+            )
         capital_flow = []
         if request.include_capital_flow:
             capital_flow = self._safe_route(
@@ -207,12 +240,30 @@ class DataAgent:
                 start_date=request.start_date,
                 end_date=request.normalized_end_date(),
             )
+        st_status: list[str] | dict[str, Any] = []
+        suspended: list[str] | dict[str, Any] = []
+        delisting: list[str] | dict[str, Any] = []
+        if request.include_risk:
+            st_status = self._safe_route("get_st_status", manifest, field_name="risk.st_status")
+            suspended = self._safe_route(
+                "get_suspended",
+                manifest,
+                field_name="risk.suspended",
+                trade_date=request.normalized_trade_date(),
+            )
+            delisting = self._safe_route("get_delisting", manifest, field_name="risk.delisting")
 
         return {
             "stage": "raw",
             "created_at": _utc_now(),
             "daily": daily,
+            "market": market,
             "capital_flow": capital_flow,
+            "risk": {
+                "st_status": st_status,
+                "suspended": suspended,
+                "delisting": delisting,
+            },
         }
 
     def _safe_route(
@@ -262,10 +313,21 @@ class DataAgent:
 
         capital_flow_raw = raw_payload.get("capital_flow")
         capital_flow = capital_flow_raw if isinstance(capital_flow_raw, list) else []
+        market_raw = raw_payload.get("market")
+        if isinstance(market_raw, list):
+            market_df = DataCleaner.clean_daily(market_raw)
+        else:
+            market_df = pd.DataFrame()
+        risk_raw = raw_payload.get("risk", {})
 
         return {
             "stage": "cleaned",
             "created_at": _utc_now(),
+            "market": {
+                "record_count": int(len(market_df)),
+                "columns": list(market_df.columns),
+                "records": _records_from_frame(market_df),
+            },
             "daily": {
                 "record_count": int(len(daily_df)),
                 "columns": list(daily_df.columns),
@@ -275,12 +337,16 @@ class DataAgent:
                 "record_count": len(capital_flow),
                 "records": capital_flow,
             },
+            "risk": risk_raw if isinstance(risk_raw, dict) else {},
         }
 
     def _analyze(self, cleaned_payload: dict[str, Any], request: DataAgentRequest) -> dict[str, Any]:
         daily_records = cleaned_payload.get("daily", {}).get("records", [])
+        market_records = cleaned_payload.get("market", {}).get("records", [])
         daily_df = pd.DataFrame(daily_records)
+        market_df = pd.DataFrame(market_records)
         factor_records: list[dict[str, Any]] = []
+        capital_summary = self._summarize_capital(cleaned_payload.get("capital_flow", {}).get("records", []))
         summary: dict[str, Any] = {
             "ticker": request.ticker,
             "record_count": int(len(daily_df)),
@@ -308,19 +374,174 @@ class DataAgent:
             factor_df = FactorCalculator.run_all(daily_df.copy())
             factor_records = _records_from_frame(factor_df, limit=request.max_return_records)
 
+        market_summary = self._summarize_market(market_df)
+        risk_summary = self._summarize_risk(
+            cleaned_payload.get("risk", {}),
+            latest=summary.get("latest") if isinstance(summary.get("latest"), dict) else {},
+        )
+        tier1, tier2 = self._build_agent_payload(
+            request=request,
+            summary=summary,
+            market_summary=market_summary,
+            capital_summary=capital_summary,
+            risk_summary=risk_summary,
+            daily_records=daily_records,
+            factor_records=factor_records,
+        )
+
         return {
             "stage": "analysis",
             "created_at": _utc_now(),
             "summary": summary,
+            "market": market_summary,
+            "capital": capital_summary,
+            "risk": risk_summary,
             "factors": {
                 "record_count": len(factor_records),
                 "records": factor_records,
             },
+            "agent_payload": {
+                "tier1_data": tier1,
+                "tier2_data": tier2,
+            },
         }
+
+    @classmethod
+    def _summarize_market(cls, market_df: pd.DataFrame) -> dict[str, Any]:
+        if market_df.empty:
+            return {
+                "index_close": 0,
+                "index_change_pct": 0,
+                "sentiment": "未知",
+                "sentiment_score": 50,
+            }
+        if "trade_date" in market_df.columns:
+            market_df["trade_date"] = pd.to_datetime(market_df["trade_date"], errors="coerce")
+            market_df = market_df.sort_values("trade_date")
+        latest = market_df.iloc[-1].to_dict()
+        pct = cls._json_safe_value(latest.get("pct_chg")) or 0
+        try:
+            pct_value = float(pct)
+        except (TypeError, ValueError):
+            pct_value = 0.0
+        if pct_value <= -2:
+            sentiment = "低迷"
+            score = 35
+        elif pct_value >= 2:
+            sentiment = "温热"
+            score = 65
+        else:
+            sentiment = "正常"
+            score = 55
+        return {
+            "index_close": cls._json_safe_value(latest.get("close")) or 0,
+            "index_change_pct": pct_value,
+            "sentiment": sentiment,
+            "sentiment_score": score,
+            "data_source": latest.get("data_source", ""),
+        }
+
+    @classmethod
+    def _summarize_capital(cls, records: list[dict[str, Any]]) -> dict[str, Any]:
+        if not records:
+            return {
+                "sector_name": "",
+                "sector_volume_cny": 0,
+                "net_inflow_main": 0,
+                "net_inflow_retail": 0,
+                "consecutive_inflow_days": 0,
+                "confirmation": "未知",
+            }
+        latest = records[-1]
+        candidates = [
+            "主力净流入-净额",
+            "主力净流入",
+            "net_inflow_main",
+            "net_mf_amount",
+        ]
+        net = 0.0
+        for key in candidates:
+            if key in latest:
+                parsed = cls._parse_number(latest.get(key))
+                if parsed is not None:
+                    net = parsed
+                    break
+        confirmation = "资金确认" if net > 0 else "资金背离" if net < 0 else "未知"
+        return {
+            "sector_name": latest.get("sector_name", latest.get("code", "")),
+            "sector_volume_cny": cls._parse_number(latest.get("amount")) or 0,
+            "net_inflow_main": net,
+            "net_inflow_retail": cls._parse_number(latest.get("散户净流入-净额")) or 0,
+            "consecutive_inflow_days": 1 if net > 0 else 0,
+            "confirmation": confirmation,
+            "data_source": latest.get("data_source", ""),
+        }
+
+    @classmethod
+    def _summarize_risk(cls, risk_raw: dict[str, Any], *, latest: dict[str, Any]) -> dict[str, Any]:
+        errors: list[str] = []
+        lists: dict[str, list[Any]] = {}
+        for field in ["st_status", "suspended", "delisting"]:
+            value = risk_raw.get(field)
+            if isinstance(value, list):
+                lists[field] = value
+            else:
+                lists[field] = []
+                if isinstance(value, dict) and value.get("error"):
+                    errors.append(f"{field}: {value['error']}")
+        return {
+            "st_list": lists["st_status"],
+            "suspended_list": lists["suspended"],
+            "delisting_list": lists["delisting"],
+            "daily_volume": cls._json_safe_value(latest.get("amount")),
+            "is_limit_up": bool(latest.get("is_limit_up", False)),
+            "is_limit_down": bool(latest.get("is_limit_down", False)),
+            "risk_data_available": not errors,
+            "risk_data_errors": errors,
+        }
+
+    @staticmethod
+    def _build_agent_payload(
+        *,
+        request: DataAgentRequest,
+        summary: dict[str, Any],
+        market_summary: dict[str, Any],
+        capital_summary: dict[str, Any],
+        risk_summary: dict[str, Any],
+        daily_records: list[dict[str, Any]],
+        factor_records: list[dict[str, Any]],
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        tier1 = {
+            "market": {
+                "index_close": market_summary.get("index_close", 0),
+                "index_change_pct": market_summary.get("index_change_pct", 0),
+                "advance_count": 0,
+                "decline_count": 0,
+                "limit_up_count": 0,
+                "limit_down_count": 0,
+            },
+            "sentiment": {
+                "sentiment": market_summary.get("sentiment", "未知"),
+                "sentiment_score": market_summary.get("sentiment_score", 50),
+            },
+            "capital": capital_summary,
+            "risk": risk_summary,
+        }
+        tier2 = {
+            "price_data": daily_records,
+            "factors": factor_records,
+            "events": [],
+            "backtest_samples": [],
+            "data_summary": summary,
+        }
+        return tier1, tier2
 
     def _write_json(self, path: Path, payload: dict[str, Any]) -> DataAgentArtifact:
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2, default=self._json_default),
+            encoding="utf-8",
+        )
         return DataAgentArtifact(
             stage=str(payload.get("stage", path.parent.name)),
             path=str(path),
@@ -351,6 +572,33 @@ class DataAgent:
         if hasattr(value, "isoformat"):
             return value.isoformat()
         return value
+
+    @staticmethod
+    def _json_default(value: Any) -> Any:
+        if pd.isna(value):
+            return None
+        if hasattr(value, "isoformat"):
+            return value.isoformat()
+        if isinstance(value, np.integer):
+            return int(value)
+        if isinstance(value, np.floating):
+            return float(value)
+        if isinstance(value, np.bool_):
+            return bool(value)
+        raise TypeError(f"Object of type {value.__class__.__name__} is not JSON serializable")
+
+    @staticmethod
+    def _parse_number(value: Any) -> float | None:
+        if value is None or pd.isna(value):
+            return None
+        if isinstance(value, str):
+            value = value.replace(",", "").strip()
+            if value in {"", "-", "--", "None", "nan"}:
+                return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
 
     @classmethod
     def _json_safe_record(cls, record: dict[str, Any]) -> dict[str, Any]:

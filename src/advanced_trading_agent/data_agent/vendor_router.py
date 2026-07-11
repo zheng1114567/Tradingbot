@@ -1,8 +1,8 @@
 """
-数据供应商路由 — 借鉴 TradingAgents' interface.py + config.py
+数据供应商路由 — 免费数据源优先
 
 核心设计:
-- 按工具粒度配置数据源 (e.g. "market_data": "tushare,akshare")
+- 按工具粒度配置数据源 (e.g. "market_data": "akshare,baostock,yfinance")
 - 有序降级链: 第一个挂了自动试下一个
 - 错误类型分级: 决定是否终止运行
 
@@ -64,8 +64,9 @@ class VendorFatalError(VendorError):
 # ============================================================
 
 class DataVendor(str, Enum):
-    TUSHARE = "tushare"
     AKSHARE = "akshare"
+    BAOSTOCK = "baostock"
+    YFINANCE = "yfinance"
 
 
 # 工具分类
@@ -96,6 +97,10 @@ TOOL_CATEGORIES = {
             "get_margin",              # 融资融券
         ],
     },
+    "risk_data": {
+        "description": "风险基础数据",
+        "tools": ["get_suspended", "get_st_status", "get_delisting"],
+    },
     "analysis": {
         "description": "分析数据",
         "tools": [
@@ -116,8 +121,8 @@ def get_vendor_for_tool(method: str) -> str:
             primary = [v.strip() for v in vendor_config.split(",") if v.strip()]
             if primary:
                 return primary[0]
-            return DataVendor.TUSHARE.value
-    return DataVendor.TUSHARE.value
+            return DataVendor.AKSHARE.value
+    return DataVendor.AKSHARE.value
 
 
 def get_vendor_chain(method: str) -> list[str]:
@@ -126,8 +131,8 @@ def get_vendor_chain(method: str) -> list[str]:
         if method in info["tools"]:
             vendor_config = config.get("data_vendors", {}).get(category, "")
             chain = [v.strip() for v in vendor_config.split(",") if v.strip()]
-            return chain if chain else [DataVendor.TUSHARE.value]
-    return [DataVendor.TUSHARE.value]
+            return chain if chain else [DataVendor.AKSHARE.value]
+    return [DataVendor.AKSHARE.value]
 
 
 # ============================================================

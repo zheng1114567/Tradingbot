@@ -771,17 +771,64 @@ def get_sector_constituents_efinance(sector_name: str = "") -> list[dict[str, An
     return []
 
 
+# ------------------------------------------------------------------
+# local_cache adapters (baostock-based, zero eastmoney dependency)
+# ------------------------------------------------------------------
+
+
+def get_sector_local(top_n: int = 10) -> list[dict[str, Any]]:
+    """Sector ranking from local baostock cache."""
+    from .local_cache import get_cached_sector_data
+
+    try:
+        data = get_cached_sector_data(top_n=top_n)
+        if not data:
+            raise NoMarketDataError("Local sector cache is empty — run build_full_cache first", vendor="local_cache")
+        return data
+    except ImportError:
+        raise VendorNotConfiguredError("local_cache requires baostock", vendor="local_cache")
+
+
+def get_sector_constituents_local(sector_name: str = "") -> list[dict[str, Any]]:
+    """Sector constituents from local baostock cache."""
+    from .local_cache import get_cached_sector_constituents
+
+    try:
+        data = get_cached_sector_constituents(sector_name)
+        if not data:
+            raise NoMarketDataError(f"No cached constituents for {sector_name}", vendor="local_cache")
+        return data
+    except ImportError:
+        raise VendorNotConfiguredError("local_cache requires baostock", vendor="local_cache")
+
+
+def get_daily_local(code: str = "", start_date: str | None = None,
+                    end_date: str | None = None) -> list[dict[str, Any]]:
+    """Daily OHLCV from local baostock parquet cache."""
+    from .local_cache import get_cached_daily
+
+    try:
+        data = get_cached_daily(code, start_date, end_date)
+        if not data:
+            raise NoMarketDataError(f"No cached daily data for {code}", symbol=code, vendor="local_cache")
+        return data
+    except ImportError:
+        raise VendorNotConfiguredError("local_cache requires baostock", vendor="local_cache")
+
+
 def register_all_vendors() -> None:
     """Register free vendor adapters."""
 
     register_vendor_impl("get_daily", "akshare", get_daily_akshare)
     register_vendor_impl("get_daily", "baostock", get_daily_baostock)
+    register_vendor_impl("get_daily", "local_cache", get_daily_local)
 
     register_vendor_impl("get_capital_flow", "akshare", get_capital_flow_akshare)
     register_vendor_impl("get_news", "akshare", get_news_akshare)
     register_vendor_impl("get_news", "sina", get_news_sina)
     register_vendor_impl("get_sector", "akshare", get_sector_akshare)
     register_vendor_impl("get_sector", "eastmoney", get_sector_eastmoney)
+    register_vendor_impl("get_sector", "local_cache", get_sector_local)
     register_vendor_impl("get_financial", "akshare", get_financial_akshare)
 
     register_vendor_impl("get_suspended", "akshare", get_suspended_akshare)
@@ -797,6 +844,7 @@ def register_all_vendors() -> None:
     register_vendor_impl("get_margin", "akshare", get_margin_akshare)
     register_vendor_impl("get_sector_constituents", "akshare", get_sector_constituents_akshare)
     register_vendor_impl("get_sector_constituents", "efinance", get_sector_constituents_efinance)
+    register_vendor_impl("get_sector_constituents", "local_cache", get_sector_constituents_local)
 
     register_vendor_impl("get_factors", "akshare", get_factors_computed)
     register_vendor_impl("get_factors", "baostock", get_factors_computed)

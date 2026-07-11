@@ -131,16 +131,30 @@ class HardRiskController:
                               proposed_pct: float) -> RiskVerdict:
         """仓位限制"""
         total = current_position_pct + proposed_pct
+        reasons = []
+        actions = []
         if proposed_pct > self.max_single_pct:
-            return RiskVerdict(
-                verdict=RiskVerdictType.SOFT_VETO,
-                reasons=[f"单票仓位 {proposed_pct:.1%} > 上限 {self.max_single_pct:.0%}"],
-                suggested_actions=[f"建议降至 {self.max_single_pct:.0%} 以下"],
-            )
+            reasons.append(f"单票仓位 {proposed_pct:.1%} > 上限 {self.max_single_pct:.0%}")
+            actions.append(f"建议降至 {self.max_single_pct:.0%} 以下")
         if total > self.max_total_pct:
+            reasons.append(f"总仓位 {total:.1%} > 上限 {self.max_total_pct:.0%}")
+        if reasons:
             return RiskVerdict(
                 verdict=RiskVerdictType.SOFT_VETO,
-                reasons=[f"总仓位 {total:.1%} > 上限 {self.max_total_pct:.0%}"],
+                reasons=reasons,
+                suggested_actions=actions,
+            )
+        return RiskVerdict()
+
+    def check_sector_limit(self, current_sector_pct: float,
+                           proposed_pct: float) -> RiskVerdict:
+        """单板块仓位限制"""
+        total = current_sector_pct + proposed_pct
+        if total > self.max_sector_pct:
+            return RiskVerdict(
+                verdict=RiskVerdictType.SOFT_VETO,
+                reasons=[f"单板块仓位 {total:.1%} > 上限 {self.max_sector_pct:.0%}"],
+                suggested_actions=[f"建议降低本次仓位或将板块暴露控制在 {self.max_sector_pct:.0%} 内"],
             )
         return RiskVerdict()
 
@@ -155,6 +169,7 @@ class HardRiskController:
                    estimated_impact_bps: float = 0,
                    expected_return_bps: float = 0,
                    current_position_pct: float = 0,
+                   current_sector_pct: float = 0,
                    proposed_pct: float = 0.10,
                    st_list: list[str] | None = None,
                    suspended_list: list[str] | None = None,
@@ -199,6 +214,16 @@ class HardRiskController:
             if pos_result.verdict == RiskVerdictType.HARD_VETO:
                 return pos_result
             if pos_result.verdict == RiskVerdictType.SOFT_VETO:
+                worst_verdict = RiskVerdictType.SOFT_VETO
+
+        # 行业/板块仓位检查
+        sector_result = self.check_sector_limit(current_sector_pct, proposed_pct)
+        if sector_result.verdict != RiskVerdictType.PASS:
+            all_reasons.extend(sector_result.reasons)
+            all_actions.extend(sector_result.suggested_actions)
+            if sector_result.verdict == RiskVerdictType.HARD_VETO:
+                return sector_result
+            if sector_result.verdict == RiskVerdictType.SOFT_VETO:
                 worst_verdict = RiskVerdictType.SOFT_VETO
 
         if all_reasons:

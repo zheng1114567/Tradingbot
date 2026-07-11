@@ -57,6 +57,14 @@ class TestHardRisk:
         )
         assert verdict.verdict == RiskVerdictType.PASS
 
+    def test_sector_limit_warning(self):
+        verdict = self.controller.check_sector_limit(
+            current_sector_pct=0.28,
+            proposed_pct=0.05,
+        )
+        assert verdict.verdict == RiskVerdictType.SOFT_VETO
+        assert "单板块仓位" in verdict.reasons[0]
+
 
 class TestSoftRisk:
     """测试软风控"""

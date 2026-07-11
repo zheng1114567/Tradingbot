@@ -483,6 +483,81 @@ class TestSystemAgent:
         assert decision.decision == DecisionType.REJECT
         assert decision.risk_verdict == RiskVerdict.HARD_VETO
 
+    def test_final_risk_check_1_soft_veto_blocks_recommendation(self, base_state):
+        llm = MockLLM(return_value=SystemDecision(
+            decision=DecisionType.RECOMMEND,
+            position=0.1,
+            alpha_source=["mock"],
+            horizon_days=5,
+            reasons=["LLM wants to recommend"],
+            objections=[],
+            risk_verdict=RiskVerdict.PASS,
+            reasoning="mock",
+        ))
+        sa = create_system_agent(llm)
+        state = {
+            **base_state,
+            "market_report_obj": _default_for(MarketReport),
+            "event_report_obj": _default_for(EventReport),
+            "analysis_report_obj": _default_for(AnalysisReport),
+            "backtest_report_obj": _default_for(BacktestReport),
+            "risk_check_1": {
+                "verdict": "SOFT_VETO",
+                "reasons": ["风险基础数据缺失，无法确认 ST/停牌/退市状态"],
+            },
+            "risk_check_2": {"verdict": "PASS", "reasons": []},
+            "risk_check_3": {"verdict": "PASS", "reasons": []},
+        }
+
+        result = sa["final"](state)
+        decision = result["system_decision_obj"]
+
+        assert decision.decision == DecisionType.WATCH
+        assert decision.risk_verdict == RiskVerdict.SOFT_VETO
+        assert "风险基础数据缺失，无法确认 ST/停牌/退市状态" in decision.objections
+        assert result["system_rubric"]["recommendation_floor"] == DecisionType.WATCH.value
+
+    def test_final_position_and_sector_risk_caps_recommendation(self, base_state):
+        llm = MockLLM(return_value=SystemDecision(
+            decision=DecisionType.RECOMMEND,
+            position=0.2,
+            alpha_source=["mock"],
+            horizon_days=5,
+            reasons=["LLM wants to recommend"],
+            objections=[],
+            risk_verdict=RiskVerdict.PASS,
+            reasoning="mock",
+        ))
+        sa = create_system_agent(llm)
+        state = {
+            **base_state,
+            "market_report_obj": _default_for(MarketReport),
+            "event_report_obj": _default_for(EventReport),
+            "analysis_report_obj": _default_for(AnalysisReport),
+            "backtest_report_obj": _default_for(BacktestReport),
+            "risk_check_1": {"verdict": "PASS", "reasons": []},
+            "risk_check_2": {"verdict": "PASS", "reasons": []},
+            "risk_check_3": {"verdict": "PASS", "reasons": []},
+            "tier1_data": {
+                **base_state["tier1_data"],
+                "risk": {
+                    "current_position": 0.58,
+                    "current_sector_position": 0.28,
+                    "proposed_position": 0.2,
+                    "daily_volume": 100_000_000,
+                },
+            },
+        }
+
+        result = sa["final"](state)
+        decision = result["system_decision_obj"]
+
+        assert decision.decision == DecisionType.WATCH
+        assert decision.risk_verdict == RiskVerdict.SOFT_VETO
+        assert decision.position == 0
+        assert any("总仓位" in item for item in decision.objections)
+        assert any("单板块仓位" in item for item in decision.objections)
+
 
 # ============================================================
 # Report Agent 测试

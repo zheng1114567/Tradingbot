@@ -25,6 +25,7 @@ from typing import Any
 from ..core.cache_manager import Tier1Data, WINTER_SENTIMENTS, decide_tier2_loading
 from ..core.data_quality import DataQualityChecker
 from ..llm.client import LLMClient
+from ..risk.hard_risk import HardRiskController, RiskVerdictType
 from ..risk.soft_risk import SignalType, SoftRiskController
 from .contract import basic_self_check, build_node_audit_update
 from .schemas import DecisionType, RiskVerdict, SystemDecision, SystemRubric
@@ -46,6 +47,8 @@ def _build_system_rubric(
     analysis_rpt: Any,
     backtest_rpt: Any,
     memory_ctx: str,
+    risk1: dict[str, Any],
+    risk_overlay: dict[str, Any],
     risk3_verdict: str,
     risk3_reasons: list[str],
     risk2: dict[str, Any],
@@ -120,12 +123,24 @@ def _build_system_rubric(
         support.append("存在同标的历史复盘记忆")
 
     risk_score = 2
-    if risk3_verdict == "HARD_VETO":
+    risk1_reasons = list(risk1.get("reasons", []) or [])
+    overlay_reasons = list(risk_overlay.get("reasons", []) or [])
+    if risk1.get("verdict") == "HARD_VETO" or risk3_verdict == "HARD_VETO":
         risk_score = 0
-        forced_downgrades.extend(risk3_reasons or ["硬风控否决"])
-    elif risk3_verdict == "SOFT_VETO" or risk2.get("verdict") == "SOFT_VETO":
+        forced_downgrades.extend(risk1_reasons + risk3_reasons or ["硬风控否决"])
+    elif (
+        risk1.get("verdict") == "SOFT_VETO"
+        or risk2.get("verdict") == "SOFT_VETO"
+        or risk3_verdict == "SOFT_VETO"
+        or risk_overlay.get("verdict") == "SOFT_VETO"
+    ):
         risk_score = 1
-        forced_downgrades.extend(risk3_reasons + risk2.get("reasons", []))
+        forced_downgrades.extend(
+            risk1_reasons
+            + risk2.get("reasons", [])
+            + risk3_reasons
+            + overlay_reasons
+        )
 
     if soft_assessment.signal in (SignalType.AVOID, SignalType.SELL):
         risk_score = 0
@@ -313,9 +328,29 @@ def create_system_agent(llm: LLMClient):
         risk3 = state.get("risk_check_3", {})
         risk3_verdict = risk3.get("verdict", "PASS")
         risk3_reasons = risk3.get("reasons", [])
+        risk1 = state.get("risk_check_1", {})
         risk2 = state.get("risk_check_2", {})
         tier1_risk = state.get("tier1_data", {}).get("risk", {})
         tier2 = state.get("tier2_data", {})
+        proposed_position = tier1_risk.get("proposed_position")
+        if proposed_position is None:
+            proposed_position = getattr(state.get("system_decision_obj"), "position", None) or 0.10
+        position_verdict = HardRiskController().check_all(
+            code=ticker,
+            daily_volume_cny=tier1_risk.get("daily_volume"),
+            is_limit_up=tier1_risk.get("is_limit_up", False),
+            is_limit_down=tier1_risk.get("is_limit_down", False),
+            estimated_impact_bps=tier1_risk.get("estimated_impact_bps", 0),
+            expected_return_bps=tier1_risk.get("expected_return_bps", 0),
+            current_position_pct=tier1_risk.get("current_position", 0),
+            current_sector_pct=tier1_risk.get("current_sector_position", 0),
+            proposed_pct=proposed_position,
+        )
+        risk_overlay = {
+            "verdict": position_verdict.verdict.value,
+            "reasons": position_verdict.reasons,
+            "suggested": position_verdict.suggested_actions,
+        }
 
         # 软风控
         soft_risk = SoftRiskController()
@@ -381,6 +416,8 @@ def create_system_agent(llm: LLMClient):
             analysis_rpt=analysis_rpt,
             backtest_rpt=backtest_rpt,
             memory_ctx=memory_ctx,
+            risk1=risk1,
+            risk_overlay=risk_overlay,
             risk3_verdict=risk3_verdict,
             risk3_reasons=risk3_reasons,
             risk2=risk2,
@@ -410,7 +447,10 @@ fallback_reason={round2_fallback_reason or 'none'}
 如果 final_pressure=downgrade, 最终裁定不得为推荐。
 
 ## 硬风控
-{risk3}
+risk_check_1={risk1}
+risk_check_2={risk2}
+risk_check_3={risk3}
+position_overlay={risk_overlay}
 
 ## 软风控
 {soft_assessment}
@@ -463,9 +503,21 @@ fallback_reason={round2_fallback_reason or 'none'}
             decision.reasons = [f"硬风控3否决: {'; '.join(risk3_reasons)}"]
             decision.risk_details = risk3_reasons
             decision.reasoning = "硬风控不通过"
-        elif risk3_verdict == "SOFT_VETO" or risk2.get("verdict") == "SOFT_VETO":
+        elif (
+            risk1.get("verdict") == "SOFT_VETO"
+            or risk3_verdict == "SOFT_VETO"
+            or risk2.get("verdict") == "SOFT_VETO"
+            or risk_overlay.get("verdict") == "SOFT_VETO"
+        ):
             decision.risk_verdict = RiskVerdict.SOFT_VETO
-            decision.risk_details = risk3_reasons + risk2.get("reasons", [])
+            risk_reasons = (
+                risk1.get("reasons", [])
+                + risk2.get("reasons", [])
+                + risk3_reasons
+                + risk_overlay.get("reasons", [])
+            )
+            decision.risk_details = risk_reasons
+            decision.objections = [*decision.objections, *risk_reasons]
             if decision.decision == DecisionType.RECOMMEND:
                 decision.decision = DecisionType.WATCH
                 decision.position = 0
@@ -496,6 +548,8 @@ fallback_reason={round2_fallback_reason or 'none'}
             f"rubric_downgraded={rubric_downgraded}",
             f"round2_provider={round2_provider or 'none'}",
             f"round2_final_pressure={round2_final_pressure}",
+            f"risk1_verdict={risk1.get('verdict', 'PASS')}",
+            f"risk_overlay_verdict={risk_overlay.get('verdict', 'PASS')}",
             f"alpha_sources={len(decision.alpha_source)}",
             f"reasons={len(decision.reasons)}",
             f"objections={len(decision.objections)}",
@@ -505,6 +559,8 @@ fallback_reason={round2_fallback_reason or 'none'}
             warnings.append("推荐缺少 Alpha 来源")
         if is_veto:
             warnings.extend(risk3_reasons)
+        warnings.extend(risk1.get("reasons", []))
+        warnings.extend(risk_overlay.get("reasons", []))
         warnings.extend(soft_assessment.reasons)
 
         return build_node_audit_update(

@@ -201,6 +201,7 @@ def create_risk_check_3():
             estimated_impact_bps=risk_data.get("estimated_impact_bps", 0),
             expected_return_bps=risk_data.get("expected_return_bps", 0),
             current_position_pct=risk_data.get("current_position", 0),
+            current_sector_pct=risk_data.get("current_sector_position", 0),
             proposed_pct=proposed_pct,
         )
 

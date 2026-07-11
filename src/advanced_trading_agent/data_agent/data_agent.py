@@ -20,6 +20,7 @@ from typing import Any, Callable
 
 import numpy as np
 import pandas as pd
+import requests
 
 from ..config import config
 from .cleaner import DataCleaner
@@ -33,6 +34,9 @@ RouteFn = Callable[..., Any]
 
 
 _SAFE_PATH_PART = re.compile(r"[^A-Za-z0-9_.-]+")
+_SCRIPT_STYLE_RE = re.compile(r"<(script|style)[^>]*>.*?</\1>", re.IGNORECASE | re.DOTALL)
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
+_WHITESPACE_RE = re.compile(r"\s+")
 
 
 def _utc_now() -> str:
@@ -83,6 +87,7 @@ class DataAgentRequest:
     news_keyword: str | None = None
     sector_keyword: str | None = None
     use_llm_news_filter: bool = True
+    fetch_news_full_text: bool = True
     news_relevance_threshold: float = 0.5
     use_react_planner: bool = False
     output_dir: str | None = None
@@ -201,6 +206,14 @@ class DataAgent:
             run_dir / "04_analysis" / "analysis_data.json",
             analysis_payload,
         )
+        artifacts["news_events"] = self._write_json(
+            run_dir / "04_analysis" / "news_events.json",
+            {
+                "stage": "news_events",
+                "created_at": _utc_now(),
+                "events": analysis_payload.get("events", {}),
+            },
+        )
         agent_payload = {
             "stage": "agent_payload",
             "created_at": _utc_now(),
@@ -301,6 +314,8 @@ class DataAgent:
                 code=request.ticker,
                 keyword=request.news_keyword,
             )
+            if request.fetch_news_full_text and isinstance(news, list):
+                news = self._enrich_news_full_text(news)
         st_status: list[str] | dict[str, Any] = []
         suspended: list[str] | dict[str, Any] = []
         delisting: list[str] | dict[str, Any] = []
@@ -923,6 +938,8 @@ class DataAgent:
         for idx, record in enumerate(records, start=1):
             title = cls._first_present(record, ["title", "标题", "新闻标题", "article_title", "name"]) or ""
             summary = cls._first_present(record, ["summary", "摘要", "内容", "content", "article_content"]) or title
+            full_text = cls._first_present(record, ["full_text", "正文", "text", "article_text"])
+            evidence_text = cls._select_evidence_text(full_text, summary, title)
             source = cls._first_present(record, ["source", "来源", "data_source"]) or record.get("data_source", "")
             event_time = cls._first_present(record, ["time", "时间", "datetime", "发布时间", "date", "日期"])
             url = cls._first_present(record, ["url", "链接", "link"])
@@ -931,6 +948,10 @@ class DataAgent:
                 "event_type": str(record.get("event_type") or "新闻"),
                 "summary": str(summary)[:500],
                 "title": str(title or summary)[:200],
+                "full_text": str(full_text or "")[:8000],
+                "evidence_text": evidence_text,
+                "content_status": str(record.get("content_status") or ("full_text" if full_text else "summary_only")),
+                "content_error": record.get("content_error"),
                 "direction": str(record.get("direction") or "中性"),
                 "confidence": float(record.get("confidence") or 0.5),
                 "event_time": cls._json_safe_value(event_time),
@@ -939,6 +960,95 @@ class DataAgent:
                 "raw": record,
             })
         return cleaned
+
+    @classmethod
+    def _select_evidence_text(cls, full_text: Any, summary: Any, title: Any) -> str:
+        text = str(full_text or "").strip()
+        if len(text) >= 80:
+            return text[:3000]
+        fallback = str(summary or title or "").strip()
+        return fallback[:1500]
+
+    @classmethod
+    def _enrich_news_full_text(cls, records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        enriched: list[dict[str, Any]] = []
+        for record in records:
+            item = dict(record)
+            title = cls._first_present(item, ["title", "标题", "新闻标题", "article_title", "name"]) or ""
+            summary = cls._first_present(item, ["summary", "摘要", "内容", "content", "article_content"]) or title
+            existing_text = cls._first_present(item, ["full_text", "正文", "text", "article_text"])
+            url = cls._first_present(item, ["url", "链接", "link"])
+
+            if existing_text:
+                item["full_text"] = str(existing_text)[:8000]
+                item["content_status"] = item.get("content_status") or "full_text"
+                item["evidence_text"] = cls._select_evidence_text(item["full_text"], summary, title)
+                enriched.append(item)
+                continue
+
+            if not url:
+                item["full_text"] = ""
+                item["content_status"] = item.get("content_status") or "summary_only"
+                item["content_error"] = item.get("content_error") or "missing_url"
+                item["evidence_text"] = cls._select_evidence_text("", summary, title)
+                enriched.append(item)
+                continue
+
+            try:
+                full_text = cls._fetch_news_full_text(str(url))
+            except Exception as exc:
+                full_text = ""
+                item["content_error"] = f"{type(exc).__name__}: {str(exc)[:200]}"
+
+            if full_text:
+                item["full_text"] = full_text[:8000]
+                item["content_status"] = "full_text"
+                item["content_error"] = item.get("content_error")
+            else:
+                item["full_text"] = ""
+                item["content_status"] = "summary_only"
+                item["content_error"] = item.get("content_error") or "extract_empty"
+            item["evidence_text"] = cls._select_evidence_text(item.get("full_text"), summary, title)
+            enriched.append(item)
+        return enriched
+
+    @classmethod
+    def _fetch_news_full_text(cls, url: str) -> str:
+        response = requests.get(
+            url,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+                )
+            },
+            timeout=8,
+        )
+        response.raise_for_status()
+        response.encoding = response.apparent_encoding or response.encoding or "utf-8"
+        return cls._extract_article_text(response.text)
+
+    @classmethod
+    def _extract_article_text(cls, html: str) -> str:
+        text = _SCRIPT_STYLE_RE.sub(" ", html or "")
+        paragraphs = re.findall(r"<p[^>]*>(.*?)</p>", text, flags=re.IGNORECASE | re.DOTALL)
+        if paragraphs:
+            candidates = [_WHITESPACE_RE.sub(" ", _HTML_TAG_RE.sub(" ", p)).strip() for p in paragraphs]
+            body = "\n".join(p for p in candidates if len(p) >= 12)
+        else:
+            body = _HTML_TAG_RE.sub(" ", text)
+        body = (
+            body.replace("&nbsp;", " ")
+            .replace("&amp;", "&")
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&quot;", '"')
+            .replace("&#39;", "'")
+        )
+        body = _WHITESPACE_RE.sub(" ", body).strip()
+        if len(body) < 80:
+            return ""
+        return body[:12000]
 
     @staticmethod
     def _first_present(record: dict[str, Any], keys: list[str]) -> Any:
@@ -960,6 +1070,9 @@ class DataAgent:
                 "event_id": record.get("event_id"),
                 "event_type": record.get("event_type", "新闻"),
                 "summary": record.get("summary", ""),
+                "evidence_text": record.get("evidence_text") or record.get("summary", ""),
+                "content_status": record.get("content_status", "summary_only"),
+                "content_error": record.get("content_error"),
                 "direction": record.get("direction", "中性"),
                 "confidence": record.get("confidence", 0.5),
                 "transmission_path": "新闻输入",
@@ -1105,6 +1218,8 @@ class DataAgent:
                 "event_id": record.get("event_id"),
                 "title": record.get("title"),
                 "summary": record.get("summary"),
+                "evidence_text": str(record.get("evidence_text") or record.get("summary") or "")[:1200],
+                "content_status": record.get("content_status"),
                 "event_time": record.get("event_time"),
                 "source": record.get("source"),
             }
@@ -1241,6 +1356,7 @@ def run_data_agent(
     news_keyword: str | None = None,
     sector_keyword: str | None = None,
     use_llm_news_filter: bool = True,
+    fetch_news_full_text: bool = True,
     include_sector_context: bool = True,
 ) -> DataAgentRun:
     """Convenience entry point for tests and CLI usage."""
@@ -1255,6 +1371,7 @@ def run_data_agent(
         news_keyword=news_keyword,
         sector_keyword=sector_keyword,
         use_llm_news_filter=use_llm_news_filter,
+        fetch_news_full_text=fetch_news_full_text,
         include_sector_context=include_sector_context,
     )
     return DataAgent(results_dir=output_dir).run(request)

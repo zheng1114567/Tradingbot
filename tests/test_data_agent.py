@@ -77,7 +77,7 @@ def test_data_agent_persists_layered_trace(tmp_path):
     )
 
     payload = result.to_dict()
-    assert set(payload["artifacts"]) == {"input", "raw", "cleaned", "analysis", "agent_payload", "final"}
+    assert set(payload["artifacts"]) == {"input", "raw", "cleaned", "analysis", "news_events", "agent_payload", "final"}
     for artifact in payload["artifacts"].values():
         assert str(tmp_path) in artifact["path"]
 
@@ -95,6 +95,8 @@ def test_data_agent_persists_layered_trace(tmp_path):
     assert final_payload["agent_payload"]["tier2_data"]["sector_context"]["matched_sector"] == "银行"
     assert final_payload["cleaned"]["news"]["record_count"] == 1
     assert final_payload["agent_payload"]["tier2_data"]["events"][0]["summary"] == "平安银行零售业务保持稳定。"
+    assert final_payload["agent_payload"]["tier2_data"]["events"][0]["evidence_text"] == "平安银行零售业务保持稳定。"
+    assert final_payload["agent_payload"]["tier2_data"]["events"][0]["content_status"] == "summary_only"
     assert final_payload["analysis"]["events"]["filter"]["mode"] == "deterministic"
     assert final_payload["analysis"]["data_quality"]["daily_consistency"]["status"] == "single_source"
     assert final_payload["agent_payload"]["tier2_data"]["data_quality"]["daily_consistency"]["confidence_score"] == 0.7
@@ -103,6 +105,7 @@ def test_data_agent_persists_layered_trace(tmp_path):
     assert final_payload["analysis"]["agent_payload"]["tier1_data"]["risk"]["risk_data_available"] is True
     assert final_payload["manifest"]["fields"]["stock.daily"]["available"] is True
     assert result.artifacts["agent_payload"].path.endswith("05_agent_payload\\agent_payload.json") or result.artifacts["agent_payload"].path.endswith("05_agent_payload/agent_payload.json")
+    assert result.artifacts["news_events"].path.endswith("04_analysis\\news_events.json") or result.artifacts["news_events"].path.endswith("04_analysis/news_events.json")
 
 
 def test_data_agent_react_planner_persists_plan(tmp_path):
@@ -384,3 +387,52 @@ def test_data_agent_llm_filter_uses_keyword_guardrail(tmp_path):
     assert len(trace["decisions"]) == 2
     assert len(events) == 1
     assert events[0]["summary"] == "Ping An Bank product update"
+
+
+def test_data_agent_fetches_full_news_text(tmp_path, monkeypatch):
+    class FakeResponse:
+        status_code = 200
+        apparent_encoding = "utf-8"
+        encoding = "utf-8"
+        text = "<html><body><p>Ping An Bank released a detailed operating update with retail banking evidence.</p><p>The full article contains enough context for downstream trading agents.</p></body></html>"
+
+        def raise_for_status(self):
+            return None
+
+    def fake_get(url, **kwargs):
+        assert url == "https://example.test/news"
+        return FakeResponse()
+
+    monkeypatch.setattr("advanced_trading_agent.data_agent.data_agent.requests.get", fake_get)
+
+    def fake_route(method, **kwargs):
+        if method == "get_daily":
+            return []
+        if method == "get_capital_flow":
+            return []
+        if method == "get_news":
+            return [{
+                "title": "Ping An Bank operating update",
+                "summary": "Short summary",
+                "source": "test",
+                "url": "https://example.test/news",
+            }]
+        if method in {"get_st_status", "get_suspended", "get_delisting"}:
+            return []
+        raise AssertionError(method)
+
+    result = DataAgent(route_fn=fake_route, results_dir=str(tmp_path)).run(
+        DataAgentRequest(
+            ticker="000001.SZ",
+            trade_date="2026-07-10",
+            news_keyword="Ping An",
+            use_llm_news_filter=False,
+        )
+    )
+
+    raw_news = result.final_data["raw"]["news"][0]
+    event = result.final_data["agent_payload"]["tier2_data"]["events"][0]
+    assert raw_news["content_status"] == "full_text"
+    assert "full article contains enough context" in raw_news["full_text"]
+    assert event["content_status"] == "full_text"
+    assert "downstream trading agents" in event["evidence_text"]

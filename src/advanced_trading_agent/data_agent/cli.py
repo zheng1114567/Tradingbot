@@ -26,6 +26,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Disable LLM news screening and use deterministic keyword filtering only",
     )
+    parser.add_argument(
+        "--no-news-full-text",
+        action="store_true",
+        help="Disable fetching full article text from news URLs",
+    )
     parser.add_argument("--no-market", action="store_true", help="Skip market index data")
     parser.add_argument("--no-capital-flow", action="store_true", help="Skip capital-flow data")
     parser.add_argument("--no-news", action="store_true", help="Skip news data")
@@ -54,6 +59,7 @@ def run_from_args(args: argparse.Namespace) -> dict[str, Any]:
         news_keyword=args.news_keyword,
         sector_keyword=args.sector_keyword,
         use_llm_news_filter=not args.no_llm_news_filter,
+        fetch_news_full_text=not args.no_news_full_text,
         use_react_planner=args.react_planner,
         output_dir=args.output_dir,
         max_news_records=args.max_news_records,
@@ -69,6 +75,7 @@ def summarize_run(payload: dict[str, Any]) -> dict[str, Any]:
     cleaned = final_data.get("cleaned", {})
     analysis = final_data.get("analysis", {})
     events = analysis.get("events", {})
+    news_events_artifact = payload.get("artifacts", {}).get("news_events", {})
     data_quality = analysis.get("data_quality", {})
     sector = analysis.get("sector", {})
     vendor_health = final_data.get("vendor_health", {})
@@ -79,6 +86,7 @@ def summarize_run(payload: dict[str, Any]) -> dict[str, Any]:
         "daily_records": cleaned.get("daily", {}).get("record_count"),
         "news_records": cleaned.get("news", {}).get("record_count"),
         "event_records": events.get("record_count"),
+        "news_events_path": news_events_artifact.get("path"),
         "news_filter": events.get("filter"),
         "sector": {
             "status": sector.get("status"),

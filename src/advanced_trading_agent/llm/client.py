@@ -24,6 +24,11 @@ _ROLE_ALIASES = {
 }
 
 
+def _api_key_or_placeholder(value: str | None) -> str:
+    """Allow lazy client construction; real auth still fails at call time."""
+    return value or "missing-api-key"
+
+
 class LLMClient:
     """LLM 客户端 — DeepSeek 优先, 支持降级"""
 
@@ -43,13 +48,13 @@ class LLMClient:
             return self._client
 
         if self.provider == "deepseek":
-            api_key = os.environ.get("DEEPSEEK_API_KEY", "")
+            api_key = _api_key_or_placeholder(os.environ.get("DEEPSEEK_API_KEY"))
             self._client = OpenAI(
                 api_key=api_key,
                 base_url="https://api.deepseek.com/v1",
             )
         elif self.provider == "openai":
-            api_key = os.environ.get("OPENAI_API_KEY", "")
+            api_key = _api_key_or_placeholder(os.environ.get("OPENAI_API_KEY"))
             self._client = OpenAI(api_key=api_key)
         elif self.provider == "anthropic":
             # Anthropic 使用独立的 anthropic SDK (非 OpenAI 兼容)
@@ -64,7 +69,7 @@ class LLMClient:
             return self._client
         else:
             # 自定义 OpenAI 兼容端点
-            api_key = os.environ.get(f"{self.provider.upper()}_API_KEY", "")
+            api_key = _api_key_or_placeholder(os.environ.get(f"{self.provider.upper()}_API_KEY"))
             base_url = os.environ.get(f"{self.provider.upper()}_BASE_URL", "")
             self._client = OpenAI(api_key=api_key, base_url=base_url)
 

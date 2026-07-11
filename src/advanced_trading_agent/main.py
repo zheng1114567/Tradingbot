@@ -161,6 +161,7 @@ def run_standalone_data_agent(
     use_react_planner: bool = False,
     news_keyword: str | None = None,
     use_llm_news_filter: bool = True,
+    fetch_news_full_text: bool = True,
 ) -> str:
     """Run data collection, cleaning, analysis, and layered persistence only."""
     result = DataAgent(results_dir=output_dir).run(
@@ -173,6 +174,7 @@ def run_standalone_data_agent(
             use_react_planner=use_react_planner,
             news_keyword=news_keyword,
             use_llm_news_filter=use_llm_news_filter,
+            fetch_news_full_text=fetch_news_full_text,
         )
     )
     return json.dumps(result.to_dict(), ensure_ascii=False, indent=2)
@@ -222,6 +224,7 @@ def main():
     parser.add_argument("--output-dir", help="DataAgent 输出目录")
     parser.add_argument("--news-keyword", help="DataAgent 新闻关键词过滤, 可选")
     parser.add_argument("--no-llm-news-filter", action="store_true", help="DataAgent 新闻筛选不调用 LLM, 仅使用规则兜底")
+    parser.add_argument("--no-news-full-text", action="store_true", help="DataAgent 不抓取新闻 URL 正文, 仅保留摘要")
     parser.add_argument("--workers", type=int, default=4, help="批量并发数 (默认 4)")
     parser.add_argument("--debug", action="store_true", help="调试模式")
     parser.add_argument("--json", action="store_true", help="JSON 输出")
@@ -255,6 +258,7 @@ def main():
             use_react_planner=args.react_planner,
             news_keyword=args.news_keyword,
             use_llm_news_filter=not args.no_llm_news_filter,
+            fetch_news_full_text=not args.no_news_full_text,
         ))
         return
 

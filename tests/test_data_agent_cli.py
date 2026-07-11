@@ -8,7 +8,7 @@ from advanced_trading_agent.data_agent import cli
 
 class FakeRun:
     def to_dict(self):
-        return {
+        payload = {
             "run_id": "run-1",
             "response_path": "out/response.json",
             "manifest_path": "out/manifest.json",
@@ -38,6 +38,8 @@ class FakeRun:
                 },
             },
         }
+        payload["artifacts"] = {"news_events": {"path": "out/news_events.json"}}
+        return payload
 
 
 class FakeDataAgent:
@@ -72,6 +74,7 @@ def test_data_agent_cli_runs_and_prints_summary(monkeypatch, capsys):
         "--sector-keyword",
         "Bank",
         "--no-llm-news-filter",
+        "--no-news-full-text",
         "--no-market",
         "--no-sector-context",
         "--sector-top-n",
@@ -90,6 +93,7 @@ def test_data_agent_cli_runs_and_prints_summary(monkeypatch, capsys):
     assert request.news_keyword == "Ping An"
     assert request.sector_keyword == "Bank"
     assert request.use_llm_news_filter is False
+    assert request.fetch_news_full_text is False
     assert request.include_market is False
     assert request.include_sector_context is False
     assert request.sector_top_n == 7
@@ -97,6 +101,7 @@ def test_data_agent_cli_runs_and_prints_summary(monkeypatch, capsys):
     payload = json.loads(capsys.readouterr().out)
     assert payload["run_id"] == "run-1"
     assert payload["daily_records"] == 2
+    assert payload["news_events_path"] == "out/news_events.json"
     assert payload["news_filter"]["used_llm"] is True
     assert payload["sector"]["matched_sector"] == "银行"
     assert payload["sector"]["top_sector_count"] == 1

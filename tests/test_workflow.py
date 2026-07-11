@@ -65,16 +65,27 @@ def make_base_state(**overrides) -> dict:
         "event_report_obj": None,
         "analysis_report_obj": None,
         "backtest_report_obj": None,
+        "agent_evidence": {},
+        "agent_tool_calls": {},
+        "agent_self_checks": {},
             "round2_state": {
                 "active": False, "round_count": 0, "max_rounds": 8,
                 "questions": [], "contradictions": [],
                 "current_speaker": "", "completed": False, "summary": "",
+                "provider": "none", "fallback_reason": "",
+                "final_pressure": "neutral", "unresolved_conflicts": [],
             },
         "round2_summary": "",
         "system_decision_obj": None,
+        "system_rubric": {},
         "system_state": "",
+        "approval_input": {},
+        "approval_record": {},
+        "execution_allowed": False,
         "final_report": "",
         "final_report_obj": None,
+        "audit_trace": {},
+        "audit_trace_path": "",
     }
     state.update(overrides)
     return state
@@ -90,7 +101,8 @@ class TestWorkflowTopology:
         # 验证节点存在
         nodes = list(wf.get_graph().nodes.keys())
         for expected in ["Risk Check 1", "System Init", "Market Agent",
-                          "Round 2 Judge", "System Final Decision", "Report Agent"]:
+                          "Round 2 Judge", "System Final Decision",
+                          "Approval Agent", "Report Agent"]:
             assert expected in nodes, f"缺少节点: {expected}"
 
     def test_risk_check_1_pass_continues(self):
@@ -215,8 +227,9 @@ class TestTradingSystemIntegration:
             "tier1_data", "tier2_data", "tier2_decision",
             "risk_check_1", "risk_check_2", "risk_check_3",
             "market_report", "event_report", "analysis_report", "backtest_report",
-            "round2_state", "round2_summary", "system_decision_obj", "system_state",
-            "final_report", "final_report_obj",
+            "round2_state", "round2_summary", "system_decision_obj", "system_rubric", "system_state",
+            "approval_input", "approval_record", "execution_allowed",
+            "final_report", "final_report_obj", "audit_trace", "audit_trace_path",
         ]
         for key in required_keys:
             assert key in hints, f"AgentState 类型注解缺少 key: {key}"

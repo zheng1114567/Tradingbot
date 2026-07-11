@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import logging
+from copy import deepcopy
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
@@ -42,7 +43,7 @@ class HardRiskController:
     """硬风控控制器 — 纯代码, 无 LLM"""
 
     def __init__(self, risk_config: dict[str, Any] | None = None):
-        rc = config.get("risk_config", {})
+        rc = deepcopy(config.get("risk_config", {}))
         if risk_config:
             rc.update(risk_config)
         self.max_single_pct = rc.get("max_single_position_pct", 0.10)
@@ -170,11 +171,14 @@ class HardRiskController:
 
         all_reasons = []
         all_actions = []
+        worst_verdict = RiskVerdictType.PASS
 
         for name, check_fn in checks:
             result = check_fn()
             if result.verdict == RiskVerdictType.HARD_VETO:
                 return result
+            if result.verdict == RiskVerdictType.SOFT_VETO:
+                worst_verdict = RiskVerdictType.SOFT_VETO
             all_reasons.extend(result.reasons)
             all_actions.extend(result.suggested_actions)
 
@@ -183,6 +187,8 @@ class HardRiskController:
             impact_result = self.check_impact_cost(estimated_impact_bps, expected_return_bps)
             if impact_result.verdict == RiskVerdictType.HARD_VETO:
                 return impact_result
+            if impact_result.verdict == RiskVerdictType.SOFT_VETO:
+                worst_verdict = RiskVerdictType.SOFT_VETO
             all_reasons.extend(impact_result.reasons)
 
         # 仓位检查
@@ -192,10 +198,12 @@ class HardRiskController:
             all_actions.extend(pos_result.suggested_actions)
             if pos_result.verdict == RiskVerdictType.HARD_VETO:
                 return pos_result
+            if pos_result.verdict == RiskVerdictType.SOFT_VETO:
+                worst_verdict = RiskVerdictType.SOFT_VETO
 
         if all_reasons:
             return RiskVerdict(
-                verdict=RiskVerdictType.PASS,
+                verdict=worst_verdict,
                 reasons=all_reasons,
                 suggested_actions=all_actions,
                 position_limit=proposed_pct,

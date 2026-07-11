@@ -64,7 +64,7 @@ class TestBacktestEngine:
             "volume": [1e7] * 5,
             "amount": [1e8] * 5,
             "pct_chg": [10.0, 0.0, 0.0, 0.0, 0.0],
-            "is_limit_up": [True, False, False, False, False],
+            "is_limit_up": [False, True, False, False, False],
             "is_limit_down": [False] * 5,
         })
         engine = BacktestEngine()

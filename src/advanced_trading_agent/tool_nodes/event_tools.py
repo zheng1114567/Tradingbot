@@ -14,6 +14,8 @@ import logging
 from datetime import date, datetime
 from typing import Any
 
+from langchain_core.tools import tool
+
 from ..core.cache_manager import CacheManager
 
 logger = logging.getLogger(__name__)
@@ -135,22 +137,21 @@ class EventTools:
 # 函数接口 (用于 LangChain Tool)
 _tools = EventTools()
 
-def search_news(**kwargs) -> str:
+@tool
+def search_news(keyword: str, days_back: int = 3) -> str:
     """搜索 A 股财经新闻"""
-    keyword = kwargs.get("keyword", "")
-    results = _tools.search_cailianshe_news(keyword)
-    results.extend(_tools.search_eastmoney_news(keyword))
+    results = _tools.search_cailianshe_news(keyword, days_back)
+    results.extend(_tools.search_eastmoney_news(keyword, days_back))
     return str(results[:10])
 
-def get_announcements(**kwargs) -> str:
+@tool
+def get_announcements(code: str, days_back: int = 30) -> str:
     """获取公司公告"""
-    code = kwargs.get("code", "")
-    results = _tools.get_company_announcements(code)
+    results = _tools.get_company_announcements(code, days_back)
     return str(results[:10])
 
-def get_calendar(**kwargs) -> str:
+@tool
+def get_calendar(start_date: str | None = None, end_date: str | None = None) -> str:
     """获取财经日历"""
-    results = _tools.get_calendar_events(
-        kwargs.get("start_date"), kwargs.get("end_date")
-    )
+    results = _tools.get_calendar_events(start_date, end_date)
     return str(results[:10])

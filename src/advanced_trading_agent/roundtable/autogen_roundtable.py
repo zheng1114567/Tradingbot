@@ -25,6 +25,7 @@ class RoundtableResult:
     unresolved_conflicts: list[str] = field(default_factory=list)
     final_pressure: str = "neutral"
     provider: str = "autogen"
+    fallback_reason: str = ""
 
 
 class AutoGenRoundtable:
@@ -60,7 +61,8 @@ class AutoGenRoundtable:
                 model_client=model_client,
                 system_message=(
                     "你是 Market Agent。只基于给定 Market 报告讨论市场温度、资金状态、仓位约束。"
-                    "不要编造外部数据。"
+                    "不要编造外部数据。\n\n"
+                    f"Market 报告:\n{self._agent_report(state, 'market_report')}"
                 ),
             ),
             AssistantAgent(
@@ -68,7 +70,8 @@ class AutoGenRoundtable:
                 model_client=model_client,
                 system_message=(
                     "你是 Event Agent。只基于给定 Event 报告讨论事件传导、证据等级和定价状态。"
-                    "不要编造外部数据。"
+                    "不要编造外部数据。\n\n"
+                    f"Event 报告:\n{self._agent_report(state, 'event_report')}"
                 ),
             ),
             AssistantAgent(
@@ -76,7 +79,8 @@ class AutoGenRoundtable:
                 model_client=model_client,
                 system_message=(
                     "你是 Analysis Agent。只基于给定 Analysis 报告讨论因子排序、拥挤和择时。"
-                    "不要编造外部数据。"
+                    "不要编造外部数据。\n\n"
+                    f"Analysis 报告:\n{self._agent_report(state, 'analysis_report')}"
                 ),
             ),
             AssistantAgent(
@@ -84,7 +88,8 @@ class AutoGenRoundtable:
                 model_client=model_client,
                 system_message=(
                     "你是 Backtest Agent。只基于给定 Backtest 报告讨论样本量、胜率和统计可靠性。"
-                    "不要编造外部数据。"
+                    "不要编造外部数据。\n\n"
+                    f"Backtest 报告:\n{self._agent_report(state, 'backtest_report')}"
                 ),
             ),
             AssistantAgent(
@@ -144,26 +149,19 @@ class AutoGenRoundtable:
         )
 
     @staticmethod
+    def _agent_report(state: dict[str, Any], key: str) -> str:
+        report = str(state.get(key, "")).strip()
+        return report[:1200] if report else "暂无该 Agent 报告"
+
+    @staticmethod
     def _build_task(state: dict[str, Any], contradictions: list[str]) -> str:
         return f"""请进行 Round 2 圆桌会议。
 
 矛盾点:
 {chr(10).join(f"- {c}" for c in contradictions)}
 
-Market 报告:
-{state.get("market_report", "")[:1200]}
-
-Event 报告:
-{state.get("event_report", "")[:1200]}
-
-Analysis 报告:
-{state.get("analysis_report", "")[:1200]}
-
-Backtest 报告:
-{state.get("backtest_report", "")[:1200]}
-
 规则:
-1. 每个 Agent 只能基于自己的报告发言。
+1. 每个 Agent 只能基于自身 system message 中的专属报告发言。
 2. 必须回应矛盾点，不允许补造数据。
 3. Moderator 最后输出未解决分歧、final_pressure 和风控关注点。
 """
@@ -208,4 +206,5 @@ Backtest 报告:
             summary=summary,
             unresolved_conflicts=contradictions,
             final_pressure=pressure,
+            provider="autogen",
         )

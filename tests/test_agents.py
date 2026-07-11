@@ -9,10 +9,12 @@
 from __future__ import annotations
 
 from datetime import date
+from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
+from advanced_trading_agent.config import config
 from advanced_trading_agent.agents.schemas import (
     AnalysisReport,
     BacktestReport,
@@ -25,12 +27,14 @@ from advanced_trading_agent.agents.schemas import (
     RiskVerdict,
     StockRanking,
     SystemDecision,
+    SystemRubric,
 )
 from advanced_trading_agent.agents.market_agent import create_market_agent
 from advanced_trading_agent.agents.event_agent import create_event_agent
 from advanced_trading_agent.agents.analysis_agent import create_analysis_agent
 from advanced_trading_agent.agents.backtest_agent import create_backtest_agent
 from advanced_trading_agent.agents.system_agent import create_system_agent
+from advanced_trading_agent.agents.approval_agent import create_approval_agent
 from advanced_trading_agent.agents.report_agent import create_report_agent
 
 
@@ -365,8 +369,75 @@ class TestSystemAgent:
         }
         result = sa["final"](state)
         assert "system_decision_obj" in result
+        assert "system_rubric" in result
         assert isinstance(result["system_decision_obj"], SystemDecision)
+        assert isinstance(SystemRubric(**result["system_rubric"]), SystemRubric)
         assert result["system_state"] == "completed"
+
+    def test_final_rubric_downgrades_weak_recommendation(self, mock_llm, base_state):
+        llm = MockLLM(return_value=SystemDecision(
+            decision=DecisionType.RECOMMEND,
+            position=0.1,
+            alpha_source=["mock"],
+            horizon_days=5,
+            reasons=["LLM wants to recommend"],
+            objections=[],
+            risk_verdict=RiskVerdict.PASS,
+            reasoning="mock",
+        ))
+        sa = create_system_agent(llm)
+        state = {
+            **base_state,
+            "risk_check_3": {"verdict": "PASS", "reasons": []},
+        }
+        result = sa["final"](state)
+        decision = result["system_decision_obj"]
+        assert decision.decision == DecisionType.WATCH
+        assert result["system_rubric"]["recommendation_floor"] == DecisionType.WATCH.value
+        assert "结构化rubric限制" in decision.reasons[0]
+
+    def test_final_round2_downgrade_pressure_blocks_recommendation(self, base_state):
+        llm = MockLLM(return_value=SystemDecision(
+            decision=DecisionType.RECOMMEND,
+            position=0.1,
+            alpha_source=["mock"],
+            horizon_days=5,
+            reasons=["LLM wants to recommend"],
+            objections=[],
+            risk_verdict=RiskVerdict.PASS,
+            reasoning="mock",
+        ))
+        sa = create_system_agent(llm)
+        state = {
+            **base_state,
+            "market_report_obj": _default_for(MarketReport),
+            "event_report_obj": _default_for(EventReport),
+            "analysis_report_obj": _default_for(AnalysisReport),
+            "backtest_report_obj": _default_for(BacktestReport),
+            "risk_check_3": {"verdict": "PASS", "reasons": []},
+            "round2_state": {
+                "active": True,
+                "round_count": 8,
+                "max_rounds": 8,
+                "questions": [],
+                "contradictions": ["Market/Event conflict"],
+                "current_speaker": "AutoGenRoundtable",
+                "completed": True,
+                "summary": "System_Moderator: final_pressure=downgrade",
+                "provider": "autogen",
+                "fallback_reason": "",
+                "final_pressure": "downgrade",
+                "unresolved_conflicts": ["Market/Event conflict"],
+            },
+            "round2_summary": "System_Moderator: final_pressure=downgrade",
+        }
+
+        result = sa["final"](state)
+        decision = result["system_decision_obj"]
+
+        assert decision.decision == DecisionType.WATCH
+        assert "Round 2 Moderator 要求降级" in decision.objections
+        assert result["system_rubric"]["recommendation_floor"] == DecisionType.WATCH.value
 
     def test_final_decision_llm_fallback(self, mock_llm_fail, base_state):
         sa = create_system_agent(mock_llm_fail)
@@ -422,3 +493,113 @@ class TestReportAgent:
         result = node(base_state)
         report = result["final_report_obj"]
         assert report.decision == DecisionType.REJECT
+
+    def test_persists_audit_trace(self, base_state, tmp_path):
+        original_results_dir = config.get("results_dir")
+        config.update({"results_dir": str(tmp_path)})
+        try:
+            node = create_report_agent()
+            state = {
+                **base_state,
+                "approval_record": {"action": "pending_human_review"},
+                "execution_allowed": False,
+                "risk_check_1": {"verdict": "PASS"},
+                "agent_evidence": {"Market Agent": ["sentiment=正常"]},
+                "system_decision_obj": SystemDecision(
+                    decision=DecisionType.WATCH,
+                    position=0,
+                    alpha_source=[],
+                    horizon_days=5,
+                    reasons=["观察"],
+                    objections=[],
+                    risk_verdict=RiskVerdict.PASS,
+                    reasoning="test",
+                ),
+            }
+            result = node(state)
+        finally:
+            config.update({"results_dir": original_results_dir})
+
+        assert result["audit_trace_path"]
+        audit_path = Path(result["audit_trace_path"])
+        assert audit_path.exists()
+        audit_text = audit_path.read_text(encoding="utf-8")
+        assert "pending_human_review" in audit_text
+        assert "Market Agent" in audit_text
+
+    def test_report_includes_round2_audit_section(self, base_state, tmp_path):
+        original_results_dir = config.get("results_dir")
+        config.update({"results_dir": str(tmp_path)})
+        try:
+            node = create_report_agent()
+            state = {
+                **base_state,
+                "round2_state": {
+                    "active": True,
+                    "round_count": 8,
+                    "max_rounds": 8,
+                    "questions": [],
+                    "contradictions": ["Market/Event conflict"],
+                    "current_speaker": "AutoGenRoundtable",
+                    "completed": True,
+                    "summary": "System_Moderator: final_pressure=downgrade",
+                    "provider": "autogen",
+                    "fallback_reason": "",
+                    "final_pressure": "downgrade",
+                    "unresolved_conflicts": ["Market/Event conflict"],
+                },
+                "round2_summary": "System_Moderator: final_pressure=downgrade",
+                "system_decision_obj": SystemDecision(
+                    decision=DecisionType.WATCH,
+                    position=0,
+                    alpha_source=[],
+                    horizon_days=5,
+                    reasons=["观察"],
+                    objections=["Round 2 Moderator 要求降级"],
+                    risk_verdict=RiskVerdict.PASS,
+                    reasoning="test",
+                ),
+            }
+            result = node(state)
+        finally:
+            config.update({"results_dir": original_results_dir})
+
+        assert "## Round 2 圆桌审计" in result["final_report"]
+        assert "Provider: autogen" in result["final_report"]
+        assert "Final Pressure: downgrade" in result["final_report"]
+
+
+class TestApprovalAgent:
+    """Approval Agent — 人工审批记录"""
+
+    def test_default_pending_review_blocks_execution(self, base_state):
+        node = create_approval_agent()
+        state = {
+            **base_state,
+            "system_decision_obj": SystemDecision(
+                decision=DecisionType.RECOMMEND, position=0.1,
+                alpha_source=["因子"], horizon_days=5,
+                reasons=["好"], objections=[],
+                risk_verdict=RiskVerdict.PASS, reasoning="test",
+            ),
+        }
+        result = node(state)
+        assert result["approval_record"]["action"] == "pending_human_review"
+        assert result["execution_allowed"] is False
+        assert result["sender"] == "Approval Agent"
+
+    def test_approved_recommend_allows_execution(self, base_state):
+        node = create_approval_agent()
+        state = {
+            **base_state,
+            "approval_input": {"action": "approve", "reviewer": "tester"},
+            "system_decision_obj": SystemDecision(
+                decision=DecisionType.RECOMMEND, position=0.1,
+                alpha_source=["因子"], horizon_days=5,
+                reasons=["好"], objections=[],
+                risk_verdict=RiskVerdict.PASS, reasoning="test",
+            ),
+        }
+        result = node(state)
+        assert result["approval_record"]["action"] == "approved"
+        assert result["execution_allowed"] is True

@@ -196,6 +196,40 @@ class LLMClient:
         """便捷调用方法"""
         return self.chat(messages, response_format=response_format)
 
+    def as_langchain_chat_model(self):
+        """Return a LangChain chat model for LangGraph prebuilt agents."""
+        if self.provider == "anthropic":
+            from langchain_anthropic import ChatAnthropic
+
+            return ChatAnthropic(
+                model=self.model,
+                temperature=self.temperature,
+                api_key=os.environ.get("ANTHROPIC_API_KEY", ""),
+            )
+
+        from langchain_openai import ChatOpenAI
+
+        if self.provider == "deepseek":
+            return ChatOpenAI(
+                model=self.model,
+                temperature=self.temperature,
+                api_key=os.environ.get("DEEPSEEK_API_KEY", ""),
+                base_url="https://api.deepseek.com/v1",
+            )
+        if self.provider == "openai":
+            return ChatOpenAI(
+                model=self.model,
+                temperature=self.temperature,
+                api_key=os.environ.get("OPENAI_API_KEY", ""),
+            )
+
+        return ChatOpenAI(
+            model=self.model,
+            temperature=self.temperature,
+            api_key=os.environ.get(f"{self.provider.upper()}_API_KEY", ""),
+            base_url=os.environ.get(f"{self.provider.upper()}_BASE_URL", ""),
+        )
+
 
 def create_llm(provider: str | None = None,
                model: str | None = None,

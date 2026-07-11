@@ -189,6 +189,21 @@ class SystemDecision(BaseModel):
         )
 
 
+class SystemRubric(BaseModel):
+    """系统裁定前的结构化评分表"""
+    market_score: int = Field(ge=0, le=2, description="市场环境评分")
+    event_score: int = Field(ge=0, le=2, description="事件链条评分")
+    analysis_score: int = Field(ge=0, le=2, description="因子/排序评分")
+    backtest_score: int = Field(ge=0, le=2, description="历史证据评分")
+    memory_score: int = Field(ge=0, le=1, description="历史记忆支持评分")
+    risk_score: int = Field(ge=0, le=2, description="风控评分")
+    total_score: int = Field(ge=0, le=11, description="总分")
+    recommendation_floor: DecisionType = Field(description="规则给出的最高裁定等级")
+    support: list[str] = Field(default_factory=list, description="支持项")
+    objections: list[str] = Field(default_factory=list, description="反对项")
+    forced_downgrades: list[str] = Field(default_factory=list, description="强制降级原因")
+
+
 # ============================================================
 # Memory Agent
 # ============================================================

@@ -14,6 +14,8 @@ import logging
 from datetime import date, datetime
 from typing import Any
 
+from langchain_core.tools import tool
+
 from ..core.cache_manager import CacheManager
 from ..data_service.vendor_router import route_to_vendor
 
@@ -148,29 +150,32 @@ class MarketTools:
 # LangChain Tool 包装函数
 _tools_instance = MarketTools()
 
-def get_market_sentiment(**kwargs) -> str:
+@tool
+def get_market_sentiment(trade_date: str | None = None) -> str:
     """获取市场情绪数据"""
-    result = _tools_instance.get_market_sentiment(kwargs.get("trade_date"))
+    result = _tools_instance.get_market_sentiment(trade_date)
     return str(result)
 
-def get_northbound_flow(**kwargs) -> str:
+@tool
+def get_northbound_flow(trade_date: str | None = None) -> str:
     """获取北向资金流向"""
-    result = _tools_instance.get_northbound_flow(kwargs.get("trade_date"))
+    result = _tools_instance.get_northbound_flow(trade_date)
     return str(result)
 
-def get_capital_flow(**kwargs) -> str:
+@tool
+def get_capital_flow(sector: str | None = None, trade_date: str | None = None) -> str:
     """获取主力资金流向"""
-    result = _tools_instance.get_capital_flow(
-        kwargs.get("sector"), kwargs.get("trade_date")
-    )
+    result = _tools_instance.get_capital_flow(sector, trade_date)
     return str(result)
 
-def get_sector_rotation(**kwargs) -> str:
+@tool
+def get_sector_rotation(top_n: int = 10) -> str:
     """获取板块轮动"""
-    result = _tools_instance.get_sector_rotation(kwargs.get("top_n", 10))
+    result = _tools_instance.get_sector_rotation(top_n)
     return str(result)
 
-def get_limit_up_tiers(**kwargs) -> str:
+@tool
+def get_limit_up_tiers(trade_date: str | None = None) -> str:
     """获取涨停梯队"""
-    result = _tools_instance.get_limit_up_tiers(kwargs.get("trade_date"))
+    result = _tools_instance.get_limit_up_tiers(trade_date)
     return str(result)

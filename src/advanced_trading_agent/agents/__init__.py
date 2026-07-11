@@ -15,10 +15,12 @@ from .analysis_agent import create_analysis_agent
 from .backtest_agent import create_backtest_agent
 from .system_agent import create_system_agent
 from .memory_agent import create_memory_agent
+from .approval_agent import create_approval_agent
 from .report_agent import create_report_agent
 
 __all__ = [
     "create_market_agent", "create_event_agent",
     "create_analysis_agent", "create_backtest_agent",
-    "create_system_agent", "create_memory_agent", "create_report_agent",
+    "create_system_agent", "create_memory_agent",
+    "create_approval_agent", "create_report_agent",
 ]

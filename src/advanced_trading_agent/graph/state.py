@@ -11,7 +11,8 @@ LangGraph State — 重写版
 """
 from __future__ import annotations
 
-from typing import Any, TypedDict
+import operator
+from typing import Annotated, Any, TypedDict
 
 from langgraph.graph import MessagesState
 
@@ -36,6 +37,10 @@ class Round2State(TypedDict):
     current_speaker: str         # 当前发言 Agent
     completed: bool              # 是否完成
     summary: str                 # 圆桌会议总结
+    provider: str                # autogen / deterministic / none
+    fallback_reason: str         # AutoGen 失败或空结果原因
+    final_pressure: str          # upgrade / neutral / downgrade
+    unresolved_conflicts: list[str]
 
 
 class AgentState(MessagesState):
@@ -77,14 +82,27 @@ class AgentState(MessagesState):
     analysis_report_obj: Any | None
     backtest_report_obj: Any | None
 
+    # === Agent 可审计轨迹 ===
+    agent_evidence: Annotated[dict, operator.or_]
+    agent_tool_calls: Annotated[dict, operator.or_]
+    agent_self_checks: Annotated[dict, operator.or_]
+
     # === Round 2 辩论 ===
     round2_state: Round2State
     round2_summary: str
 
     # === System 裁定 ===
     system_decision_obj: Any | None
+    system_rubric: dict
     system_state: str
+
+    # === 人工审批 ===
+    approval_input: dict
+    approval_record: dict
+    execution_allowed: bool
 
     # === 最终输出 ===
     final_report: str
     final_report_obj: Any | None
+    audit_trace: dict
+    audit_trace_path: str

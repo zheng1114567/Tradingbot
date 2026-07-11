@@ -18,13 +18,20 @@ import logging
 from typing import Any
 
 from ..llm.client import LLMClient
-from ..tool_nodes.event_tools import EventTools
+from ..tool_nodes.event_tools import (
+    EventTools,
+    get_announcements,
+    get_calendar,
+    search_news,
+)
+from .contract import basic_self_check, build_agent_update
+from .react_runner import run_prebuilt_react
 from .schemas import EventReport
 
 logger = logging.getLogger(__name__)
 
 
-def create_event_agent(llm: LLMClient):
+def create_event_agent(llm: LLMClient, tools: EventTools | None = None):
     """创建 Event Agent 节点函数"""
 
     def event_node(state: dict[str, Any]) -> dict[str, Any]:
@@ -34,16 +41,34 @@ def create_event_agent(llm: LLMClient):
         memory = state.get("memory_context", "")
 
         # 用工具搜索事件相关新闻
-        tools = EventTools()
-        news_items = tools.search_cailianshe_news(ticker)
-        news_items.extend(tools.search_eastmoney_news(ticker))
+        event_tools = tools or EventTools()
+        news_items = event_tools.search_cailianshe_news(ticker)
+        eastmoney_news = event_tools.search_eastmoney_news(ticker)
+        news_items.extend(eastmoney_news)
+        tool_calls = [
+            {
+                "tool": "search_cailianshe_news",
+                "args": {"ticker": ticker},
+                "records": len(news_items) - len(eastmoney_news),
+            },
+            {
+                "tool": "search_eastmoney_news",
+                "args": {"ticker": ticker},
+                "records": len(eastmoney_news),
+            },
+        ]
 
         # 识别实体
         detected_entities = []
         for item in news_items:
             text = str(item)
-            entities = tools.detect_entity(text)
+            entities = event_tools.detect_entity(text)
             detected_entities.extend(entities)
+        tool_calls.append({
+            "tool": "detect_entity",
+            "args": {"items": len(news_items)},
+            "records": len(detected_entities),
+        })
 
         event_summary = "\n".join(
             f"- [{e.get('event_type', '?')}] {e.get('summary', str(e))[:100]}"
@@ -90,16 +115,31 @@ def create_event_agent(llm: LLMClient):
 
 请分析最重要的事件。输出结构化报告。"""
 
+        react_prompt = (
+            "你是 A 股事件分析师。必须用工具搜索新闻、公告或日历事件，"
+            "再按反伪链条规则判断事件是否有交易价值。"
+        )
+        report, react_trace = run_prebuilt_react(
+            llm=llm,
+            tools=[search_news, get_announcements, get_calendar],
+            prompt=react_prompt,
+            user_content=prompt,
+            response_format=EventReport,
+        )
+        if react_trace:
+            tool_calls.extend(react_trace)
+
         try:
-            report = llm.chat(
-                messages=[
-                    ("system",
-                     "你是 A 股事件分析师。严格遵守反伪链条规则。"
-                     "没有明确实体映射的事件, 只能给 indirect。"),
-                    ("human", prompt),
-                ],
-                response_format=EventReport,
-            )
+            if report is None:
+                report = llm.chat(
+                    messages=[
+                        ("system",
+                         "你是 A 股事件分析师。严格遵守反伪链条规则。"
+                         "没有明确实体映射的事件, 只能给 indirect。"),
+                        ("human", prompt),
+                    ],
+                    response_format=EventReport,
+                )
         except Exception as e:
             logger.warning("LLM event analysis failed, defaulting: %s", e)
             report = EventReport(
@@ -116,9 +156,37 @@ def create_event_agent(llm: LLMClient):
                 invalid_conditions=["LLM不可用, 建议人工复核"],
             )
 
-        return {
-            "event_report": report.to_markdown() if hasattr(report, 'to_markdown') else str(report),
-            "event_report_obj": report,
-        }
+        evidence = [
+            f"structured_events={len(events_raw)}",
+            f"news_items={len(news_items)}",
+            f"detected_entities={entities_summary}",
+            f"evidence_level={report.evidence_level}",
+            f"chain_quality={report.chain_quality}",
+            f"pricing_status={report.pricing_status}",
+        ]
+        warnings = []
+        if report.chain_quality != "direct":
+            warnings.append(f"传导链条非 direct: {report.chain_quality}")
+        if report.evidence_level in ("行业媒体", "社交传闻"):
+            warnings.append(f"证据等级偏弱: {report.evidence_level}")
+        if report.pricing_status == "过度定价":
+            warnings.append("事件可能已过度定价")
+
+        return build_agent_update(
+            state,
+            sender="Event Agent",
+            report_key="event_report",
+            report=report.to_markdown() if hasattr(report, "to_markdown") else str(report),
+            report_obj_key="event_report_obj",
+            report_obj=report,
+            evidence=evidence,
+            tool_calls=tool_calls,
+            self_check=basic_self_check(
+                evidence=evidence,
+                passed_rules=["anti_fake_event_chain_checked"],
+                warnings=warnings,
+                confidence=report.confidence,
+            ),
+        )
 
     return event_node

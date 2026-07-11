@@ -100,3 +100,13 @@ class TestHardRiskEdgeCases:
             suspended_list=[],
         )
         assert verdict.verdict == RiskVerdictType.PASS
+
+    def test_check_all_preserves_soft_veto(self):
+        """综合检查不能把软否决降级为 PASS"""
+        verdict = self.controller.check_all(
+            code="000001.SZ",
+            daily_volume_cny=1_000_000,
+            proposed_pct=0.15,
+        )
+        assert verdict.verdict == RiskVerdictType.SOFT_VETO
+        assert verdict.reasons

@@ -32,6 +32,7 @@ from langgraph.graph import END, START, StateGraph
 
 from ..agents import (
     create_analysis_agent,
+    create_approval_agent,
     create_backtest_agent,
     create_event_agent,
     create_market_agent,
@@ -85,6 +86,7 @@ def create_workflow() -> StateGraph:
     sa_final = sa["final"]        # 最终裁定
 
     # Report Agent (无 LLM)
+    approval_node = create_approval_agent()
     report_node = create_report_agent()
 
     # === 构建图 ===
@@ -103,6 +105,7 @@ def create_workflow() -> StateGraph:
     workflow.add_node("Round 2 Debate", _create_round2_node(llm))
     workflow.add_node("Risk Check 3", risk3_node)
     workflow.add_node("System Final Decision", sa_final)
+    workflow.add_node("Approval Agent", approval_node)
     workflow.add_node("Report Agent", report_node)
 
     # === 连边 ===
@@ -159,8 +162,9 @@ def create_workflow() -> StateGraph:
         {"finalize": "System Final Decision", "end": "System Final Decision"},
     )
 
-    # 裁定 → 报告 → END
-    workflow.add_edge("System Final Decision", "Report Agent")
+    # 裁定 → 人工审批记录 → 报告 → END
+    workflow.add_edge("System Final Decision", "Approval Agent")
+    workflow.add_edge("Approval Agent", "Report Agent")
     workflow.add_edge("Report Agent", END)
 
     return workflow.compile()
@@ -249,11 +253,19 @@ def _create_round2_node(llm: LLMClient):
                         "summary": result.summary,
                         "unresolved_conflicts": result.unresolved_conflicts,
                         "final_pressure": result.final_pressure,
+                        "provider": result.provider,
+                        "fallback_reason": result.fallback_reason,
                     },
                     "round2_summary": result.summary,
                 }
         except Exception as e:
-            logger.warning("AutoGen roundtable failed, falling back to deterministic roundtable: %s", e)
+            fallback_reason = f"{type(e).__name__}: {e}"
+            logger.warning(
+                "AutoGen roundtable failed, falling back to deterministic roundtable: %s",
+                e,
+            )
+        else:
+            fallback_reason = "AutoGen returned empty summary"
 
         # 提出质询 (LLM 生成问题, 失败则确定性降级)
         contradiction = contradictions[count % len(contradictions)] if contradictions else ""
@@ -337,6 +349,10 @@ System 质询:
                 "current_speaker": "System",
                 "completed": count + 1 >= max_rounds,
                 "summary": summary,
+                "provider": "deterministic",
+                "fallback_reason": fallback_reason,
+                "final_pressure": "neutral",
+                "unresolved_conflicts": contradictions,
             },
             "round2_summary": summary,
         }
@@ -630,6 +646,9 @@ class TradingSystem:
             "event_report_obj": None,
             "analysis_report_obj": None,
             "backtest_report_obj": None,
+            "agent_evidence": {},
+            "agent_tool_calls": {},
+            "agent_self_checks": {},
             "round2_state": {
                 "active": False,
                 "round_count": 0,
@@ -639,12 +658,22 @@ class TradingSystem:
                 "current_speaker": "",
                 "completed": False,
                 "summary": "",
+                "provider": "none",
+                "fallback_reason": "",
+                "final_pressure": "neutral",
+                "unresolved_conflicts": [],
             },
             "round2_summary": "",
             "system_decision_obj": None,
+            "system_rubric": {},
             "system_state": "",
+            "approval_input": {},
+            "approval_record": {},
+            "execution_allowed": False,
             "final_report": "",
             "final_report_obj": None,
+            "audit_trace": {},
+            "audit_trace_path": "",
         }
 
         if self.debug:

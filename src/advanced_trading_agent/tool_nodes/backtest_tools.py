@@ -12,6 +12,8 @@ import logging
 from datetime import date
 from typing import Any
 
+from langchain_core.tools import tool
+
 from ..backtest.engine import BacktestEngine
 from ..core.cache_manager import CacheManager
 
@@ -96,15 +98,21 @@ class BacktestTools:
 # 函数接口
 _tools = BacktestTools()
 
-def run_backtest(**kwargs) -> str:
+@tool
+def run_backtest(code: str, entry_date: str | None = None) -> str:
     """运行回测"""
     result = _tools.run_backtest(
-        kwargs.get("code", ""),
-        kwargs.get("entry_date", str(date.today())),
+        code,
+        entry_date or str(date.today()),
     )
     return str(result)
 
-def find_similar(**kwargs) -> str:
+@tool
+def find_similar(sentiment: str = "正常", sector: str = "", event_type: str = "") -> str:
     """查找相似历史情境"""
-    result = _tools.find_similar_history(kwargs)
+    result = _tools.find_similar_history({
+        "sentiment": sentiment,
+        "sector": sector,
+        "event_type": event_type,
+    })
     return str(result)

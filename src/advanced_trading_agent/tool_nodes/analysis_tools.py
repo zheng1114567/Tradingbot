@@ -14,6 +14,8 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from langchain_core.tools import tool
+
 from ..core.cache_manager import CacheManager
 from ..data_service.vendor_router import route_to_vendor
 
@@ -87,24 +89,20 @@ class AnalysisTools:
 # 函数接口
 _tools = AnalysisTools()
 
-def get_factors(**kwargs) -> str:
+@tool
+def get_factors(code: str | None = None, sector: str | None = None, top_n: int = 20) -> str:
     """获取个股因子数据"""
-    result = _tools.get_factor_data(
-        kwargs.get("code"), kwargs.get("sector"),
-        kwargs.get("top_n", 20)
-    )
+    result = _tools.get_factor_data(code, sector, top_n)
     return str(result)
 
-def rank_stocks(**kwargs) -> str:
+@tool
+def rank_stocks(sector: str, sort_by: str = "composite_score", top_n: int = 10) -> str:
     """按因子排序个股"""
-    result = _tools.rank_stocks(
-        kwargs.get("sector", ""),
-        kwargs.get("sort_by", "composite_score"),
-        kwargs.get("top_n", 10),
-    )
+    result = _tools.rank_stocks(sector, sort_by, top_n)
     return str(result)
 
-def check_crowding(**kwargs) -> str:
+@tool
+def check_crowding(sector: str) -> str:
     """检查板块拥挤度"""
-    result = _tools.check_crowding(kwargs.get("sector", ""))
+    result = _tools.check_crowding(sector)
     return str(result)

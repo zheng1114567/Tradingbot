@@ -20,38 +20,50 @@ class PerformanceMetrics:
     """回测绩效指标计算"""
 
     @staticmethod
+    def _valid_returns(results: list[BacktestResult], days: int) -> list[float]:
+        return [
+            r.returns[days]
+            for r in results
+            if r.tradable and r.returns.get(days) is not None
+        ]
+
+    @staticmethod
     def win_rate(results: list[BacktestResult], days: int = 5) -> float:
         """胜率 (指定持有期的正收益比例)"""
-        valid = [r for r in results if r.returns.get(days) is not None]
+        valid = PerformanceMetrics._valid_returns(results, days)
         if not valid:
             return 0.0
-        wins = sum(1 for r in valid if r.returns.get(days, 0) > 0)
+        wins = sum(1 for r in valid if r > 0)
         return wins / len(valid)
 
     @staticmethod
     def avg_return(results: list[BacktestResult], days: int = 5) -> float:
         """平均收益率"""
-        valid = [r for r in results if r.returns.get(days) is not None]
+        valid = PerformanceMetrics._valid_returns(results, days)
         if not valid:
             return 0.0
-        return float(np.mean([r.returns[days] for r in valid]))
+        return float(np.mean(valid))
 
     @staticmethod
     def avg_excess_return(results: list[BacktestResult], days: int = 5) -> float:
         """平均超额收益率"""
-        valid = [r for r in results if r.excess_returns.get(days) is not None]
+        valid = [
+            r.excess_returns[days]
+            for r in results
+            if r.tradable and r.excess_returns.get(days) is not None
+        ]
         if not valid:
             return 0.0
-        return float(np.mean([r.excess_returns[days] for r in valid]))
+        return float(np.mean(valid))
 
     @staticmethod
     def profit_loss_ratio(results: list[BacktestResult], days: int = 5) -> float:
         """盈亏比"""
-        valid = [r for r in results if r.returns.get(days) is not None]
+        valid = PerformanceMetrics._valid_returns(results, days)
         if not valid:
             return 0.0
-        wins = [r.returns[days] for r in valid if r.returns[days] > 0]
-        losses = [r.returns[days] for r in valid if r.returns[days] < 0]
+        wins = [r for r in valid if r > 0]
+        losses = [r for r in valid if r < 0]
         avg_win = float(np.mean(wins)) if wins else 0
         avg_loss = abs(float(np.mean(losses))) if losses else 1
         return avg_win / avg_loss if avg_loss > 0 else 0
@@ -66,15 +78,15 @@ class PerformanceMetrics:
     def sharpe_ratio(results: list[BacktestResult], days: int = 5,
                      risk_free_rate: float = 0.02) -> float:
         """年化夏普比"""
-        valid = [r.returns.get(days) for r in results if r.returns.get(days) is not None]
+        valid = PerformanceMetrics._valid_returns(results, days)
         if len(valid) < 5:
             return 0.0
         arr = np.array(valid)
-        excess = arr - risk_free_rate / 245  # 日化无风险利率
+        period_rf = risk_free_rate * days / 245
+        excess = arr - period_rf
         if np.std(arr) == 0:
             return 0.0
-        # 年化: sqrt(245)
-        return float(np.mean(excess) / np.std(arr) * np.sqrt(245))
+        return float(np.mean(excess) / np.std(arr) * np.sqrt(245 / days))
 
     @staticmethod
     def tradable_ratio(results: list[BacktestResult]) -> float:

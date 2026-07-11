@@ -29,5 +29,15 @@ def test_autogen_task_contains_agent_reports():
     task = AutoGenRoundtable._build_task(state, ["conflict"])
 
     assert "conflict" in task
-    assert "market" in task
-    assert "backtest" in task
+    assert "每个 Agent 只能基于自身 system message" in task
+    assert "market" not in task
+    assert "backtest" not in task
+
+
+def test_autogen_agent_report_is_scoped_and_truncated():
+    state = {"market_report": "m" * 1300}
+
+    report = AutoGenRoundtable._agent_report(state, "market_report")
+
+    assert report == "m" * 1200
+    assert AutoGenRoundtable._agent_report({}, "missing") == "暂无该 Agent 报告"

@@ -27,8 +27,8 @@ class DataCleaner:
         if "trade_date" in df.columns:
             df["trade_date"] = pd.to_datetime(df["trade_date"])
             df = df.sort_values("trade_date")
-        # 缺失值
-        df = df.ffill().bfill()
+        # 缺失值: 回测数据禁止用未来值回填过去。
+        df = df.ffill()
         # 异常值
         if "pct_chg" in df.columns:
             df = df[df["pct_chg"].abs() <= 100]  # 过滤极端涨跌幅

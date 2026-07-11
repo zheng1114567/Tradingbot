@@ -19,9 +19,10 @@ import logging
 from datetime import date
 from typing import Any
 
-from ..backtest.engine import BacktestEngine
 from ..llm.client import LLMClient
-from ..tool_nodes.backtest_tools import BacktestTools
+from ..tool_nodes.backtest_tools import BacktestTools, find_similar, run_backtest
+from .contract import basic_self_check, build_agent_update
+from .react_runner import run_prebuilt_react
 from .schemas import BacktestReport, Confidence
 
 logger = logging.getLogger(__name__)
@@ -29,7 +30,7 @@ logger = logging.getLogger(__name__)
 MIN_SAMPLE_SIZE = 30  # 最小样本量阈值
 
 
-def create_backtest_agent(llm: LLMClient):
+def create_backtest_agent(llm: LLMClient, tools: BacktestTools | None = None):
     """创建 Backtest Agent 节点函数"""
 
     def backtest_node(state: dict[str, Any]) -> dict[str, Any]:
@@ -39,8 +40,13 @@ def create_backtest_agent(llm: LLMClient):
         backtest_samples = tier2.get("backtest_samples", [])
 
         # 先用工具跑回测
-        tools = BacktestTools()
-        bt_result = tools.run_backtest(ticker, trade_date)
+        backtest_tools = tools or BacktestTools()
+        bt_result = backtest_tools.run_backtest(ticker, trade_date)
+        tool_calls = [{
+            "tool": "run_backtest",
+            "args": {"ticker": ticker, "trade_date": trade_date},
+            "records": 1 if bt_result else 0,
+        }]
 
         # 从 Tier 2 回测样本获取统计
         sample_size = 0
@@ -90,16 +96,31 @@ def create_backtest_agent(llm: LLMClient):
 请评估当前标的是否有足够的历史证据支撑买入。
 输出结构化回测验证报告。"""
 
+        react_prompt = (
+            "你是 A 股历史证据审查员。必须用工具运行回测并查找相似历史样本，"
+            "再输出结构化报告。样本不足、胜率不足和负超额收益必须降级。"
+        )
+        report, react_trace = run_prebuilt_react(
+            llm=llm,
+            tools=[run_backtest, find_similar],
+            prompt=react_prompt,
+            user_content=prompt,
+            response_format=BacktestReport,
+        )
+        if react_trace:
+            tool_calls.extend(react_trace)
+
         try:
-            report = llm.chat(
-                messages=[
-                    ("system",
-                     "你是 A 股历史证据审查员。样本不足时不能支撑买入。"
-                     "必须同时考虑成功样本和失败样本。"),
-                    ("human", prompt),
-                ],
-                response_format=BacktestReport,
-            )
+            if report is None:
+                report = llm.chat(
+                    messages=[
+                        ("system",
+                         "你是 A 股历史证据审查员。样本不足时不能支撑买入。"
+                         "必须同时考虑成功样本和失败样本。"),
+                        ("human", prompt),
+                    ],
+                    response_format=BacktestReport,
+                )
             # 规则覆盖 LLM (置信度强制降级)
             if not enough_samples and report.confidence == Confidence.HIGH:
                 report.confidence = Confidence.MEDIUM
@@ -115,9 +136,36 @@ def create_backtest_agent(llm: LLMClient):
                 reasoning=f"基于回测数据的规则分析: {sample_summary}",
             )
 
-        return {
-            "backtest_report": report.to_markdown() if hasattr(report, 'to_markdown') else str(report),
-            "backtest_report_obj": report,
-        }
+        evidence = [
+            f"sample_size={report.sample_size}",
+            f"win_rate={report.win_rate:.1%}",
+            f"avg_excess_return={report.avg_excess_return:+.2%}",
+            f"best_holding_period={report.best_holding_period or 'N/A'}",
+            f"confidence={report.confidence.value}",
+        ]
+        warnings = []
+        if report.sample_size < MIN_SAMPLE_SIZE:
+            warnings.append(f"样本不足: {report.sample_size} < {MIN_SAMPLE_SIZE}")
+        if report.win_rate < 0.5:
+            warnings.append(f"胜率不足: {report.win_rate:.1%}")
+        if report.avg_excess_return < 0:
+            warnings.append(f"超额收益为负: {report.avg_excess_return:+.2%}")
+
+        return build_agent_update(
+            state,
+            sender="Backtest Agent",
+            report_key="backtest_report",
+            report=report.to_markdown() if hasattr(report, "to_markdown") else str(report),
+            report_obj_key="backtest_report_obj",
+            report_obj=report,
+            evidence=evidence,
+            tool_calls=tool_calls,
+            self_check=basic_self_check(
+                evidence=evidence,
+                passed_rules=["sample_size_confidence_cap_enforced"],
+                warnings=warnings,
+                confidence=report.confidence.value,
+            ),
+        )
 
     return backtest_node

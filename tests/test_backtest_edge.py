@@ -86,10 +86,60 @@ class TestBacktestEdgeCases:
             "is_limit_down": [False] * 10,
         })
         engine = BacktestEngine()
-        # Jan 5 (Mon) 不是涨停日
-        result = engine.run_single(df, date(2026, 1, 5), "000001.SZ")
+        # Jan 2 signal enters on Jan 5, which is not limit-up.
+        result = engine.run_single(df, date(2026, 1, 2), "000001.SZ")
         assert result.tradable is not False
         assert result.entry_price is not None
+
+    def test_entry_uses_next_trading_day_open(self):
+        """盘后信号只能按下一交易日开盘价买入"""
+        df = pd.DataFrame({
+            "trade_date": pd.date_range("2026-01-01", periods=6, freq="B"),
+            "open": [10.0, 20.0, 21.0, 22.0, 23.0, 24.0],
+            "close": [10.5, 20.5, 21.5, 22.5, 23.5, 24.5],
+            "volume": [1e7] * 6,
+            "amount": [1e8] * 6,
+            "is_limit_up": [False] * 6,
+            "is_limit_down": [False] * 6,
+        })
+        result = BacktestEngine(config_override={"default_holding_days": [1]}).run_single(
+            df, date(2026, 1, 1), "000001.SZ"
+        )
+        assert result.entry_price == 20.0
+
+    def test_untradable_entry_has_no_returns(self):
+        """买入日不可成交时不应产生收益样本"""
+        df = pd.DataFrame({
+            "trade_date": pd.date_range("2026-01-01", periods=6, freq="B"),
+            "open": [10.0] * 6,
+            "close": [10.5] * 6,
+            "volume": [1e7] * 6,
+            "amount": [1e8] * 6,
+            "is_limit_up": [False, True, False, False, False, False],
+            "is_limit_down": [False] * 6,
+        })
+        result = BacktestEngine(config_override={"default_holding_days": [1, 3]}).run_single(
+            df, date(2026, 1, 1), "000001.SZ"
+        )
+        assert result.tradable is False
+        assert result.returns == {1: None, 3: None}
+        assert PerformanceMetrics.avg_return([result], 1) == 0.0
+
+    def test_unsellable_exit_has_no_return_for_period(self):
+        """目标卖出日及顺延窗口都不可卖时，该持有期收益为空"""
+        df = pd.DataFrame({
+            "trade_date": pd.date_range("2026-01-01", periods=12, freq="B"),
+            "open": [10.0] * 12,
+            "close": [10.5] * 12,
+            "volume": [1e7] * 12,
+            "amount": [1e8] * 12,
+            "is_limit_up": [False] * 12,
+            "is_limit_down": [False, False] + [True] * 10,
+        })
+        result = BacktestEngine(config_override={"default_holding_days": [1]}).run_single(
+            df, date(2026, 1, 1), "000001.SZ"
+        )
+        assert result.returns[1] is None
 
     def test_benchmark_default(self):
         """默认基准应为沪深300"""
@@ -130,3 +180,13 @@ class TestMetricsEdgeCases:
         assert PerformanceMetrics.avg_return([r], 5) == 0.01
         assert PerformanceMetrics.win_rate([r], 5) == 1.0
         assert PerformanceMetrics.tradable_ratio([r]) == 1.0
+
+    def test_metrics_ignore_untradable_returns(self):
+        """指标不应纳入不可成交样本的收益"""
+        r = BacktestResult(
+            run_date=date.today(), target_date=date.today(),
+            code="A", decision="推荐", tradable=False,
+            returns={5: 0.50},
+        )
+        assert PerformanceMetrics.avg_return([r], 5) == 0.0
+        assert PerformanceMetrics.win_rate([r], 5) == 0.0

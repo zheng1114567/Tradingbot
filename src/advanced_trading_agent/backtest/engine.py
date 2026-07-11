@@ -15,6 +15,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
+from copy import deepcopy
 from typing import Any, Literal
 
 import numpy as np
@@ -76,7 +77,7 @@ class BacktestEngine:
     """事件驱动回测引擎 — A 股专用"""
 
     def __init__(self, config_override: dict[str, Any] | None = None):
-        bc = config.get("backtest_config", {})
+        bc = deepcopy(config.get("backtest_config", {}))
         if config_override:
             bc.update(config_override)
 
@@ -109,11 +110,18 @@ class BacktestEngine:
             return False, "涨停不可买"
         if row.get("is_limit_down", False) and direction == "sell":
             return False, "跌停不可卖"
+        if row.get("is_limit_down", False) and direction == "buy":
+            return False, "跌停不可买"
         if row.get("volume", 0) == 0:
             return False, "无成交量"
         if row.get("amount", 0) < 10_000_000:  # 日成交额 >= 1000万
             return False, "成交额过低"
         return True, ""
+
+    def _empty_returns(self) -> tuple[dict[int, None], dict[int, None]]:
+        """Return a holding-period map with no executable returns."""
+        return ({d: None for d in self.holding_days},
+                {d: None for d in self.holding_days})
 
     # ============================================================
     # 单笔回测
@@ -141,10 +149,11 @@ class BacktestEngine:
                 benchmark=self.benchmark,
             )
 
-        # Point-in-time: 找到 entry_date 在数据中的位置
+        # Point-in-time: 找到 entry_date 在数据中的位置。
+        # 盘后观察池的 trade_date 是信号生成日，实际买入只能发生在下一交易日。
         price_df = price_df.sort_values("trade_date").reset_index(drop=True)
         try:
-            entry_idx = price_df[
+            signal_idx = price_df[
                 price_df["trade_date"] == pd.Timestamp(entry_date)
             ].index[0]
         except IndexError:
@@ -154,9 +163,28 @@ class BacktestEngine:
                 benchmark=self.benchmark,
             )
 
+        entry_idx = signal_idx + 1
+        if entry_idx >= len(price_df):
+            returns, excess_returns = self._empty_returns()
+            return BacktestResult(
+                run_date=date.today(), target_date=entry_date,
+                code=code, decision=decision, alpha_source=alpha_source,
+                returns=returns, excess_returns=excess_returns,
+                tradable=False, benchmark=self.benchmark,
+            )
+
         # 检查可成交性
         entry_row = price_df.loc[entry_idx]
         tradable, reason = self.is_tradable(entry_row, "buy")
+        if not tradable:
+            returns, excess_returns = self._empty_returns()
+            return BacktestResult(
+                run_date=date.today(), target_date=entry_date,
+                code=code, decision=decision, alpha_source=alpha_source,
+                entry_price=entry_row.get("open", entry_row.get("close")),
+                returns=returns, excess_returns=excess_returns,
+                tradable=False, benchmark=self.benchmark,
+            )
 
         # T+1: 最早次日卖出
         entry_price = entry_row.get("open", entry_row["close"])
@@ -186,6 +214,7 @@ class BacktestEngine:
             sell_tradable, _ = self.is_tradable(exit_row, "sell")
             if not sell_tradable:
                 # 顺延到下一个可成交日
+                found_exit = False
                 for lookahead in range(1, 10):
                     if exit_idx + lookahead >= len(price_df):
                         break
@@ -193,7 +222,12 @@ class BacktestEngine:
                     if self.is_tradable(next_row, "sell")[0]:
                         exit_price = next_row.get("open", next_row["close"])
                         exit_idx = exit_idx + lookahead
+                        found_exit = True
                         break
+                if not found_exit:
+                    returns[days] = None
+                    excess_returns[days] = None
+                    continue
 
             # 计算收益 (扣除成本)
             cost_sell = self.calc_trade_cost(is_buy=False)
@@ -201,8 +235,17 @@ class BacktestEngine:
             net_return = raw_return - (cost_buy + cost_sell) / 10000
             returns[days] = net_return
 
-            # 相对基准超额收益 (外部计算, 由调用方传入 bench_close 列)
-            excess_returns[days] = None
+            # 相对基准超额收益 (调用方可传入 bench_close 列)
+            if "bench_close" in price_df.columns:
+                bench_entry = price_df.loc[entry_idx, "bench_close"]
+                bench_exit = price_df.loc[exit_idx, "bench_close"]
+                if bench_entry and not pd.isna(bench_entry) and not pd.isna(bench_exit):
+                    bench_return = (bench_exit - bench_entry) / bench_entry
+                    excess_returns[days] = net_return - bench_return
+                else:
+                    excess_returns[days] = None
+            else:
+                excess_returns[days] = None
 
             # 最大回撤
             for look_idx in range(entry_idx + 1, exit_idx + 1):
@@ -212,7 +255,7 @@ class BacktestEngine:
                     dd = (cur - peak) / peak
                     max_drawdown = min(max_drawdown, dd)
 
-        actual_days = min(
+        actual_days = max(
             (d for d in self.holding_days if returns.get(d) is not None),
             default=0
         )

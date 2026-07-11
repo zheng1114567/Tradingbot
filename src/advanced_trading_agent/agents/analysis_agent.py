@@ -13,13 +13,15 @@ import logging
 from typing import Any
 
 from ..llm.client import LLMClient
-from ..tool_nodes.analysis_tools import AnalysisTools
+from ..tool_nodes.analysis_tools import AnalysisTools, check_crowding, get_factors, rank_stocks
+from .contract import basic_self_check, build_agent_update
+from .react_runner import run_prebuilt_react
 from .schemas import AnalysisReport, StockRanking
 
 logger = logging.getLogger(__name__)
 
 
-def create_analysis_agent(llm: LLMClient):
+def create_analysis_agent(llm: LLMClient, tools: AnalysisTools | None = None):
     """创建 Analysis Agent 节点函数"""
 
     def analysis_node(state: dict[str, Any]) -> dict[str, Any]:
@@ -28,10 +30,15 @@ def create_analysis_agent(llm: LLMClient):
         factors_raw = tier2.get("factors", [])
 
         # 用工具获取更多因子数据
-        tools = AnalysisTools()
-        factors = tools.get_factor_data(code=ticker, top_n=20)
+        analysis_tools = tools or AnalysisTools()
+        factors = analysis_tools.get_factor_data(code=ticker, top_n=20)
         if not factors:
             factors = factors_raw
+        tool_calls = [{
+            "tool": "get_factor_data",
+            "args": {"code": ticker, "top_n": 20},
+            "records": len(factors or []),
+        }]
 
         # 确定性排序 (不用 LLM)
         sorted_factors = sorted(
@@ -82,14 +89,29 @@ def create_analysis_agent(llm: LLMClient):
 
 输出结构化分析报告。"""
 
+        react_prompt = (
+            "你是 A 股因子分析师。必须先用工具检查因子、排序和拥挤度，"
+            "再输出结构化因子分析；个股排序最终必须以确定性排序结果为准。"
+        )
+        report, react_trace = run_prebuilt_react(
+            llm=llm,
+            tools=[get_factors, rank_stocks, check_crowding],
+            prompt=react_prompt,
+            user_content=prompt,
+            response_format=AnalysisReport,
+        )
+        if react_trace:
+            tool_calls.extend(react_trace)
+
         try:
-            report = llm.chat(
-                messages=[
-                    ("system", "你是 A 股因子分析师。基于因子数据分析, 不凭感觉。"),
-                    ("human", prompt),
-                ],
-                response_format=AnalysisReport,
-            )
+            if report is None:
+                report = llm.chat(
+                    messages=[
+                        ("system", "你是 A 股因子分析师。基于因子数据分析, 不凭感觉。"),
+                        ("human", prompt),
+                    ],
+                    response_format=AnalysisReport,
+                )
             # 用确定性排序结果覆盖 LLM 的排序 (LLM 排序不可靠)
             if rankings:
                 report.stock_rankings = rankings
@@ -105,9 +127,34 @@ def create_analysis_agent(llm: LLMClient):
                 reasoning="根据预计算因子的规则分析",
             )
 
-        return {
-            "analysis_report": report.to_markdown() if hasattr(report, 'to_markdown') else str(report),
-            "analysis_report_obj": report,
-        }
+        top_ranking = report.stock_rankings[0] if report.stock_rankings else None
+        evidence = [
+            f"factor_records={len(factors or [])}",
+            f"rankings={len(report.stock_rankings)}",
+            f"top_score={top_ranking.composite_score if top_ranking else 'N/A'}",
+            f"factor_warnings={'; '.join(report.factor_warnings) if report.factor_warnings else 'None'}",
+        ]
+        warnings = list(report.factor_warnings or [])
+        if top_ranking and top_ranking.warnings:
+            warnings.extend(top_ranking.warnings)
+        if not report.stock_rankings:
+            warnings.append("无可排序因子样本")
+
+        return build_agent_update(
+            state,
+            sender="Analysis Agent",
+            report_key="analysis_report",
+            report=report.to_markdown() if hasattr(report, "to_markdown") else str(report),
+            report_obj_key="analysis_report_obj",
+            report_obj=report,
+            evidence=evidence,
+            tool_calls=tool_calls,
+            self_check=basic_self_check(
+                evidence=evidence,
+                passed_rules=["deterministic_ranking_preferred"],
+                warnings=warnings,
+                confidence=report.sector_score,
+            ),
+        )
 
     return analysis_node

@@ -33,3 +33,10 @@ def test_backtest_config_values():
     bc = config.get("backtest_config", {})
     assert bc.get("primary_holding_days") == 5
     assert bc.get("benchmark") is not None
+
+
+def test_strategy_rule_config_values():
+    rules = config.get("strategy_rules", {})
+    assert rules.get("version")
+    assert rules.get("rubric_thresholds", {}).get("recommend_min_total") == 9
+    assert config.get("strategy_audit_queue_path")

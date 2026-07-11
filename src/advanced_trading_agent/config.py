@@ -31,6 +31,7 @@ _ENV_OVERRIDES = {
     "ATA_DATA_CACHE_DIR": "data_cache_dir",
     "ATA_RESULTS_DIR": "results_dir",
     "ATA_MEMORY_LOG_PATH": "memory_log_path",
+    "ATA_MEMORY_INDEX_PATH": "memory_index_path",
     # 兼容旧前缀
     "TRADINGAGENTS_LLM_PROVIDER": "llm_provider",
     "TRADINGAGENTS_DEEP_THINK_LLM": "deep_think_llm",
@@ -105,6 +106,11 @@ class Config:
             "results_dir": os.getenv("ATA_RESULTS_DIR", str(_ATA_HOME / "results")),
             "data_cache_dir": os.getenv("ATA_DATA_CACHE_DIR", str(_ATA_HOME / "cache")),
             "memory_log_path": os.getenv("ATA_MEMORY_LOG_PATH", str(_ATA_HOME / "memory" / "trading_memory.md")),
+            "memory_index_path": os.getenv("ATA_MEMORY_INDEX_PATH", str(_ATA_HOME / "memory" / "trading_memory.jsonl")),
+            "strategy_audit_queue_path": os.getenv(
+                "ATA_STRATEGY_AUDIT_QUEUE_PATH",
+                str(_ATA_HOME / "memory" / "strategy_audit_queue.jsonl"),
+            ),
             # LLM
             "llm_provider": "deepseek",
             "deep_think_llm": "deepseek-chat",
@@ -134,13 +140,37 @@ class Config:
             },
             # 回测
             "backtest_config": {
-                "default_holding_days": [1, 3, 5, 10],
+                "default_holding_days": [1, 3, 5, 10, 20],
                 "primary_holding_days": 5,
                 "benchmark": "000300.SH",  # 沪深300
                 "slippage_bps": 3,         # 滑点 3bp
                 "stamp_tax_bps": 10,       # 印花税 10bp (卖出)
                 "commission_bps": 3,       # 佣金 3bp
                 "min_sample_size": 30,     # 最小样本量
+            },
+            # 复盘与策略校准
+            "review_config": {
+                "review_horizons": [1, 3, 5, 10, 20],
+                "primary_horizon_days": 5,
+                "min_samples_to_adjust": 30,
+                "min_hit_rate": 0.45,
+                "min_avg_excess_return": 0.0,
+                "pause_hit_rate": 0.35,
+                "pause_avg_excess_return": -0.02,
+            },
+            # 策略规则版本: 所有确定性阈值进入同一 rulebook snapshot
+            "strategy_rules": {
+                "version": os.getenv("ATA_STRATEGY_RULE_VERSION", "rules-v1"),
+                "rubric_thresholds": {
+                    "recommend_min_total": 9,
+                    "watch_below_total": 9,
+                    "reject_on_risk_score": 0,
+                },
+                "memory_policy": {
+                    "primary_store": "markdown",
+                    "index_store": "jsonl",
+                    "deferred_reflection": True,
+                },
             },
         }
 

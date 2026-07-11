@@ -144,6 +144,7 @@ def get_vendor_chain(method: str) -> list[str]:
 # type: dict[str, dict[str, Callable]]
 # 结构: {method_name: {vendor_name: impl_function}}
 _VENDOR_IMPLEMENTATIONS: dict[str, dict[str, Callable]] = {}
+_DEFAULT_VENDOR_REGISTRATION_ATTEMPTED = False
 
 
 def register_vendor_impl(method: str, vendor: str, impl: Callable) -> None:
@@ -156,6 +157,26 @@ def register_vendor_impl(method: str, vendor: str, impl: Callable) -> None:
 def get_vendor_impl(method: str, vendor: str) -> Callable | None:
     """获取供应商实现"""
     return _VENDOR_IMPLEMENTATIONS.get(method, {}).get(vendor)
+
+
+def ensure_default_vendor_registration() -> None:
+    """Lazily register built-in adapters for direct tool-node calls."""
+    global _DEFAULT_VENDOR_REGISTRATION_ATTEMPTED
+    if _DEFAULT_VENDOR_REGISTRATION_ATTEMPTED:
+        return
+    _DEFAULT_VENDOR_REGISTRATION_ATTEMPTED = True
+    existing = {
+        method: dict(vendors)
+        for method, vendors in _VENDOR_IMPLEMENTATIONS.items()
+    }
+    try:
+        from .collector import register_all_vendors
+
+        register_all_vendors()
+        for method, vendors in existing.items():
+            _VENDOR_IMPLEMENTATIONS.setdefault(method, {}).update(vendors)
+    except Exception as exc:
+        logger.warning("Default vendor registration failed: %s", exc)
 
 
 def _record_route_attempt(
@@ -201,6 +222,8 @@ def route_to_vendor(method: str, *args, **kwargs) -> Any:
     6. 所有供应商失败 -> 抛异常
     """
     route_trace = kwargs.pop("_route_trace", None)
+    if method in {tool for info in TOOL_CATEGORIES.values() for tool in info["tools"]}:
+        ensure_default_vendor_registration()
     chain = get_vendor_chain(method)
 
     last_no_data: NoMarketDataError | None = None

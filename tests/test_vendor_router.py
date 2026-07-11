@@ -10,8 +10,10 @@ from advanced_trading_agent.data_agent.vendor_router import (
     route_to_vendor,
     get_vendor_chain,
     get_vendor_impl,
+    ensure_default_vendor_registration,
     _VENDOR_IMPLEMENTATIONS,
 )
+from advanced_trading_agent.data_agent import vendor_router
 
 
 class TestVendorChain:
@@ -19,6 +21,7 @@ class TestVendorChain:
 
     def setup_method(self):
         _VENDOR_IMPLEMENTATIONS.clear()
+        vendor_router._DEFAULT_VENDOR_REGISTRATION_ATTEMPTED = False
 
     def test_simple_success(self):
         def impl(code):
@@ -151,12 +154,40 @@ class TestVendorChain:
         assert get_vendor_chain("get_news") == ["akshare", "sina"]
         assert get_vendor_chain("get_sector") == ["akshare", "eastmoney"]
 
+    def test_default_vendor_registration_covers_tool_methods(self):
+        ensure_default_vendor_registration()
+
+        missing = []
+        for method in [
+            "get_daily",
+            "get_capital_flow",
+            "get_news",
+            "get_sector",
+            "get_st_status",
+            "get_suspended",
+            "get_delisting",
+            "get_northbound_flow",
+            "get_limit_up_tiers",
+            "get_dragon_tiger",
+            "get_margin",
+            "get_factors",
+            "check_crowding",
+            "find_similar",
+        ]:
+            registered = set(_VENDOR_IMPLEMENTATIONS.get(method, {}))
+            expected = set(get_vendor_chain(method))
+            if not registered.intersection(expected):
+                missing.append((method, sorted(expected), sorted(registered)))
+
+        assert missing == []
+
 
 class TestVendorImplRegistration:
     """供应商实现注册测试"""
 
     def setup_method(self):
         _VENDOR_IMPLEMENTATIONS.clear()
+        vendor_router._DEFAULT_VENDOR_REGISTRATION_ATTEMPTED = False
 
     def test_register_and_retrieve(self):
         def impl(code):

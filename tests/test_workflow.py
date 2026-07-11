@@ -37,6 +37,7 @@ def make_base_state(**overrides) -> dict:
         "trade_date": "2026-07-10",
         "sender": "system",
         "run_mode": "live",
+        "skip_backtest": False,
         "tier1_data": {
             "market": {"index_close": 3000, "index_change_pct": 0.5},
             "sentiment": {"sentiment": "正常", "sentiment_score": 55},
@@ -101,7 +102,7 @@ class TestWorkflowTopology:
         # 验证节点存在
         nodes = list(wf.get_graph().nodes.keys())
         for expected in ["Risk Check 1", "System Init", "Market Agent",
-                          "Round 2 Judge", "System Final Decision",
+                          "Round 2 Judge", "Skip Backtest", "System Final Decision",
                           "Approval Agent", "Report Agent"]:
             assert expected in nodes, f"缺少节点: {expected}"
 
@@ -273,12 +274,50 @@ class TestTradingSystemIntegration:
         assert tier1["_data_manifest"]["fields"]["stock.daily"]["available"] is True
         assert "risk.st_status" in tier1["_data_manifest"]["fields"]
 
+    def test_skip_backtest_parameter_routes_without_backtest_tools(self):
+        system = TradingSystem(debug=False, mode="live")
+
+        with patch.object(system, "_load_data") as load_data:
+            load_data.return_value = (
+                {
+                    "market": {"index_close": 3000, "index_change_pct": 0.5},
+                    "sentiment": {"sentiment": "正常", "sentiment_score": 55},
+                    "capital": {"confirmation": "资金确认", "net_inflow_main": 1e8},
+                    "risk": {
+                        "st_list": [],
+                        "suspended_list": [],
+                        "delisting_list": [],
+                        "daily_volume": 20_000_000,
+                        "risk_data_available": True,
+                        "risk_data_errors": [],
+                    },
+                },
+                {
+                    "price_data": [{"code": "000001.SZ", "close": 10, "pct_chg": 1}],
+                    "factors": [],
+                    "events": [],
+                    "backtest_samples": [],
+                },
+            )
+            state, _ = system.analyze(
+                ticker="000001.SZ",
+                trade_date="2026-07-10",
+                tier1_data={},
+                tier2_data={},
+                skip_backtest=True,
+            )
+
+        assert state["skip_backtest"] is True
+        assert state["backtest_report_obj"].sample_size == 0
+        assert "skip_backtest=True" in state["agent_evidence"]["Backtest Agent"]
+
     def test_workflow_state_keys(self):
         """验证 AgentState 的 key 设计完整性"""
         from typing import get_type_hints
         hints = get_type_hints(AgentState)
         required_keys = [
             "company_of_interest", "trade_date", "sender", "run_mode",
+            "skip_backtest",
             "tier1_data", "tier2_data", "tier2_decision",
             "risk_check_1", "risk_check_2", "risk_check_3",
             "market_report", "event_report", "analysis_report", "backtest_report",

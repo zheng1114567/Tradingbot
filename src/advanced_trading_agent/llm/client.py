@@ -8,9 +8,11 @@ from __future__ import annotations
 
 import logging
 import os
+import json
 from collections.abc import Sequence
 from typing import Any
 
+from openai import BadRequestError
 from openai import OpenAI
 
 from ..config import config
@@ -94,10 +96,29 @@ class LLMClient:
             normalized.append({"role": role, "content": str(content)})
         return normalized
 
-    def _call_openai(self, kwargs: dict[str, Any],
-                      response_format: type | None = None) -> str:
+    def _build_structured_messages(
+        self,
+        messages: list[dict[str, str]],
+        response_format: type,
+    ) -> list[dict[str, str]]:
+        """Ask providers without native JSON schema support for raw JSON."""
+        schema = response_format.model_json_schema()
+        instruction = (
+            "You must respond with valid JSON only. Do not wrap it in markdown. "
+            "The JSON must conform to this schema: "
+            f"{json.dumps(schema, ensure_ascii=False)}"
+        )
+        return [*messages, {"role": "system", "content": instruction}]
+
+    def _call_openai(
+        self,
+        kwargs: dict[str, Any],
+        response_format: type | None = None,
+        *,
+        use_native_response_format: bool = True,
+    ) -> str:
         """调用 OpenAI 兼容 API"""
-        if response_format is not None:
+        if response_format is not None and use_native_response_format:
             kwargs["response_format"] = {
                 "type": "json_schema",
                 "json_schema": {
@@ -106,6 +127,8 @@ class LLMClient:
                     "schema": response_format.model_json_schema(),
                 },
             }
+        elif response_format is not None:
+            kwargs["messages"] = self._build_structured_messages(kwargs["messages"], response_format)
 
         response = self.client.chat.completions.create(**kwargs)
         content = response.choices[0].message.content or ""
@@ -158,8 +181,12 @@ class LLMClient:
     def _parse_structured(content: str, response_format: type) -> Any:
         """解析 JSON 到 Pydantic"""
         try:
-            import json
-            parsed = json.loads(content)
+            text = content.strip()
+            if text.startswith("```"):
+                text = text.strip("`").strip()
+                if text.lower().startswith("json"):
+                    text = text[4:].strip()
+            parsed = json.loads(text)
             return response_format.model_validate(parsed)
         except Exception as e:
             raise ValueError(f"Failed to parse structured output: {e}") from e
@@ -192,6 +219,26 @@ class LLMClient:
             if self.provider == "anthropic":
                 return self._call_anthropic(kwargs, response_format=response_format)
             return self._call_openai(kwargs, response_format=response_format)
+        except BadRequestError as e:
+            message = str(e)
+            if response_format is not None and "response_format" in message:
+                logger.warning(
+                    "Provider rejected native structured output; retrying JSON prompt mode: %s",
+                    e,
+                )
+                fallback_kwargs = {
+                    "model": self.model,
+                    "messages": normalized_messages,
+                    "temperature": temperature or self.temperature,
+                    "max_tokens": max_tokens,
+                }
+                return self._call_openai(
+                    fallback_kwargs,
+                    response_format=response_format,
+                    use_native_response_format=False,
+                )
+            logger.error("LLM call failed: %s", e)
+            raise
         except Exception as e:
             logger.error("LLM call failed: %s", e)
             raise

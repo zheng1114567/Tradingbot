@@ -53,6 +53,7 @@ class AgentState(MessagesState):
 
     # === 运行模式 ===
     run_mode: str  # live / backtest
+    skip_backtest: bool
 
     # === 数据层 ===
     tier1_data: dict

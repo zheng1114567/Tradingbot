@@ -2,6 +2,7 @@
 import os
 import pytest
 from advanced_trading_agent.llm.client import LLMClient, create_llm
+from advanced_trading_agent.agents.schemas import MarketReport
 
 
 class TestLLMClient:
@@ -70,3 +71,57 @@ class TestLLMClient:
         client = create_llm(provider="deepseek")
         # 初始化应成功; 调用时才会失败
         assert client.client is not None
+
+    def test_parse_structured_accepts_markdown_json_block(self):
+        payload = """```json
+{"market_state":"正常","position_cap":0.6,"capital_confirmation":"资金确认","sector_preference":[],"risk_warning":null,"reasoning":"ok"}
+```"""
+
+        parsed = LLMClient._parse_structured(payload, MarketReport)
+
+        assert parsed.market_state == "正常"
+
+    def test_openai_structured_fallback_uses_json_prompt(self):
+        captured = {}
+
+        class Message:
+            content = (
+                '{"market_state":"正常","position_cap":0.6,'
+                '"capital_confirmation":"资金确认","sector_preference":[],'
+                '"risk_warning":null,"reasoning":"fallback"}'
+            )
+
+        class Choice:
+            message = Message()
+
+        class Response:
+            choices = [Choice()]
+
+        class Completions:
+            def create(self, **kwargs):
+                captured.update(kwargs)
+                return Response()
+
+        class Chat:
+            completions = Completions()
+
+        class FakeClient:
+            chat = Chat()
+
+        client = create_llm(provider="openai")
+        client._client = FakeClient()
+
+        result = client._call_openai(
+            {
+                "model": "fake",
+                "messages": [{"role": "user", "content": "x"}],
+                "temperature": 0.1,
+                "max_tokens": 100,
+            },
+            response_format=MarketReport,
+            use_native_response_format=False,
+        )
+
+        assert result.reasoning == "fallback"
+        assert "response_format" not in captured
+        assert "valid JSON only" in captured["messages"][-1]["content"]

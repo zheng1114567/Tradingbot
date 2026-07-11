@@ -39,6 +39,8 @@ from ..agents import (
     create_memory_agent,
     create_report_agent,
 )
+from ..agents.contract import basic_self_check, build_agent_update
+from ..agents.schemas import BacktestReport, Confidence
 from ..agents.system_agent import create_system_agent
 from ..config import config
 from ..data_agent.data_agent import DataAgent, DataAgentRequest
@@ -55,6 +57,49 @@ from .risk_nodes import create_risk_check_1, create_risk_check_2, create_risk_ch
 from .state import AgentState
 
 logger = logging.getLogger(__name__)
+
+
+def _create_skip_backtest_node():
+    """Create an auditable placeholder when backtest is explicitly skipped."""
+
+    def skip_backtest_node(state: dict[str, Any]) -> dict[str, Any]:
+        report = BacktestReport(
+            sample_size=0,
+            win_rate=0,
+            avg_excess_return=0,
+            failure_pattern="用户参数 skip_backtest=True，跳过回测证据审查",
+            confidence=Confidence.LOW,
+            reasoning="本次运行明确跳过 Backtest Agent；最终裁定不得将回测作为支持项。",
+        )
+        evidence = [
+            "skip_backtest=True",
+            "sample_size=0",
+            "confidence=low",
+        ]
+        return build_agent_update(
+            state,
+            sender="Backtest Agent",
+            report_key="backtest_report",
+            report=report.to_markdown(),
+            report_obj_key="backtest_report_obj",
+            report_obj=report,
+            evidence=evidence,
+            tool_calls=[],
+            self_check=basic_self_check(
+                evidence=evidence,
+                passed_rules=["backtest_explicitly_skipped"],
+                warnings=["回测已跳过，不能作为推荐依据"],
+                confidence="low",
+            ),
+        )
+
+    return skip_backtest_node
+
+
+def _after_analysis(state: AgentState) -> str:
+    if state.get("skip_backtest"):
+        return "skip_backtest"
+    return "backtest"
 
 
 def create_workflow() -> StateGraph:
@@ -76,6 +121,7 @@ def create_workflow() -> StateGraph:
     event_node = create_event_agent(llm)
     analysis_node = create_analysis_agent(llm)
     backtest_node = create_backtest_agent(llm)
+    skip_backtest_node = _create_skip_backtest_node()
 
     # System Agent (三个内部节点: init + round2_judge + final)
     sa = create_system_agent(llm)
@@ -98,6 +144,7 @@ def create_workflow() -> StateGraph:
     workflow.add_node("Event Agent", event_node)
     workflow.add_node("Analysis Agent", analysis_node)
     workflow.add_node("Backtest Agent", backtest_node)
+    workflow.add_node("Skip Backtest", skip_backtest_node)
     workflow.add_node("Risk Check 2", risk2_node)
     workflow.add_node("Round 2 Judge", sa_round2_judge)
     workflow.add_node("Round 2 Debate", _create_round2_node(llm))
@@ -131,10 +178,15 @@ def create_workflow() -> StateGraph:
 
     # Round 1 顺序
     workflow.add_edge("Event Agent", "Analysis Agent")
-    workflow.add_edge("Analysis Agent", "Backtest Agent")
+    workflow.add_conditional_edges(
+        "Analysis Agent",
+        _after_analysis,
+        {"backtest": "Backtest Agent", "skip_backtest": "Skip Backtest"},
+    )
 
     # Round 1 完成 → 硬风控2
     workflow.add_edge("Backtest Agent", "Risk Check 2")
+    workflow.add_edge("Skip Backtest", "Risk Check 2")
 
     # 硬风控2 → Round 2 Judge
     workflow.add_edge("Risk Check 2", "Round 2 Judge")
@@ -392,7 +444,8 @@ class TradingSystem:
 
     def analyze(self, ticker: str, trade_date: str | None = None,
                 tier1_data: dict[str, Any] | None = None,
-                tier2_data: dict[str, Any] | None = None) -> tuple[dict[str, Any], str]:
+                tier2_data: dict[str, Any] | None = None,
+                skip_backtest: bool = False) -> tuple[dict[str, Any], str]:
         """运行分析工作流
 
         Args:
@@ -426,6 +479,7 @@ class TradingSystem:
             "trade_date": trade_date,
             "sender": "system",
             "run_mode": self.mode,
+            "skip_backtest": skip_backtest,
             "tier1_data": tier1_data or {},
             "tier2_data": tier2_data or {},
             "tier2_decision": {},

@@ -4,7 +4,7 @@
 因此测试实现需要注册在 "tushare" 名下才能被路由到。
 """
 import pytest
-from advanced_trading_agent.data_service.vendor_router import (
+from advanced_trading_agent.data_agent.vendor_router import (
     DataVendor,
     VendorRateLimitError,
     VendorNotConfiguredError,

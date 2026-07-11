@@ -41,9 +41,9 @@ from ..agents import (
 )
 from ..agents.system_agent import create_system_agent
 from ..config import config
-from ..data_service.collector import register_all_vendors
-from ..data_service.manifest import DataManifest
-from ..data_service.vendor_router import route_to_vendor
+from ..data_agent.collector import register_all_vendors
+from ..data_agent.manifest import DataManifest
+from ..data_agent.vendor_router import route_to_vendor
 from ..llm.client import LLMClient
 from ..roundtable import AutoGenRoundtable
 from .conditional import (

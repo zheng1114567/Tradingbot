@@ -23,6 +23,7 @@ from .backtest.portfolio import ObservationPortfolioBacktester
 from .backtest.review import ReviewEngine
 from .backtest.scheduler import run_daily_review
 from .config import config
+from .data_agent.data_agent import DataAgent, DataAgentRequest
 from .graph.workflow import TradingSystem
 from .strategy_rules import load_strategy_proposals, review_strategy_proposal
 
@@ -150,6 +151,27 @@ def backtest_portfolio(signals_file: str, price_file: str) -> str:
     return report
 
 
+def run_standalone_data_agent(
+    ticker: str,
+    *,
+    trade_date: str | None = None,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    output_dir: str | None = None,
+) -> str:
+    """Run data collection, cleaning, analysis, and layered persistence only."""
+    result = DataAgent(results_dir=output_dir).run(
+        DataAgentRequest(
+            ticker=ticker,
+            trade_date=trade_date,
+            start_date=start_date,
+            end_date=end_date,
+            output_dir=output_dir,
+        )
+    )
+    return json.dumps(result.to_dict(), ensure_ascii=False, indent=2)
+
+
 def list_strategy_audit_queue() -> str:
     """Return pending and reviewed strategy change proposals as JSON."""
     return json.dumps(load_strategy_proposals(), ensure_ascii=False, indent=2)
@@ -180,6 +202,7 @@ def main():
     parser.add_argument("--review", action="store_true", help="运行复盘汇总")
     parser.add_argument("--daily-review", action="store_true", help="运行每日复盘任务")
     parser.add_argument("--portfolio-backtest", action="store_true", help="运行观察池组合回测")
+    parser.add_argument("--data-agent", action="store_true", help="单独运行 DataAgent 并分层保存数据")
     parser.add_argument("--strategy-audit", action="store_true", help="查看策略规则变更审计队列")
     parser.add_argument("--audit-proposal-id", help="要审批的策略变更 proposal_id")
     parser.add_argument("--audit-action", choices=["approve", "reject"], help="策略变更审批动作")
@@ -187,6 +210,9 @@ def main():
     parser.add_argument("--audit-comment", default="", help="审批备注")
     parser.add_argument("--price-file", help="复盘用行情 CSV")
     parser.add_argument("--signals-file", help="观察池信号 CSV")
+    parser.add_argument("--start-date", help="DataAgent 起始日期, 如 20260101")
+    parser.add_argument("--end-date", help="DataAgent 结束日期, 如 20260710")
+    parser.add_argument("--output-dir", help="DataAgent 输出目录")
     parser.add_argument("--workers", type=int, default=4, help="批量并发数 (默认 4)")
     parser.add_argument("--debug", action="store_true", help="调试模式")
     parser.add_argument("--json", action="store_true", help="JSON 输出")
@@ -206,6 +232,18 @@ def main():
         if not args.signals_file or not args.price_file:
             parser.error("--portfolio-backtest requires --signals-file and --price-file")
         print(backtest_portfolio(args.signals_file, args.price_file))
+        return
+
+    if args.data_agent:
+        if not args.ticker:
+            parser.error("--data-agent requires --ticker")
+        print(run_standalone_data_agent(
+            args.ticker,
+            trade_date=args.date,
+            start_date=args.start_date,
+            end_date=args.end_date,
+            output_dir=args.output_dir,
+        ))
         return
 
     if args.strategy_audit:

@@ -36,7 +36,7 @@ class BacktestTools:
             return cached
 
         try:
-            from ..data_service.vendor_router import route_to_vendor
+            from ..data_agent.vendor_router import route_to_vendor
             price_data = route_to_vendor("get_daily", code=code)
             if isinstance(price_data, str) and "NO_DATA" in price_data:
                 return {"sample_size": 0, "error": price_data}
@@ -80,7 +80,7 @@ class BacktestTools:
         if cached:
             return cached
 
-        from ..data_service.vendor_router import route_to_vendor
+        from ..data_agent.vendor_router import route_to_vendor
         data = route_to_vendor("find_similar",
                                 sentiment=sentiment,
                                 sector=sector,

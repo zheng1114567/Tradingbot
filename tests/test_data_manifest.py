@@ -2,7 +2,7 @@
 
 import json
 
-from advanced_trading_agent.data_service.manifest import DataManifest
+from advanced_trading_agent.data_agent.manifest import DataManifest
 
 
 def test_manifest_records_fields_and_soft_vetoes(tmp_path):

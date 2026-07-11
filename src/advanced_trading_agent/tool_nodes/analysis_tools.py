@@ -17,7 +17,7 @@ from typing import Any
 from langchain_core.tools import tool
 
 from ..core.cache_manager import CacheManager
-from ..data_service.vendor_router import route_to_vendor
+from ..data_agent.vendor_router import route_to_vendor
 
 logger = logging.getLogger(__name__)
 

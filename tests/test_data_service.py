@@ -1,14 +1,14 @@
 """数据 Service 测试"""
 import pytest
 import pandas as pd
-from advanced_trading_agent.data_service.schema import (
+from advanced_trading_agent.data_agent.schema import (
     MarketSchema, SentimentSchema, CapitalSchema,
     FactorSchema, EventSchema, PointInTime,
     DecisionType, MarketSentiment, CapitalConfirmation,
 )
-from advanced_trading_agent.data_service.cleaner import DataCleaner
-from advanced_trading_agent.data_service.factors import FactorCalculator
-from advanced_trading_agent.data_service.vendor_router import (
+from advanced_trading_agent.data_agent.cleaner import DataCleaner
+from advanced_trading_agent.data_agent.factors import FactorCalculator
+from advanced_trading_agent.data_agent.vendor_router import (
     DataVendor, route_to_vendor, register_vendor_impl,
     VendorRateLimitError, VendorNotConfiguredError,
 )
@@ -79,8 +79,8 @@ class TestVendorRouter:
         register_vendor_impl("test_fallback", "a", vendor_a)
         register_vendor_impl("test_fallback", "b", vendor_b)
         # 手动测试
-        from advanced_trading_agent.data_service.vendor_router import get_vendor_chain
-        from advanced_trading_agent.data_service.vendor_router import _VENDOR_IMPLEMENTATIONS
+        from advanced_trading_agent.data_agent.vendor_router import get_vendor_chain
+        from advanced_trading_agent.data_agent.vendor_router import _VENDOR_IMPLEMENTATIONS
         impls = _VENDOR_IMPLEMENTATIONS.get("test_fallback", {})
         assert "a" in impls
         assert "b" in impls

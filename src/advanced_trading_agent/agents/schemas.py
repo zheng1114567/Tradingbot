@@ -1,8 +1,8 @@
 """
 Agent 输出 Schema — 重写版
 
-与 data_service/schema.py 的分工:
-- data_service/schema.py: 数据格式 (行情/资金/因子等原始数据)
+与 data_agent/schema.py 的分工:
+- data_agent/schema.py: 数据格式 (行情/资金/因子等原始数据)
 - agents/schemas.py: Agent 分析结果 (报告/决策等)
 
 借鉴 TradingAgents' schemas.py 的 Pydantic 结构化输出模式

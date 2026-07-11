@@ -13,6 +13,29 @@ pip install -e .
 - LLM API Key (DeepSeek)
 - tushare token
 
+### DataAgent 需要接入的 API
+
+- `TUSHARE_TOKEN`: 推荐配置。用于 A 股日 K、资金流、财务、ST/停牌、北向资金、龙虎榜、融资融券等数据。
+- `akshare`: 无需 token，但需要安装 `pip install -e ".[akshare]"` 或 `pip install akshare`。主要作为行情、新闻、板块、涨停梯队的降级数据源。
+- `DEEPSEEK_API_KEY`: 只有运行完整多 Agent 分析时需要；单独测试 DataAgent 不需要 LLM key。
+
+### 单独测试 DataAgent
+
+```bash
+python -m advanced_trading_agent.main --data-agent --ticker 000001.SZ --date 2026-07-10 --start-date 20260101 --end-date 20260710 --output-dir ./data/results
+```
+
+DataAgent 会按步骤留痕并分层保存:
+
+```text
+data/results/data_agent_runs/<date>_<ticker>_<timestamp>/
+├── 01_input/request.json          # 输入参数、供应商链
+├── 02_raw/raw_data.json           # 原始供应商数据
+├── 03_cleaned/cleaned_data.json   # 标准化、清洗后的数据
+├── 04_analysis/analysis_data.json # 因子、摘要和分析数据
+└── 05_final/response.json         # 汇总返回: input/raw/cleaned/analysis/manifest
+```
+
 ## 运行
 
 ```bash
@@ -31,10 +54,11 @@ python -m advanced_trading_agent.main --ticker 000001.SZ --debug
 ```
 src/advanced_trading_agent/
 ├── config.py              # 配置管理 (env覆盖)
-├── data_service/          # 数据层
+├── data_agent/            # DataAgent 数据层
 │   ├── schema.py          # Tier 1/Tier 2 Schema (Pydantic)
 │   ├── vendor_router.py   # 多供应商路由 + 降级
 │   ├── collector.py       # 数据采集 (tushare/akshare)
+│   ├── data_agent.py      # 独立 DataAgent: 输入→原始→清洗→分析→最终返回
 │   ├── cleaner.py         # 数据清洗
 │   └── factors.py         # 因子计算
 ├── agents/                # Agent 层

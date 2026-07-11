@@ -271,7 +271,7 @@ def _cache_via_mootdx(client: Any, tickers: list[str], daily_dir: Path) -> int:
 
         try:
             code = ticker.split(".")[0]
-            df = client.bars(symbol=code, frequency=9, offset=250)
+            df = client.bars(symbol=code, frequency=9, offset=60)
             if df is not None and len(df) > 0:
                 df["code"] = ticker
                 df["data_source"] = "mootdx"

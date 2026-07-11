@@ -122,10 +122,12 @@ class Config:
             "output_language": "Chinese",
             # 数据
             "data_vendors": {
-                "market_data": "tushare,akshare",   # 行情: tushare 优先, akshare 降级
-                "fundamental_data": "tushare",
+                "market_data": "akshare,tushare",   # 行情: 免费 akshare 优先, tushare 可选增强
+                "fundamental_data": "akshare,tushare",
                 "news_data": "akshare",
-                "capital_flow": "tushare,akshare",
+                "capital_flow": "akshare,tushare",
+                "a_share_specific": "akshare,tushare",
+                "analysis": "akshare,tushare",
             },
             # 风控
             "risk_config": {

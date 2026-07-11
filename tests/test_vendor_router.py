@@ -1,7 +1,7 @@
 """供应商路由测试 — 测试错误处理和降级链
 
-注意: route_to_vendor 的默认供应商链为 ["tushare"],
-因此测试实现需要注册在 "tushare" 名下才能被路由到。
+注意: 未知方法的默认供应商链为 ["tushare"]。
+已知行情方法默认免费优先，供应商链从 akshare 开始。
 """
 import pytest
 from advanced_trading_agent.data_agent.vendor_router import (
@@ -99,9 +99,9 @@ class TestVendorChain:
 
     def test_fallback_order_across_vendors(self):
         """使用已知的 get_daily 方法测试降级顺序"""
-        from advanced_trading_agent.config import config
         chain = get_vendor_chain("get_daily")
         assert len(chain) >= 1
+        assert chain[0] == "akshare"
         # 注册 mock 到链中的第一个供应商
         first_vendor = chain[0]
         def mock_impl(code):

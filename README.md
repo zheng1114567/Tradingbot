@@ -11,15 +11,15 @@ pip install -e .
 
 复制 `.env.example` 为 `.env`, 填入:
 - LLM API Key (DeepSeek)
-- tushare token
+- 如只测试 DataAgent，可先不填任何付费行情 token；默认走 AkShare 免费数据源
 
 ### DataAgent 需要接入的 API
 
-- `TUSHARE_TOKEN`: 推荐配置。用于 A 股日 K、资金流、财务、ST/停牌、北向资金、龙虎榜、融资融券等数据。
+- `akshare`: 默认免费数据源，无需 API Key，但需要安装 `pip install -e ".[akshare]"` 或 `pip install akshare`。主要用于行情、新闻、板块、涨停梯队和部分资金流数据。
+  - 文档: `https://akshare.akfamily.xyz/`
+- `TUSHARE_TOKEN`: 可选增强/备用数据源，不作为默认必需项。部分接口依赖积分或付费权限，适合后续补齐更稳定的 A 股专业数据。
   - 注册/Token: `https://tushare.pro/register`
   - 文档: `https://tushare.pro/document/1?doc_id=40`
-- `akshare`: 无需 token，但需要安装 `pip install -e ".[akshare]"` 或 `pip install akshare`。主要作为行情、新闻、板块、涨停梯队的降级数据源。
-  - 文档: `https://akshare.akfamily.xyz/`
 - `DEEPSEEK_API_KEY`: 完整多 Agent 分析默认 LLM key；单独测试 DataAgent 不需要。
   - API Key: `https://platform.deepseek.com/api_keys`
   - 文档: `https://api-docs.deepseek.com/`

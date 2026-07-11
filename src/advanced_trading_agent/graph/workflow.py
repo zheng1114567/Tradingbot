@@ -43,7 +43,7 @@ from ..agents.system_agent import create_system_agent
 from ..config import config
 from ..data_agent.data_agent import DataAgent, DataAgentRequest
 from ..llm.client import LLMClient
-from ..roundtable import AutoGenRoundtable
+from ..roundtable import AutoGenRoundtable, RoundtableHarness
 from .conditional import (
     after_market,
     after_risk_check_1,
@@ -190,21 +190,15 @@ def _create_round2_node(llm: LLMClient):
             targets.append("Backtest")
         return targets or ["Market", "Event", "Analysis", "Backtest"]
 
-    def _report_for(state: AgentState, target: str) -> str:
-        key = {
-            "Market": "market_report",
-            "Event": "event_report",
-            "Analysis": "analysis_report",
-            "Backtest": "backtest_report",
-        }.get(target, "")
-        report = state.get(key, "")
-        return str(report).strip() or "暂无该 Agent 报告"
+    harness = RoundtableHarness()
 
-    def _fallback_answer(target: str, contradiction: str, report: str) -> str:
-        excerpt = report.replace("\n", " ")[:260]
+    def _fallback_answer(target: str, contradiction: str, report: str, evidence: str) -> str:
+        report_excerpt = report.replace("\n", " ")[:180]
+        evidence_excerpt = evidence.replace("\n", " ")[:360]
         return (
-            f"{target} 回答: 基于当前报告，针对矛盾“{contradiction}”，"
-            f"可引用证据为：{excerpt}"
+            f"{target} 回答: 基于 AgentContext 和当前报告，针对矛盾“{contradiction}”，"
+            f"可引用数据证据为：{evidence_excerpt}；报告依据为：{report_excerpt}。"
+            "若上述证据不足以消除矛盾，应进入最终裁定的反对意见。"
         )
 
     def _build_summary(questions: list[dict[str, Any]]) -> str:
@@ -267,24 +261,18 @@ def _create_round2_node(llm: LLMClient):
 
         # 提出质询 (LLM 生成问题, 失败则确定性降级)
         contradiction = contradictions[count % len(contradictions)] if contradictions else ""
-        market_rpt = state.get("market_report", "")
-        event_rpt = state.get("event_report", "")
-        analysis_rpt = state.get("analysis_report", "")
-        backtest_rpt = state.get("backtest_report", "")
+        context = harness.build_context(state, contradictions)
 
         prompt = f"""Round 2 交叉质询 - 第 {count + 1} 轮
 
 发现的矛盾:
 {contradiction}
 
-各 Agent 报告:
-Market: {market_rpt[:200]}
-Event: {event_rpt[:200]}
-Analysis: {analysis_rpt[:200]}
-Backtest: {backtest_rpt[:200]}
+DATA_AGENT_BRIEF:
+{context.shared_evidence_text[:1200]}
 
 请针对上述矛盾提出一个精准的质询问题。
-质询必须基于数据矛盾, 不能是泛泛的问题。"""
+质询必须基于 DataAgent 数据矛盾和各 Agent 可见证据, 不能是泛泛的问题。"""
 
         try:
             response = llm.chat([
@@ -298,7 +286,7 @@ Backtest: {backtest_rpt[:200]}
         questions = list(round2.get("questions", []))
         answers = []
         for target in _targets_for(contradiction):
-            report = _report_for(state, target)
+            agent_context = context.agent_contexts[target]
             answer_prompt = f"""Round 2 圆桌会议 - {target} Agent 发言
 
 矛盾:
@@ -307,26 +295,34 @@ Backtest: {backtest_rpt[:200]}
 System 质询:
 {question}
 
-{target} Agent 当前报告:
-{report[:1200]}
+AgentContext:
+{agent_context.evidence_text[:1200]}
 
-请只基于该 Agent 报告回答:
+{target} Agent 当前报告:
+{agent_context.report[:1200]}
+
+请只基于该 AgentContext、DATA_AGENT_BRIEF 和该 Agent 报告回答:
 1. 是否坚持原判断
-2. 支撑证据
+2. 支撑证据，必须点名引用 DataAgent 字段或报告片段
 3. 对最终裁定的影响
 回答要简洁。"""
             try:
                 response = llm.chat([
-                    ("system", f"你是 {target} Agent，在圆桌会议中只基于自己的报告回答。"),
+                    ("system", agent_context.system_message),
                     ("human", answer_prompt),
                 ])
                 answer = response if isinstance(response, str) else str(response)
             except Exception:
-                answer = _fallback_answer(target, contradiction, report)
+                answer = _fallback_answer(
+                    target,
+                    contradiction,
+                    agent_context.report,
+                    agent_context.evidence_text,
+                )
             answers.append({
                 "target_agent": target,
                 "answer": answer,
-                "evidence": report[:500],
+                "evidence": agent_context.evidence_text[:800],
             })
 
         questions.append({

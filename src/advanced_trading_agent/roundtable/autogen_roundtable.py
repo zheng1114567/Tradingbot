@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from ..config import config
+from .harness import RoundtableHarness
 
 logger = logging.getLogger(__name__)
 
@@ -31,10 +32,16 @@ class RoundtableResult:
 class AutoGenRoundtable:
     """Run a fixed-order AutoGen roundtable for Round 2 conflicts."""
 
-    def __init__(self, model: str | None = None, provider: str | None = None):
+    def __init__(
+        self,
+        model: str | None = None,
+        provider: str | None = None,
+        harness: RoundtableHarness | None = None,
+    ):
         cfg = config.get_all()
         self.provider = provider or cfg.get("llm_provider", "deepseek")
         self.model = model or cfg.get("deep_think_llm", "deepseek-chat")
+        self.harness = harness or RoundtableHarness()
 
     def run(self, state: dict[str, Any]) -> RoundtableResult:
         """Run AutoGen synchronously from the workflow node."""
@@ -54,59 +61,46 @@ class AutoGenRoundtable:
         if not contradictions:
             return RoundtableResult(summary="", unresolved_conflicts=[])
 
+        context = self.harness.build_context(state, contradictions)
         model_client = self._create_model_client(OpenAIChatCompletionClient)
+        agent_contexts = context.agent_contexts
         agents = [
             AssistantAgent(
                 "Market_Agent",
                 model_client=model_client,
-                system_message=(
-                    "你是 Market Agent。只基于给定 Market 报告讨论市场温度、资金状态、仓位约束。"
-                    "不要编造外部数据。\n\n"
-                    f"Market 报告:\n{self._agent_report(state, 'market_report')}"
-                ),
+                system_message=agent_contexts["Market"].system_message,
             ),
             AssistantAgent(
                 "Event_Agent",
                 model_client=model_client,
-                system_message=(
-                    "你是 Event Agent。只基于给定 Event 报告讨论事件传导、证据等级和定价状态。"
-                    "不要编造外部数据。\n\n"
-                    f"Event 报告:\n{self._agent_report(state, 'event_report')}"
-                ),
+                system_message=agent_contexts["Event"].system_message,
             ),
             AssistantAgent(
                 "Analysis_Agent",
                 model_client=model_client,
-                system_message=(
-                    "你是 Analysis Agent。只基于给定 Analysis 报告讨论因子排序、拥挤和择时。"
-                    "不要编造外部数据。\n\n"
-                    f"Analysis 报告:\n{self._agent_report(state, 'analysis_report')}"
-                ),
+                system_message=agent_contexts["Analysis"].system_message,
             ),
             AssistantAgent(
                 "Backtest_Agent",
                 model_client=model_client,
-                system_message=(
-                    "你是 Backtest Agent。只基于给定 Backtest 报告讨论样本量、胜率和统计可靠性。"
-                    "不要编造外部数据。\n\n"
-                    f"Backtest 报告:\n{self._agent_report(state, 'backtest_report')}"
-                ),
+                system_message=agent_contexts["Backtest"].system_message,
             ),
             AssistantAgent(
                 "System_Moderator",
                 model_client=model_client,
                 system_message=(
-                    "你是 System Moderator。最后发言必须总结未解决分歧、裁定压力"
-                    "(upgrade/neutral/downgrade)和风控关注点。回复结尾写 TERMINATE。"
+                    "你是 System Moderator。你只能基于 DATA_AGENT_BRIEF、各 Agent 发言和"
+                    "Round 2 矛盾点裁定。最后必须输出 unresolved_conflicts、final_pressure"
+                    "(upgrade/neutral/downgrade) 和风控关注点。回复结尾写 TERMINATE。"
                 ),
             ),
         ]
         team = RoundRobinGroupChat(agents, max_turns=len(agents))
-        task = self._build_task(state, contradictions)
+        task = context.task
         result = await team.run(task=task)
         messages = self._extract_messages(result)
         await model_client.close()
-        return self._to_result(contradictions, messages)
+        return self._to_result(contradictions, messages, context=context)
 
     def _create_model_client(self, client_cls):
         if self.provider == "deepseek":
@@ -155,16 +149,7 @@ class AutoGenRoundtable:
 
     @staticmethod
     def _build_task(state: dict[str, Any], contradictions: list[str]) -> str:
-        return f"""请进行 Round 2 圆桌会议。
-
-矛盾点:
-{chr(10).join(f"- {c}" for c in contradictions)}
-
-规则:
-1. 每个 Agent 只能基于自身 system message 中的专属报告发言。
-2. 必须回应矛盾点，不允许补造数据。
-3. Moderator 最后输出未解决分歧、final_pressure 和风控关注点。
-"""
+        return RoundtableHarness().build_context(state, contradictions).task
 
     @staticmethod
     def _extract_messages(result: Any) -> list[dict[str, str]]:
@@ -177,7 +162,20 @@ class AutoGenRoundtable:
         return messages
 
     @staticmethod
-    def _to_result(contradictions: list[str], messages: list[dict[str, str]]) -> RoundtableResult:
+    def _to_result(
+        contradictions: list[str],
+        messages: list[dict[str, str]],
+        *,
+        context: Any | None = None,
+    ) -> RoundtableResult:
+        evidence_by_source = {}
+        if context is not None:
+            evidence_by_source = {
+                "Market_Agent": context.agent_contexts["Market"].evidence_text,
+                "Event_Agent": context.agent_contexts["Event"].evidence_text,
+                "Analysis_Agent": context.agent_contexts["Analysis"].evidence_text,
+                "Backtest_Agent": context.agent_contexts["Backtest"].evidence_text,
+            }
         questions = [{
             "source_agent": "System",
             "target_agent": ",".join(m["source"] for m in messages if m["source"]),
@@ -187,7 +185,7 @@ class AutoGenRoundtable:
                 {
                     "target_agent": m["source"],
                     "answer": m["content"],
-                    "evidence": "",
+                    "evidence": evidence_by_source.get(m["source"], ""),
                 }
                 for m in messages
             ],

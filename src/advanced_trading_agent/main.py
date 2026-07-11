@@ -216,7 +216,8 @@ def audit_strategy_proposal(
 
 
 def scan_and_analyze(top_n: int = 10, trade_date: str | None = None,
-                    debug: bool = False, skip_backtest: bool = False) -> str:
+                    debug: bool = False, skip_backtest: bool = False,
+                    force: bool = False) -> str:
     """Scan for hot stocks, collect data during scan, then analyze top candidates.
 
     Uses the combined scan+collect flow: MarketScanner.scan_and_collect()
@@ -225,7 +226,7 @@ def scan_and_analyze(top_n: int = 10, trade_date: str | None = None,
 
     An LLM-generated market summary is included at the top of the report.
     Results are cached by trade_date — re-running the same date returns
-    the cached report immediately.
+    the cached report immediately unless `force=True`.
 
     Returns a consolidated Markdown report.
     """
@@ -235,8 +236,8 @@ def scan_and_analyze(top_n: int = 10, trade_date: str | None = None,
     scan_path = results_dir / f"scan_report_{trade_date}.md"
 
     # Cache hit: return existing report for the same trade date
-    if scan_path.exists():
-        logger.info("Scan report already exists for %s, returning cached.", trade_date)
+    if scan_path.exists() and not force:
+        logger.info("Scan report already exists for %s, returning cached. Use --force to re-scan.", trade_date)
         return scan_path.read_text(encoding="utf-8")
 
     scanner = MarketScanner(top_sectors=5, top_n=top_n)
@@ -378,6 +379,7 @@ def main():
     parser.add_argument("--json", action="store_true", help="JSON 输出")
     parser.add_argument("--scan", action="store_true", help="扫描热点板块和强势股，自动分析 Top-N")
     parser.add_argument("--scan-top-n", type=int, default=10, help="扫描后分析 Top N 只股票 (默认 10)")
+    parser.add_argument("--force", "-f", action="store_true", help="强制重新扫描，忽略缓存")
 
     args = parser.parse_args()
 
@@ -432,6 +434,7 @@ def main():
             trade_date=args.date,
             debug=args.debug,
             skip_backtest=args.skip_backtest,
+            force=args.force,
         ))
         return
 

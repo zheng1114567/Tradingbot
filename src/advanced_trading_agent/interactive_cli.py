@@ -682,8 +682,28 @@ def _handle_scan(
     context: SessionContext,
     analyze_runner: AnalyzeRunner,
 ) -> CommandResult:
-    """Handle /scan — discover hot stocks and optionally analyze them."""
+    """Handle /scan — discover hot stocks.
+
+    /scan               Lightweight scan, show ranked candidates.
+    /scan --full         Full pipeline: scan + collect + LLM summary + analyze top-N.
+    /scan --force        Force re-scan even if today's report is cached.
+    """
     from .data_agent.scanner import MarketScanner
+
+    force = "--force" in args or "-f" in args
+    full = "--full" in args
+
+    if full or force:
+        from .main import scan_and_analyze
+        top_n = 10
+        for i, a in enumerate(args):
+            if a in ("--top", "-n") and i + 1 < len(args):
+                try:
+                    top_n = int(args[i + 1])
+                except ValueError:
+                    pass
+        report = scan_and_analyze(top_n=top_n, force=force)
+        return CommandResult(report)
 
     scanner = MarketScanner(top_sectors=5, top_n=15)
     results = scanner.scan()
@@ -693,6 +713,7 @@ def _handle_scan(
 
     output = scanner.format_results(results)
     output += "\n\nUse /a <ticker> to analyze any of these candidates."
+    output += "\nUse /scan --full for deep analysis with LLM summary."
 
     return CommandResult(output)
 

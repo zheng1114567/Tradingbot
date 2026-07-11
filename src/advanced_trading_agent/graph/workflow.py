@@ -380,6 +380,7 @@ class TradingSystem:
                 end_date=trade_date,
                 include_market=True,
                 include_capital_flow=True,
+                include_news=True,
                 include_factors=True,
                 include_risk=True,
                 use_react_planner=True,

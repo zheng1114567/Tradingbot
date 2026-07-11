@@ -40,6 +40,12 @@ python -m advanced_trading_agent.main --data-agent --ticker 000001.SZ --date 202
 python -m advanced_trading_agent.main --data-agent --react-planner --ticker 000001.SZ --date 2026-07-10 --start-date 20260101 --output-dir ./data/results
 ```
 
+也可以给新闻采集加关键词过滤:
+
+```bash
+python -m advanced_trading_agent.main --data-agent --react-planner --ticker 000001.SZ --date 2026-07-10 --start-date 20260101 --output-dir ./data/results --news-keyword 平安银行
+```
+
 DataAgent 会按步骤留痕并分层保存:
 
 ```text

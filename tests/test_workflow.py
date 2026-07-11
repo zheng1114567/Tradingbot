@@ -254,7 +254,7 @@ class TestTradingSystemIntegration:
                                 }
                             ],
                             "factors": [],
-                            "events": [],
+                            "events": [{"event_id": "news_0001", "summary": "测试新闻"}],
                             "backtest_samples": [],
                         },
                     },
@@ -267,6 +267,7 @@ class TestTradingSystemIntegration:
             tier1, tier2 = system._load_data("000001.SZ", "2026-07-10")
 
         assert tier2["price_data"]
+        assert tier2["events"][0]["summary"] == "测试新闻"
         assert tier1["risk"]["risk_data_available"] is True
         assert tier1["risk"]["daily_volume"] == 20_000_000
         assert tier1["_data_manifest"]["fields"]["stock.daily"]["available"] is True

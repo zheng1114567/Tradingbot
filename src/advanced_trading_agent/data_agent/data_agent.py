@@ -74,10 +74,13 @@ class DataAgentRequest:
     end_date: str | None = None
     include_market: bool = True
     include_capital_flow: bool = True
+    include_news: bool = True
     include_factors: bool = True
     include_risk: bool = True
+    news_keyword: str | None = None
     use_react_planner: bool = False
     output_dir: str | None = None
+    max_news_records: int = 20
     max_return_records: int = 20
 
     def normalized_trade_date(self) -> str:
@@ -164,6 +167,7 @@ class DataAgent:
                 "daily": get_vendor_chain("get_daily"),
                 "market": get_vendor_chain("get_daily"),
                 "capital_flow": get_vendor_chain("get_capital_flow"),
+                "news": get_vendor_chain("get_news"),
                 "factors": get_vendor_chain("get_factors"),
                 "risk": {
                     "st_status": get_vendor_chain("get_st_status"),
@@ -257,6 +261,14 @@ class DataAgent:
                 start_date=request.start_date,
                 end_date=request.normalized_end_date(),
             )
+        news = []
+        if request.include_news:
+            news = self._safe_route(
+                "get_news",
+                manifest,
+                field_name="news.events",
+                keyword=request.news_keyword,
+            )
         st_status: list[str] | dict[str, Any] = []
         suspended: list[str] | dict[str, Any] = []
         delisting: list[str] | dict[str, Any] = []
@@ -276,6 +288,7 @@ class DataAgent:
             "daily": daily,
             "market": market,
             "capital_flow": capital_flow,
+            "news": news,
             "risk": {
                 "st_status": st_status,
                 "suspended": suspended,
@@ -330,6 +343,8 @@ class DataAgent:
 
         capital_flow_raw = raw_payload.get("capital_flow")
         capital_flow = capital_flow_raw if isinstance(capital_flow_raw, list) else []
+        news_raw = raw_payload.get("news")
+        news = news_raw if isinstance(news_raw, list) else []
         market_raw = raw_payload.get("market")
         if isinstance(market_raw, list):
             market_df = DataCleaner.clean_daily(market_raw)
@@ -354,15 +369,21 @@ class DataAgent:
                 "record_count": len(capital_flow),
                 "records": capital_flow,
             },
+            "news": {
+                "record_count": len(news),
+                "records": self._clean_news(news),
+            },
             "risk": risk_raw if isinstance(risk_raw, dict) else {},
         }
 
     def _analyze(self, cleaned_payload: dict[str, Any], request: DataAgentRequest) -> dict[str, Any]:
         daily_records = cleaned_payload.get("daily", {}).get("records", [])
         market_records = cleaned_payload.get("market", {}).get("records", [])
+        news_records = cleaned_payload.get("news", {}).get("records", [])
         daily_df = pd.DataFrame(daily_records)
         market_df = pd.DataFrame(market_records)
         factor_records: list[dict[str, Any]] = []
+        event_records = self._build_event_records(news_records, request)
         capital_summary = self._summarize_capital(cleaned_payload.get("capital_flow", {}).get("records", []))
         summary: dict[str, Any] = {
             "ticker": request.ticker,
@@ -404,6 +425,7 @@ class DataAgent:
             risk_summary=risk_summary,
             daily_records=daily_records,
             factor_records=factor_records,
+            event_records=event_records,
         )
 
         return {
@@ -413,6 +435,10 @@ class DataAgent:
             "market": market_summary,
             "capital": capital_summary,
             "risk": risk_summary,
+            "events": {
+                "record_count": len(event_records),
+                "records": event_records,
+            },
             "factors": {
                 "record_count": len(factor_records),
                 "records": factor_records,
@@ -527,6 +553,7 @@ class DataAgent:
         risk_summary: dict[str, Any],
         daily_records: list[dict[str, Any]],
         factor_records: list[dict[str, Any]],
+        event_records: list[dict[str, Any]],
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         tier1 = {
             "market": {
@@ -547,11 +574,68 @@ class DataAgent:
         tier2 = {
             "price_data": daily_records,
             "factors": factor_records,
-            "events": [],
+            "events": event_records,
             "backtest_samples": [],
             "data_summary": summary,
         }
         return tier1, tier2
+
+    @classmethod
+    def _clean_news(cls, records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        cleaned: list[dict[str, Any]] = []
+        for idx, record in enumerate(records, start=1):
+            title = cls._first_present(record, ["title", "标题", "新闻标题", "article_title", "name"]) or ""
+            summary = cls._first_present(record, ["summary", "摘要", "内容", "content", "article_content"]) or title
+            source = cls._first_present(record, ["source", "来源", "data_source"]) or record.get("data_source", "")
+            event_time = cls._first_present(record, ["time", "时间", "datetime", "发布时间", "date", "日期"])
+            url = cls._first_present(record, ["url", "链接", "link"])
+            cleaned.append({
+                "event_id": str(record.get("event_id") or f"news_{idx:04d}"),
+                "event_type": str(record.get("event_type") or "新闻"),
+                "summary": str(summary)[:500],
+                "title": str(title or summary)[:200],
+                "direction": str(record.get("direction") or "中性"),
+                "confidence": float(record.get("confidence") or 0.5),
+                "event_time": cls._json_safe_value(event_time),
+                "source": source,
+                "url": url,
+                "raw": record,
+            })
+        return cleaned
+
+    @staticmethod
+    def _first_present(record: dict[str, Any], keys: list[str]) -> Any:
+        for key in keys:
+            value = record.get(key)
+            if value not in (None, ""):
+                return value
+        return None
+
+    @classmethod
+    def _build_event_records(
+        cls,
+        news_records: list[dict[str, Any]],
+        request: DataAgentRequest,
+    ) -> list[dict[str, Any]]:
+        events = []
+        for record in news_records[: request.max_news_records]:
+            events.append({
+                "event_id": record.get("event_id"),
+                "event_type": record.get("event_type", "新闻"),
+                "summary": record.get("summary", ""),
+                "direction": record.get("direction", "中性"),
+                "confidence": record.get("confidence", 0.5),
+                "transmission_path": "新闻输入",
+                "direct_beneficiaries": [request.ticker],
+                "evidence_level": "公开新闻",
+                "pricing_status": "未定价",
+                "chain_quality": "weak",
+                "event_time": record.get("event_time"),
+                "source": record.get("source", ""),
+                "url": record.get("url"),
+                "raw": record.get("raw", {}),
+            })
+        return events
 
     def _write_json(self, path: Path, payload: dict[str, Any]) -> DataAgentArtifact:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -620,6 +704,7 @@ def run_data_agent(
     end_date: str | None = None,
     output_dir: str | None = None,
     use_react_planner: bool = False,
+    news_keyword: str | None = None,
 ) -> DataAgentRun:
     """Convenience entry point for tests and CLI usage."""
 
@@ -630,5 +715,6 @@ def run_data_agent(
         end_date=end_date,
         output_dir=output_dir,
         use_react_planner=use_react_planner,
+        news_keyword=news_keyword,
     )
     return DataAgent(results_dir=output_dir).run(request)

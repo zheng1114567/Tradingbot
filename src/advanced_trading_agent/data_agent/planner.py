@@ -40,6 +40,7 @@ class DataAgentPlanner:
                 "ticker": request.ticker,
                 "trade_date": request.normalized_trade_date(),
                 "include_capital_flow": request.include_capital_flow,
+                "include_news": getattr(request, "include_news", True),
                 "include_factors": request.include_factors,
             },
         })
@@ -80,6 +81,23 @@ class DataAgentPlanner:
                 "thought": "Capital flow was not requested.",
                 "action": "skip_method",
                 "args": {"method": "get_capital_flow"},
+                "observation": "skipped",
+            })
+
+        if getattr(request, "include_news", True):
+            required_methods.append("get_news")
+            trace.append({
+                "thought": "News events are needed by Event Agent tier-2 context.",
+                "action": "require_method",
+                "args": {"method": "get_news", "vendor_chain": get_vendor_chain("get_news")},
+                "observation": "required",
+            })
+        else:
+            skipped_methods.append("get_news")
+            trace.append({
+                "thought": "News events were not requested.",
+                "action": "skip_method",
+                "args": {"method": "get_news"},
                 "observation": "skipped",
             })
 
@@ -149,6 +167,8 @@ class DataAgentPlanner:
         ]
         if request.include_capital_flow:
             parts.insert(1, "collect capital flow")
+        if getattr(request, "include_news", True):
+            parts.insert(1, "collect news events")
         if request.include_factors:
             parts.insert(-1, "compute factors")
         return ", ".join(parts)

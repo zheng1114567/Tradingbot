@@ -36,6 +36,15 @@ def test_data_agent_persists_layered_trace(tmp_path):
             ]
         if method == "get_capital_flow":
             return [{"ts_code": kwargs["code"], "trade_date": "20260710", "net_mf_amount": 88.0}]
+        if method == "get_news":
+            return [
+                {
+                    "标题": "平安银行发布经营动态",
+                    "内容": "平安银行零售业务保持稳定。",
+                    "发布时间": "2026-07-10 09:30:00",
+                    "来源": "akshare",
+                }
+            ]
         if method in {"get_st_status", "get_suspended", "get_delisting"}:
             return []
         raise AssertionError(f"unexpected method: {method}")
@@ -62,6 +71,8 @@ def test_data_agent_persists_layered_trace(tmp_path):
     assert final_payload["analysis"]["summary"]["latest"]["code"] == "000001.SZ"
     assert final_payload["agent_payload"]["tier1_data"]["risk"]["risk_data_available"] is True
     assert final_payload["agent_payload"]["tier2_data"]["price_data"]
+    assert final_payload["cleaned"]["news"]["record_count"] == 1
+    assert final_payload["agent_payload"]["tier2_data"]["events"][0]["summary"] == "平安银行零售业务保持稳定。"
     assert final_payload["analysis"]["agent_payload"]["tier1_data"]["risk"]["risk_data_available"] is True
     assert final_payload["manifest"]["fields"]["stock.daily"]["available"] is True
     assert result.artifacts["agent_payload"].path.endswith("05_agent_payload\\agent_payload.json") or result.artifacts["agent_payload"].path.endswith("05_agent_payload/agent_payload.json")
@@ -89,6 +100,8 @@ def test_data_agent_react_planner_persists_plan(tmp_path):
             ]
         if method in {"get_st_status", "get_suspended", "get_delisting"}:
             return []
+        if method == "get_news":
+            return []
         raise AssertionError(f"unexpected method: {method}")
 
     result = DataAgent(route_fn=fake_route, results_dir=str(tmp_path)).run(
@@ -106,6 +119,7 @@ def test_data_agent_react_planner_persists_plan(tmp_path):
     assert result.plan["required_methods"] == [
         "get_daily",
         "get_daily:index",
+        "get_news",
         "get_st_status",
         "get_suspended",
         "get_delisting",
@@ -139,6 +153,8 @@ def test_data_agent_marks_risk_errors_unavailable(tmp_path):
                 }
             ]
         if method == "get_capital_flow":
+            return []
+        if method == "get_news":
             return []
         if method == "get_st_status":
             raise RuntimeError("risk endpoint failed")

@@ -159,6 +159,7 @@ def run_standalone_data_agent(
     end_date: str | None = None,
     output_dir: str | None = None,
     use_react_planner: bool = False,
+    news_keyword: str | None = None,
 ) -> str:
     """Run data collection, cleaning, analysis, and layered persistence only."""
     result = DataAgent(results_dir=output_dir).run(
@@ -169,6 +170,7 @@ def run_standalone_data_agent(
             end_date=end_date,
             output_dir=output_dir,
             use_react_planner=use_react_planner,
+            news_keyword=news_keyword,
         )
     )
     return json.dumps(result.to_dict(), ensure_ascii=False, indent=2)
@@ -216,6 +218,7 @@ def main():
     parser.add_argument("--start-date", help="DataAgent 起始日期, 如 20260101")
     parser.add_argument("--end-date", help="DataAgent 结束日期, 如 20260710")
     parser.add_argument("--output-dir", help="DataAgent 输出目录")
+    parser.add_argument("--news-keyword", help="DataAgent 新闻关键词过滤, 可选")
     parser.add_argument("--workers", type=int, default=4, help="批量并发数 (默认 4)")
     parser.add_argument("--debug", action="store_true", help="调试模式")
     parser.add_argument("--json", action="store_true", help="JSON 输出")
@@ -247,6 +250,7 @@ def main():
             end_date=args.end_date,
             output_dir=args.output_dir,
             use_react_planner=args.react_planner,
+            news_keyword=args.news_keyword,
         ))
         return
 

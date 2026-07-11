@@ -41,6 +41,7 @@ class DataAgentPlanner:
                 "trade_date": request.normalized_trade_date(),
                 "include_capital_flow": request.include_capital_flow,
                 "include_news": getattr(request, "include_news", True),
+                "use_llm_news_filter": getattr(request, "use_llm_news_filter", True),
                 "include_factors": request.include_factors,
             },
         })
@@ -86,10 +87,16 @@ class DataAgentPlanner:
 
         if getattr(request, "include_news", True):
             required_methods.append("get_news")
+            if getattr(request, "use_llm_news_filter", True):
+                required_methods.append("filter_news:llm")
             trace.append({
-                "thought": "News events are needed by Event Agent tier-2 context.",
+                "thought": "News events are needed by Event Agent tier-2 context and should be filtered for relevance.",
                 "action": "require_method",
-                "args": {"method": "get_news", "vendor_chain": get_vendor_chain("get_news")},
+                "args": {
+                    "method": "get_news",
+                    "vendor_chain": get_vendor_chain("get_news"),
+                    "llm_filter": getattr(request, "use_llm_news_filter", True),
+                },
                 "observation": "required",
             })
         else:
@@ -169,6 +176,8 @@ class DataAgentPlanner:
             parts.insert(1, "collect capital flow")
         if getattr(request, "include_news", True):
             parts.insert(1, "collect news events")
+            if getattr(request, "use_llm_news_filter", True):
+                parts.insert(2, "filter news with LLM")
         if request.include_factors:
             parts.insert(-1, "compute factors")
         return ", ".join(parts)

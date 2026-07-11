@@ -10,6 +10,7 @@ The agent records each stage of a data run:
 from __future__ import annotations
 
 import json
+import os
 import re
 from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, timezone
@@ -78,6 +79,8 @@ class DataAgentRequest:
     include_factors: bool = True
     include_risk: bool = True
     news_keyword: str | None = None
+    use_llm_news_filter: bool = True
+    news_relevance_threshold: float = 0.5
     use_react_planner: bool = False
     output_dir: str | None = None
     max_news_records: int = 20
@@ -131,10 +134,12 @@ class DataAgent:
         route_fn: RouteFn = route_to_vendor,
         results_dir: str | None = None,
         planner: DataAgentPlanner | None = None,
+        llm_client: Any | None = None,
     ) -> None:
         self._route_fn = route_fn
         self._results_dir = Path(results_dir or config.get("results_dir", "data/results"))
         self._planner = planner or DataAgentPlanner()
+        self._llm_client = llm_client
 
     def run(self, request: DataAgentRequest) -> DataAgentRun:
         # Ensure the free vendor adapters are available when DataAgent is used standalone.
@@ -383,7 +388,8 @@ class DataAgent:
         daily_df = pd.DataFrame(daily_records)
         market_df = pd.DataFrame(market_records)
         factor_records: list[dict[str, Any]] = []
-        event_records = self._build_event_records(news_records, request)
+        news_filter = self._filter_news_with_llm(news_records, request)
+        event_records = self._build_event_records(news_filter["records"], request)
         capital_summary = self._summarize_capital(cleaned_payload.get("capital_flow", {}).get("records", []))
         summary: dict[str, Any] = {
             "ticker": request.ticker,
@@ -438,6 +444,7 @@ class DataAgent:
             "events": {
                 "record_count": len(event_records),
                 "records": event_records,
+                "filter": news_filter["trace"],
             },
             "factors": {
                 "record_count": len(factor_records),
@@ -637,6 +644,174 @@ class DataAgent:
             })
         return events
 
+    def _filter_news_with_llm(
+        self,
+        news_records: list[dict[str, Any]],
+        request: DataAgentRequest,
+    ) -> dict[str, Any]:
+        if not news_records:
+            return {
+                "records": [],
+                "trace": {
+                    "mode": "empty",
+                    "used_llm": False,
+                    "reason": "no news records",
+                    "input_count": 0,
+                    "output_count": 0,
+                },
+            }
+
+        if not request.use_llm_news_filter:
+            records = self._filter_news_deterministically(news_records, request)
+            return {
+                "records": records,
+                "trace": {
+                    "mode": "deterministic",
+                    "used_llm": False,
+                    "reason": "LLM news filter disabled",
+                    "input_count": len(news_records),
+                    "output_count": len(records),
+                },
+            }
+
+        try:
+            llm = self._get_news_filter_llm()
+            if not self._llm_news_filter_configured(llm):
+                raise RuntimeError(f"{getattr(llm, 'provider', 'llm')} API key is not configured")
+            decisions = self._ask_llm_to_filter_news(llm, news_records, request)
+            selected: list[dict[str, Any]] = []
+            decision_by_id = {str(item.get("event_id")): item for item in decisions}
+            for record in news_records:
+                decision = decision_by_id.get(str(record.get("event_id")), {})
+                try:
+                    relevance = float(decision.get("relevance", 0))
+                except (TypeError, ValueError):
+                    relevance = 0.0
+                if not bool(decision.get("keep")) or relevance < request.news_relevance_threshold:
+                    continue
+                selected.append({
+                    **record,
+                    "direction": decision.get("direction") or record.get("direction", "中性"),
+                    "confidence": self._bounded_float(decision.get("confidence"), default=0.5),
+                    "llm_relevance": relevance,
+                    "llm_reason": str(decision.get("reason", ""))[:300],
+                })
+            return {
+                "records": selected[: request.max_news_records],
+                "trace": {
+                    "mode": "llm",
+                    "used_llm": True,
+                    "model": getattr(llm, "model", ""),
+                    "provider": getattr(llm, "provider", ""),
+                    "input_count": len(news_records),
+                    "output_count": len(selected[: request.max_news_records]),
+                    "threshold": request.news_relevance_threshold,
+                },
+            }
+        except Exception as exc:
+            records = self._filter_news_deterministically(news_records, request)
+            return {
+                "records": records,
+                "trace": {
+                    "mode": "fallback",
+                    "used_llm": False,
+                    "reason": f"{type(exc).__name__}: {exc}",
+                    "input_count": len(news_records),
+                    "output_count": len(records),
+                    "threshold": request.news_relevance_threshold,
+                },
+            }
+
+    def _get_news_filter_llm(self) -> Any:
+        if self._llm_client is not None:
+            return self._llm_client
+        from ..llm.client import create_llm
+
+        return create_llm()
+
+    def _llm_news_filter_configured(self, llm: Any) -> bool:
+        if self._llm_client is not None:
+            return True
+        provider = str(getattr(llm, "provider", "deepseek")).upper()
+        if provider == "DEEPSEEK":
+            return bool(os.environ.get("DEEPSEEK_API_KEY"))
+        if provider == "OPENAI":
+            return bool(os.environ.get("OPENAI_API_KEY"))
+        if provider == "ANTHROPIC":
+            return bool(os.environ.get("ANTHROPIC_API_KEY"))
+        return bool(os.environ.get(f"{provider}_API_KEY"))
+
+    @classmethod
+    def _ask_llm_to_filter_news(
+        cls,
+        llm: Any,
+        news_records: list[dict[str, Any]],
+        request: DataAgentRequest,
+    ) -> list[dict[str, Any]]:
+        candidates = [
+            {
+                "event_id": record.get("event_id"),
+                "title": record.get("title"),
+                "summary": record.get("summary"),
+                "event_time": record.get("event_time"),
+                "source": record.get("source"),
+            }
+            for record in news_records[: max(request.max_news_records * 3, request.max_news_records)]
+        ]
+        prompt = {
+            "ticker": request.ticker,
+            "trade_date": request.normalized_trade_date(),
+            "news_keyword": request.news_keyword,
+            "task": (
+                "Select news relevant to this ticker or its sector for downstream trading agents. "
+                "Return only JSON with key decisions: list of objects containing event_id, keep, "
+                "relevance from 0 to 1, direction in 正面/负面/中性, confidence from 0 to 1, and reason."
+            ),
+            "candidates": candidates,
+        }
+        response = llm.chat(
+            [
+                (
+                    "system",
+                    "你是量化交易数据管道里的新闻筛选器。只返回 JSON，不要输出解释文字。",
+                ),
+                ("human", json.dumps(prompt, ensure_ascii=False)),
+            ],
+            temperature=0,
+            max_tokens=1200,
+        )
+        payload = json.loads(str(response))
+        decisions = payload.get("decisions", payload if isinstance(payload, list) else [])
+        if not isinstance(decisions, list):
+            raise ValueError("LLM news filter response must contain a decisions list")
+        return [item for item in decisions if isinstance(item, dict)]
+
+    @classmethod
+    def _filter_news_deterministically(
+        cls,
+        news_records: list[dict[str, Any]],
+        request: DataAgentRequest,
+    ) -> list[dict[str, Any]]:
+        keyword = (request.news_keyword or "").lower()
+        selected = []
+        for record in news_records:
+            haystack = json.dumps(record, ensure_ascii=False).lower()
+            if not keyword or keyword in haystack:
+                selected.append({
+                    **record,
+                    "llm_relevance": 0.5,
+                    "llm_reason": "deterministic keyword fallback",
+                })
+        return selected[: request.max_news_records]
+
+    @staticmethod
+    def _bounded_float(value: Any, *, default: float) -> float:
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            return default
+        return max(0.0, min(1.0, parsed))
+
     def _write_json(self, path: Path, payload: dict[str, Any]) -> DataAgentArtifact:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(
@@ -705,6 +880,7 @@ def run_data_agent(
     output_dir: str | None = None,
     use_react_planner: bool = False,
     news_keyword: str | None = None,
+    use_llm_news_filter: bool = True,
 ) -> DataAgentRun:
     """Convenience entry point for tests and CLI usage."""
 
@@ -716,5 +892,6 @@ def run_data_agent(
         output_dir=output_dir,
         use_react_planner=use_react_planner,
         news_keyword=news_keyword,
+        use_llm_news_filter=use_llm_news_filter,
     )
     return DataAgent(results_dir=output_dir).run(request)

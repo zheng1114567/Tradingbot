@@ -5,6 +5,21 @@ import json
 from advanced_trading_agent.data_agent.data_agent import DataAgent, DataAgentRequest
 
 
+class FakeLLM:
+    provider = "fake"
+    model = "fake-news-filter"
+
+    def __init__(self, response: str | Exception):
+        self.response = response
+        self.calls = []
+
+    def chat(self, messages, **kwargs):
+        self.calls.append({"messages": messages, "kwargs": kwargs})
+        if isinstance(self.response, Exception):
+            raise self.response
+        return self.response
+
+
 def test_data_agent_persists_layered_trace(tmp_path):
     def fake_route(method, **kwargs):
         if method == "get_daily":
@@ -55,6 +70,7 @@ def test_data_agent_persists_layered_trace(tmp_path):
             trade_date="2026-07-10",
             start_date="20260701",
             end_date="20260710",
+            use_llm_news_filter=False,
         )
     )
 
@@ -73,6 +89,7 @@ def test_data_agent_persists_layered_trace(tmp_path):
     assert final_payload["agent_payload"]["tier2_data"]["price_data"]
     assert final_payload["cleaned"]["news"]["record_count"] == 1
     assert final_payload["agent_payload"]["tier2_data"]["events"][0]["summary"] == "平安银行零售业务保持稳定。"
+    assert final_payload["analysis"]["events"]["filter"]["mode"] == "deterministic"
     assert final_payload["analysis"]["agent_payload"]["tier1_data"]["risk"]["risk_data_available"] is True
     assert final_payload["manifest"]["fields"]["stock.daily"]["available"] is True
     assert result.artifacts["agent_payload"].path.endswith("05_agent_payload\\agent_payload.json") or result.artifacts["agent_payload"].path.endswith("05_agent_payload/agent_payload.json")
@@ -120,6 +137,7 @@ def test_data_agent_react_planner_persists_plan(tmp_path):
         "get_daily",
         "get_daily:index",
         "get_news",
+        "filter_news:llm",
         "get_st_status",
         "get_suspended",
         "get_delisting",
@@ -163,9 +181,89 @@ def test_data_agent_marks_risk_errors_unavailable(tmp_path):
         raise AssertionError(f"unexpected method: {method}")
 
     result = DataAgent(route_fn=fake_route, results_dir=str(tmp_path)).run(
-        DataAgentRequest(ticker="000001.SZ", trade_date="2026-07-10", include_factors=False)
+        DataAgentRequest(
+            ticker="000001.SZ",
+            trade_date="2026-07-10",
+            include_factors=False,
+            use_llm_news_filter=False,
+        )
     )
 
     risk = result.final_data["agent_payload"]["tier1_data"]["risk"]
     assert risk["risk_data_available"] is False
     assert risk["risk_data_errors"] == ["st_status: risk endpoint failed"]
+
+
+def test_data_agent_uses_llm_to_filter_news(tmp_path):
+    def fake_route(method, **kwargs):
+        if method == "get_daily":
+            return []
+        if method == "get_capital_flow":
+            return []
+        if method == "get_news":
+            return [
+                {"title": "Ping An Bank operating update", "summary": "Retail business stable", "source": "test"},
+                {"title": "Unrelated sports headline", "summary": "A match result", "source": "test"},
+            ]
+        if method in {"get_st_status", "get_suspended", "get_delisting"}:
+            return []
+        raise AssertionError(method)
+
+    llm = FakeLLM(json.dumps({
+        "decisions": [
+            {
+                "event_id": "news_0001",
+                "keep": True,
+                "relevance": 0.92,
+                "direction": "正面",
+                "confidence": 0.8,
+                "reason": "Directly related to the ticker.",
+            },
+            {
+                "event_id": "news_0002",
+                "keep": False,
+                "relevance": 0.05,
+                "direction": "中性",
+                "confidence": 0.7,
+                "reason": "Unrelated.",
+            },
+        ]
+    }, ensure_ascii=False))
+
+    result = DataAgent(route_fn=fake_route, results_dir=str(tmp_path), llm_client=llm).run(
+        DataAgentRequest(ticker="000001.SZ", trade_date="2026-07-10", news_keyword="Ping An")
+    )
+
+    events = result.final_data["agent_payload"]["tier2_data"]["events"]
+    assert len(events) == 1
+    assert events[0]["summary"] == "Retail business stable"
+    assert events[0]["direction"] == "正面"
+    assert events[0]["confidence"] == 0.8
+    assert result.final_data["analysis"]["events"]["filter"]["used_llm"] is True
+    assert llm.calls
+
+
+def test_data_agent_news_filter_falls_back_when_llm_fails(tmp_path):
+    def fake_route(method, **kwargs):
+        if method == "get_daily":
+            return []
+        if method == "get_capital_flow":
+            return []
+        if method == "get_news":
+            return [
+                {"title": "Ping An Bank operating update", "summary": "Retail business stable", "source": "test"},
+                {"title": "Unrelated sports headline", "summary": "A match result", "source": "test"},
+            ]
+        if method in {"get_st_status", "get_suspended", "get_delisting"}:
+            return []
+        raise AssertionError(method)
+
+    llm = FakeLLM(RuntimeError("LLM unavailable"))
+    result = DataAgent(route_fn=fake_route, results_dir=str(tmp_path), llm_client=llm).run(
+        DataAgentRequest(ticker="000001.SZ", trade_date="2026-07-10", news_keyword="Ping An")
+    )
+
+    events = result.final_data["agent_payload"]["tier2_data"]["events"]
+    assert len(events) == 1
+    assert events[0]["summary"] == "Retail business stable"
+    assert result.final_data["analysis"]["events"]["filter"]["mode"] == "fallback"

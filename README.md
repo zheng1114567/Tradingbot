@@ -46,6 +46,12 @@ python -m advanced_trading_agent.main --data-agent --react-planner --ticker 0000
 python -m advanced_trading_agent.main --data-agent --react-planner --ticker 000001.SZ --date 2026-07-10 --start-date 20260101 --output-dir ./data/results --news-keyword 平安银行
 ```
 
+默认会使用 LLM 对新闻相关性、方向、置信度做筛选；如果没有 LLM Key 或调用失败，会自动降级为规则筛选并在 `analysis.events.filter` 里留痕。调试时也可以关闭 LLM 新闻筛选:
+
+```bash
+python -m advanced_trading_agent.main --data-agent --ticker 000001.SZ --date 2026-07-10 --no-llm-news-filter
+```
+
 DataAgent 会按步骤留痕并分层保存:
 
 ```text

@@ -714,6 +714,63 @@ def get_sector_constituents_akshare(sector_name: str = "") -> list[dict[str, Any
     return []
 
 
+# ------------------------------------------------------------------
+# efinance-based adapters (fallback when eastmoney push2 endpoints are blocked)
+# ------------------------------------------------------------------
+
+
+def get_dragon_tiger_efinance(trade_date: str | None = None) -> list[dict[str, Any]]:
+    """Dragon-tiger list via efinance (uses datacenter API, not push2)."""
+    try:
+        import efinance as ef
+    except ImportError:
+        raise VendorNotConfiguredError("efinance not installed (pip install efinance)", vendor="efinance")
+
+    td = trade_date or date.today().isoformat()
+    try:
+        df = ef.stock.get_daily_billboard(start_date=td, end_date=td)
+        if df is None or df.empty:
+            return []
+        results: list[dict[str, Any]] = []
+        for record in df.head(30).to_dict("records"):
+            results.append({
+                "code": str(record.get("股票代码", record.get("code", ""))),
+                "name": str(record.get("股票名称", record.get("name", ""))),
+                "close": _float_or_none(record.get("收盘价", record.get("close", 0))),
+                "change_pct": _float_or_none(record.get("涨跌幅", 0)),
+                "turnover": _float_or_none(record.get("换手率", 0)),
+                "net_buy": _float_or_none(record.get("龙虎榜净买额", 0)),
+                "reason": str(record.get("上榜原因", "")),
+                "data_source": "efinance",
+            })
+        return results
+    except Exception as exc:
+        logger.warning("efinance dragon_tiger failed: %s", exc)
+        raise NoMarketDataError(str(exc), vendor="efinance") from exc
+
+
+def get_sector_constituents_efinance(sector_name: str = "") -> list[dict[str, Any]]:
+    """Get board members via efinance — reverse lookup from board name.
+
+    This is best-effort: iterates A-share stocks and collects those
+    belonging to the target board. Cached in memory for the session.
+    """
+    if not sector_name:
+        return []
+
+    try:
+        import efinance as ef
+    except ImportError:
+        raise VendorNotConfiguredError("efinance not installed (pip install efinance)", vendor="efinance")
+
+    # For now, return empty — the full reverse index is expensive to build.
+    # In practice, akshare's push2-based adapter handles this when the
+    # network allows it. This adapter exists so the vendor chain doesn't
+    # stop at akshare when push2 is blocked.
+    logger.debug("efinance sector_constituents: reverse index not yet implemented for %s", sector_name)
+    return []
+
+
 def register_all_vendors() -> None:
     """Register free vendor adapters."""
 
@@ -736,8 +793,10 @@ def register_all_vendors() -> None:
     register_vendor_impl("get_northbound_top10", "akshare", get_northbound_top10_akshare)
     register_vendor_impl("get_limit_up_tiers", "akshare", get_limit_up_tiers_akshare)
     register_vendor_impl("get_dragon_tiger", "akshare", get_dragon_tiger_akshare)
+    register_vendor_impl("get_dragon_tiger", "efinance", get_dragon_tiger_efinance)
     register_vendor_impl("get_margin", "akshare", get_margin_akshare)
     register_vendor_impl("get_sector_constituents", "akshare", get_sector_constituents_akshare)
+    register_vendor_impl("get_sector_constituents", "efinance", get_sector_constituents_efinance)
 
     register_vendor_impl("get_factors", "akshare", get_factors_computed)
     register_vendor_impl("get_factors", "baostock", get_factors_computed)

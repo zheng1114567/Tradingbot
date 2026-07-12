@@ -21,6 +21,7 @@ import pandas as pd
 from ..config import config
 from ..core.atomic_write import atomic_write_text
 from .cache_manifest import CacheManifest
+from .news_text import is_noise_news_record
 
 logger = logging.getLogger(__name__)
 
@@ -532,6 +533,21 @@ def get_cached_daily(ticker: str, start_date: str | None = None,
     return cache.ensure_daily_data(ticker, start_date, end_date)
 
 
+def _nearest_cache_file(pattern: str, trade_date: str | None = None) -> Path | None:
+    """Find cached file matching *pattern* for *trade_date*, falling back to the most recent available."""
+    td = trade_date or date.today().isoformat()
+    cache = LocalCache()
+    exact = cache.cache_dir / pattern.replace("*", td)
+    if exact.exists():
+        return exact
+    # Fall back to most recent matching file
+    matches = sorted(cache.cache_dir.glob(pattern.replace("*", "*")), reverse=True)
+    if matches:
+        logger.debug("Cache miss for %s, falling back to %s", exact.name, matches[0].name)
+        return matches[0]
+    return None
+
+
 def get_cached_market_breadth(trade_date: str | None = None) -> dict[str, Any]:
     """Compute a market-breadth proxy from cached daily parquet files."""
     td = trade_date or date.today().isoformat()
@@ -626,21 +642,17 @@ def get_cached_market_breadth(trade_date: str | None = None) -> dict[str, Any]:
 
 
 def get_cached_dragon_tiger(trade_date: str | None = None) -> list[dict[str, Any]]:
-    """Read cached dragon-tiger data."""
-    td = trade_date or date.today().isoformat()
-    cache = LocalCache()
-    path = cache.cache_dir / f"dragon_tiger_{td}.json"
-    if path.exists():
+    """Read cached dragon-tiger data, falling back to most recent available date."""
+    path = _nearest_cache_file("dragon_tiger_*.json", trade_date)
+    if path and path.exists():
         return json.loads(path.read_text("utf-8"))
     return []
 
 
 def get_cached_limit_up(trade_date: str | None = None) -> dict[str, Any]:
-    """Read cached limit-up pool data."""
-    td = trade_date or date.today().isoformat()
-    cache = LocalCache()
-    path = cache.cache_dir / f"limit_up_{td}.json"
-    if path.exists():
+    """Read cached limit-up pool data, falling back to most recent available date."""
+    path = _nearest_cache_file("limit_up_*.json", trade_date)
+    if path and path.exists():
         return json.loads(path.read_text("utf-8"))
     return {}
 
@@ -653,9 +665,8 @@ def get_cached_news(ticker: str, trade_date: str | None = None) -> list[dict[str
     if path.exists():
         data = json.loads(path.read_text("utf-8"))
         if isinstance(data, list):
-            return data
+            return [record for record in data if isinstance(record, dict) and not is_noise_news_record(record)]
     return []
-
 
 def get_cached_northbound_top10(trade_date: str | None = None) -> list[dict[str, Any]]:
     """Read cached northbound top-10 turnover data."""
@@ -685,9 +696,8 @@ def get_cached_sector_news(sector_name: str, trade_date: str | None = None) -> l
     if path.exists():
         data = json.loads(path.read_text("utf-8"))
         if isinstance(data, list):
-            return data
+            return [record for record in data if isinstance(record, dict) and not is_noise_news_record(record)]
     return []
-
 
 def get_cached_financial(ticker: str) -> list[dict[str, Any]]:
     """Read cached financial records for one ticker."""
@@ -735,11 +745,9 @@ def get_cached_risk_blacklist() -> list[dict[str, str]]:
 
 
 def get_cached_risk_snapshot(trade_date: str | None = None) -> dict[str, Any]:
-    """Read cached daily risk snapshot."""
-    td = trade_date or date.today().isoformat()
-    cache = LocalCache()
-    path = cache.cache_dir / f"risk_{td}.json"
-    if path.exists():
+    """Read cached daily risk snapshot, falling back to most recent available date."""
+    path = _nearest_cache_file("risk_*.json", trade_date)
+    if path and path.exists():
         data = json.loads(path.read_text("utf-8"))
         if isinstance(data, dict):
             return data

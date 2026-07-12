@@ -343,65 +343,56 @@ def get_news_sina(
     days: int = 2,
     limit: int = 50,
     include_announcements: bool = True,
+    **kwargs: Any,
 ) -> list[dict[str, Any]]:
     if not code:
         raise NoMarketDataError("Sina news requires a stock code", symbol="", vendor="sina")
 
     symbol = f"{_market_suffix(code)}{_digits(code)}"
-    urls = [
-        (
-            "https://vip.stock.finance.sina.com.cn/corp/view/vCB_AllNewsStock.php",
-            {"symbol": symbol},
-        ),
-        (
-            f"https://vip.stock.finance.sina.com.cn/corp/go.php/vCB_AllNewsStock/symbol/{symbol}.phtml",
-            None,
-        ),
-    ]
     records: list[dict[str, Any]] = []
     seen: set[str] = set()
-    last_error: Exception | None = None
-    for url, params in urls:
-        try:
-            _vendor_jitter()
-            response = requests.get(url, params=params, headers=_http_headers(), timeout=10)
-            response.raise_for_status()
-            response.encoding = response.apparent_encoding or response.encoding or "gb18030"
-            text = response.text
-        except Exception as exc:
-            last_error = exc
-            logger.warning("sina news failed for %s: %s", symbol, exc)
-            continue
+    try:
+        _vendor_jitter()
+        response = requests.get(
+            "https://vip.stock.finance.sina.com.cn/corp/view/vCB_AllNewsStock.php",
+            {"symbol": symbol},
+            headers=_http_headers(),
+            timeout=3,
+        )
+        response.raise_for_status()
+        response.encoding = response.apparent_encoding or response.encoding or "gb18030"
+        text = response.text
+    except Exception as exc:
+        raise NoMarketDataError(f"Sina news failed for {symbol}: {exc}", symbol=code, vendor="sina")
 
-        for match in re.finditer(
-            r"<a[^>]+href=[\"'](?P<url>https?://[^\"']+)[\"'][^>]*>(?P<title>.*?)</a>",
-            text,
-            flags=re.IGNORECASE | re.DOTALL,
-        ):
-            title = _strip_html(match.group("title"))
-            link = match.group("url").strip()
-            if len(title) < 4 or link in seen:
-                continue
-            candidate = {
-                "title": title,
-                "summary": title,
-                "source": "sina",
-                "time": "",
-                "url": link,
-                "type": "news",
-                "code": code,
-                "data_source": "sina",
-            }
-            if keyword and keyword.lower() not in json.dumps(candidate, ensure_ascii=False).lower():
-                continue
-            seen.add(link)
-            records.append(candidate)
-            if len(records) >= limit:
-                return records
+    for match in re.finditer(
+        r"<a[^>]+href=[\"'](?P<url>https?://[^\"']+)[\"'][^>]*>(?P<title>.*?)</a>",
+        text,
+        flags=re.IGNORECASE | re.DOTALL,
+    ):
+        title = _strip_html(match.group("title"))
+        link = match.group("url").strip()
+        if len(title) < 4 or link in seen:
+            continue
+        candidate = {
+            "title": title,
+            "summary": title,
+            "source": "sina",
+            "time": "",
+            "url": link,
+            "type": "news",
+            "code": code,
+            "data_source": "sina",
+        }
+        if keyword and keyword.lower() not in json.dumps(candidate, ensure_ascii=False).lower():
+            continue
+        seen.add(link)
+        records.append(candidate)
+        if len(records) >= limit:
+            return records
 
     if not records:
-        detail = f": {last_error}" if last_error else ""
-        raise NoMarketDataError(f"No Sina news for {code}{detail}", symbol=code, vendor="sina")
+        raise NoMarketDataError(f"No Sina news for {code}", symbol=code, vendor="sina")
     return records[:limit]
 
 
@@ -412,6 +403,7 @@ def get_news_cls(
     days: int = 2,
     limit: int = 50,
     include_announcements: bool = True,
+    **kwargs: Any,
 ) -> list[dict[str, Any]]:
     """财联社快讯 fallback, filtered locally by ticker/sector keyword."""
     del days, include_announcements
@@ -470,7 +462,7 @@ def get_news_cls(
     return records
 
 
-def get_sector_eastmoney(top_n: int = 10) -> list[dict[str, Any]]:
+def get_sector_eastmoney(top_n: int = 10, **kwargs: Any) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
     specs = [
         ("industry", "m:90+t:2+f:!50"),
@@ -521,6 +513,168 @@ def get_sector_eastmoney(top_n: int = 10) -> list[dict[str, Any]]:
         detail = f": {last_error}" if last_error else ""
         raise NoMarketDataError(f"No Eastmoney sector data{detail}", vendor="eastmoney")
     return records[:top_n]
+
+
+_EASTMONEY_API = "http://push2.eastmoney.com/api/qt/clist/get"
+_EM_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+    ),
+}
+
+
+def _eastmoney_diff(
+    fs: str,
+    fields: str,
+    pz: int = 5000,
+    fid: str = "f12",
+    po: int = 0,
+) -> list[dict[str, Any]]:
+    """Fetch diff rows from eastmoney push2 HTTP API."""
+    try:
+        response = requests.get(
+            _EASTMONEY_API,
+            params={
+                "pn": 1, "pz": pz, "po": po, "np": 1,
+                "fltt": 2, "invt": 2,
+                "fid": fid, "fs": fs,
+                "fields": fields,
+                "ut": "bd1d9ddb04089700cf9c27f6f7426281",
+            },
+            headers=_EM_HEADERS,
+            timeout=10,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        return (payload.get("data") or {}).get("diff") or []
+    except Exception:
+        return []
+
+
+def get_limit_up_tiers_eastmoney(**kwargs: Any) -> dict[str, Any]:
+    """Limit-up tiers from eastmoney realtime stock list."""
+    rows = _eastmoney_diff(
+        fs="m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23",
+        fields="f12,f14,f3,f2,f4,f15,f16,f17,f20,f184,f185",
+        po=1,
+        fid="f3",
+    )
+    limit_up: list[dict[str, Any]] = []
+    for r in rows:
+        pct = r.get("f3")
+        if pct is None or not isinstance(pct, (int, float)):
+            continue
+        if pct < 9.5:
+            continue
+        limit_up.append({
+            "ticker": _digits_to_ticker(str(r.get("f12", ""))),
+            "code": str(r.get("f12", "")),
+            "name": str(r.get("f14", "")),
+            "change_pct": float(pct),
+            "price": r.get("f2"),
+            "high": r.get("f15"),
+            "low": r.get("f16"),
+            "open": r.get("f17"),
+            "volume": r.get("f20"),
+        })
+
+    first_board = sum(1 for s in limit_up if _is_first_limit_up(s))
+    second_board = sum(1 for s in limit_up if _is_second_limit_up(s))
+    third_plus = max(0, len(limit_up) - first_board - second_board)
+    return {
+        "first_board": first_board,
+        "second_board": second_board,
+        "third_plus": third_plus,
+        "stocks": limit_up[:200],
+        "data_source": "eastmoney",
+    }
+
+
+def _digits_to_ticker(code: str) -> str:
+    if len(code) != 6:
+        return code
+    if code.startswith(("6", "9")):
+        return f"{code}.SH"
+    if code.startswith(("0", "3", "2")):
+        return f"{code}.SZ"
+    return code
+
+
+def _is_first_limit_up(stock: dict[str, Any]) -> bool:
+    """Heuristic: first board typically has lower volume surge."""
+    vol = stock.get("volume") or 0
+    return vol < 5000000
+
+
+def _is_second_limit_up(stock: dict[str, Any]) -> bool:
+    vol = stock.get("volume") or 0
+    return 5000000 <= vol < 20000000
+
+
+def get_market_breadth_eastmoney(**kwargs: Any) -> dict[str, Any]:
+    """Market breadth (advance/decline) from eastmoney stock list."""
+    rows = _eastmoney_diff(
+        fs="m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23",
+        fields="f12,f14,f3",
+        fid="f3",
+    )
+    advance = sum(1 for r in rows if isinstance(r.get("f3"), (int, float)) and r["f3"] > 0)
+    decline = sum(1 for r in rows if isinstance(r.get("f3"), (int, float)) and r["f3"] < 0)
+    flat = sum(1 for r in rows if isinstance(r.get("f3"), (int, float)) and r["f3"] == 0)
+    return {
+        "advance_count": advance,
+        "decline_count": decline,
+        "flat_count": flat,
+        "total": advance + decline + flat,
+        "data_source": "eastmoney",
+    }
+
+
+def get_st_status_eastmoney(**kwargs: Any) -> list[str]:
+    """ST/*ST stock codes from eastmoney realtime list."""
+    rows = _eastmoney_diff(
+        fs="m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23",
+        fields="f12,f14",
+    )
+    st_codes: list[str] = []
+    for r in rows:
+        name = str(r.get("f14", ""))
+        if "ST" in name.upper():
+            code = str(r.get("f12", ""))
+            st_codes.append(_digits_to_ticker(code))
+    return st_codes
+
+
+def get_suspended_eastmoney(**kwargs: Any) -> list[str]:
+    """Suspended stock codes from eastmoney (f20 volume = 0 on trading day)."""
+    rows = _eastmoney_diff(
+        fs="m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23",
+        fields="f12,f14,f20",
+    )
+    suspended: list[str] = []
+    for r in rows:
+        vol = r.get("f20")
+        name = str(r.get("f14", ""))
+        if vol is not None and (isinstance(vol, (int, float)) and vol == 0) and "退" in name:
+            code = str(r.get("f12", ""))
+            suspended.append(_digits_to_ticker(code))
+    return suspended
+
+
+def get_delisting_eastmoney(**kwargs: Any) -> list[str]:
+    """Delisting stock codes from eastmoney (name includes 退)."""
+    rows = _eastmoney_diff(
+        fs="m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23",
+        fields="f12,f14",
+    )
+    delisted: list[str] = []
+    for r in rows:
+        name = str(r.get("f14", ""))
+        if "退" in name:
+            code = str(r.get("f12", ""))
+            delisted.append(_digits_to_ticker(code))
+    return delisted
 
 
 def get_suspended_baostock(trade_date: str | None = None) -> list[str]:
@@ -652,7 +806,7 @@ def _get_probe_stocks() -> list[str]:
     return _EFINANCE_PROBE_STOCKS
 
 
-def get_sector_efinance(top_n: int = 10) -> list[dict[str, Any]]:
+def get_sector_efinance(top_n: int = 10, **kwargs: Any) -> list[dict[str, Any]]:
     """Sector ranking via efinance board membership aggregation.
 
     Calls get_belong_board() for a diverse set of probe stocks and
@@ -1065,6 +1219,7 @@ def register_all_vendors() -> None:
     register_vendor_impl("get_daily", "mootdx", get_daily_mootdx)
     register_vendor_impl("get_daily", "baostock", get_daily_baostock)
     register_vendor_impl("get_market_breadth", "local_cache", get_market_breadth_local)
+    register_vendor_impl("get_market_breadth", "eastmoney", get_market_breadth_eastmoney)
 
     register_vendor_impl("get_financial", "local_cache", get_financial_local)
     register_vendor_impl("get_financial", "baostock", get_financial_baostock)
@@ -1078,10 +1233,14 @@ def register_all_vendors() -> None:
 
     register_vendor_impl("get_suspended", "local_cache", get_suspended_local)
     register_vendor_impl("get_suspended", "baostock", get_suspended_baostock)
+    register_vendor_impl("get_suspended", "eastmoney", get_suspended_eastmoney)
     register_vendor_impl("get_st_status", "local_cache", get_st_status_local)
+    register_vendor_impl("get_st_status", "eastmoney", get_st_status_eastmoney)
     register_vendor_impl("get_delisting", "local_cache", get_delisting_local)
+    register_vendor_impl("get_delisting", "eastmoney", get_delisting_eastmoney)
 
     register_vendor_impl("get_limit_up_tiers", "local_cache", get_limit_up_tiers_local)
+    register_vendor_impl("get_limit_up_tiers", "eastmoney", get_limit_up_tiers_eastmoney)
     register_vendor_impl("get_northbound_flow", "local_cache", get_northbound_flow_local)
     register_vendor_impl("get_northbound_top10", "local_cache", get_northbound_top10_local)
     register_vendor_impl("get_dragon_tiger", "efinance", get_dragon_tiger_efinance)

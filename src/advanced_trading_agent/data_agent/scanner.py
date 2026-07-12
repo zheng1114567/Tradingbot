@@ -70,6 +70,29 @@ class ScanBundle:
             "route_trace": self.route_trace,
         }
 
+    def package_for_ticker(self, ticker: str) -> ScanDataPackage:
+        """Return scan-owned raw and cleaned payloads for DataAgent processing."""
+        raw_payload = self.raw_for_ticker(ticker)
+        return ScanDataPackage(
+            raw_payload=raw_payload,
+            cleaned_payload=MarketScanner.clean_data_agent_raw(raw_payload),
+            route_trace=self.route_trace,
+        )
+
+
+@dataclass
+class ScanDataPackage:
+    """DataAgent input package produced by scan.
+
+    Scan owns vendor fetching and deterministic cleaning. DataAgent consumes
+    this package as an auditable processing input and does not reimplement
+    either responsibility.
+    """
+
+    raw_payload: dict[str, Any]
+    cleaned_payload: dict[str, Any]
+    route_trace: list[dict[str, Any]] = field(default_factory=list)
+
 
 class _ScorerEntry(TypedDict):
     """Internal accumulator for multi-channel scoring evidence."""
@@ -783,7 +806,7 @@ class MarketScanner:
         return "\n".join(parts)
 
     # ------------------------------------------------------------------
-    # Data collection (combined scan + fetch)
+    # Data collection (combined scan fetch + clean)
     # ------------------------------------------------------------------
 
     def collect_shared_data(
@@ -793,7 +816,7 @@ class MarketScanner:
     ) -> ScanSharedRaw:
         """Collect market-wide data shared across all tickers.
 
-        Returns a dict with keys matching DataAgent._collect_raw shared fields:
+        Returns a dict with keys matching the shared raw ScanDataPackage fields:
         market, sector_context, risk.
         """
         trace: list[dict[str, Any]] = []
@@ -839,8 +862,8 @@ class MarketScanner:
     ) -> ScanTickerRaw:
         """Collect per-ticker raw data: daily, capital_flow, enriched news.
 
-        Returns a dict with keys matching the per-ticker portion of
-        DataAgent._collect_raw: daily, capital_flow, news.
+        Returns the per-ticker raw portion of ScanDataPackage:
+        daily, capital_flow, news.
         """
         trace: list[dict[str, Any]] = []
         if route_trace is not None:
@@ -956,6 +979,28 @@ class MarketScanner:
             **ticker_raw,
             "route_trace": trace,
         }
+
+    def collect_data_agent_package(
+        self,
+        request: Any,
+        route_trace: list[dict[str, Any]] | None = None,
+    ) -> ScanDataPackage:
+        """Collect and clean the complete DataAgent input package.
+
+        This is the canonical scan -> DataAgent seam:
+        - scan fetches vendor/cache/news inputs
+        - scan normalizes and cleans them
+        - DataAgent only processes the cleaned structure into factors/events/payloads
+        """
+        trace: list[dict[str, Any]] = []
+        if route_trace is not None:
+            trace = route_trace
+        raw_payload = self.collect_data_agent_raw(request, trace)
+        return ScanDataPackage(
+            raw_payload=raw_payload,
+            cleaned_payload=self.clean_data_agent_raw(raw_payload),
+            route_trace=trace,
+        )
 
     @staticmethod
     def clean_data_agent_raw(raw_payload: dict[str, Any]) -> dict[str, Any]:

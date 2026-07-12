@@ -1,13 +1,15 @@
 """Free-first data collection adapters.
 
-Default vendor order uses API-key-free A-share data sources:
-akshare -> baostock -> sina/eastmoney fallbacks.
+Default vendor order prefers lower-ban-risk A-share sources:
+mootdx -> akshare -> baostock -> local cache, with HTTP sources as fallbacks.
 """
 from __future__ import annotations
 
 import json
 import logging
+import random
 import re
+import time
 from datetime import date, timedelta
 from typing import Any
 
@@ -22,6 +24,11 @@ from .vendor_router import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _vendor_jitter(min_seconds: float = 0.1, max_seconds: float = 0.5) -> None:
+    """Best-effort jitter to reduce bursty free-endpoint access."""
+    time.sleep(random.uniform(min_seconds, max_seconds))
 
 
 def _fmt_yyyymmdd(value: str | None, default: date) -> str:
@@ -57,13 +64,28 @@ def _baostock_code(code: str) -> str:
     return f"{_market_suffix(code)}.{_digits(code)}"
 
 
-def _ak_index_symbol(code: str) -> str | None:
-    digits = _digits(code)
-    if digits in {"000001", "000300", "000905", "000852"} and _market_suffix(code) == "sh":
-        return f"sh{digits}"
-    if digits.startswith(("399", "159")) and _market_suffix(code) == "sz":
-        return f"sz{digits}"
-    return None
+def _normalize_baostock_code(code: str) -> str:
+    raw = str(code or "")
+    if "." not in raw:
+        return raw
+    prefix, digits = raw.split(".", 1)
+    return f"{digits}.{prefix.upper()}"
+
+
+def _quarter_candidates(trade_date: str | None = None, limit: int = 6) -> list[tuple[str, str]]:
+    raw = (trade_date or date.today().isoformat()).replace("-", "")
+    base = date(int(raw[:4]), int(raw[4:6]), int(raw[6:8]))
+    year = base.year
+    quarter = ((base.month - 1) // 3) + 1
+    pairs: list[tuple[str, str]] = []
+    for _ in range(limit):
+        pairs.append((str(year), str(quarter)))
+        quarter -= 1
+        if quarter == 0:
+            year -= 1
+            quarter = 4
+    return pairs
+
 
 
 def _with_source(records: list[dict[str, Any]], source: str, code: str = "") -> list[dict[str, Any]]:
@@ -101,12 +123,6 @@ def _http_headers() -> dict[str, str]:
     }
 
 
-def _get_akshare():
-    try:
-        import akshare as ak
-        return ak
-    except ImportError as exc:
-        raise VendorNotConfiguredError("akshare not installed (pip install akshare)", vendor="akshare") from exc
 
 
 def _get_baostock():
@@ -117,50 +133,58 @@ def _get_baostock():
         raise VendorNotConfiguredError("baostock not installed (pip install baostock)", vendor="baostock") from exc
 
 
-def get_daily_akshare(
+def _get_mootdx():
+    try:
+        from mootdx.quotes import Quotes
+        return Quotes.factory(market="std")
+    except ImportError as exc:
+        raise VendorNotConfiguredError("mootdx not installed (pip install mootdx)", vendor="mootdx") from exc
+
+
+def _read_baostock_rows(result: Any) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    while getattr(result, "error_code", "0") == "0" and result.next():
+        rows.append(dict(zip(result.fields, result.get_row_data())))
+    return rows
+
+
+def get_daily_mootdx(
     code: str,
     start_date: str | None = None,
     end_date: str | None = None,
 ) -> list[dict[str, Any]]:
-    """Daily OHLCV from AkShare for A-share stocks and major indexes."""
+    """Daily OHLCV via mootdx TCP protocol, avoiding HTTP anti-bot limits."""
 
-    ak = _get_akshare()
-    end = _fmt_yyyymmdd(end_date, date.today())
-    start = _fmt_yyyymmdd(start_date, date.today() - timedelta(days=365))
+    client = _get_mootdx()
     symbol = _digits(code)
+    start = pd.to_datetime(_fmt_iso(start_date, date.today() - timedelta(days=365)))
+    end = pd.to_datetime(_fmt_iso(end_date, date.today()))
     try:
-        index_symbol = _ak_index_symbol(code)
-        if index_symbol:
-            df = ak.stock_zh_index_daily(symbol=index_symbol)
-            if df is not None and not df.empty:
-                df = df.rename(columns={"date": "trade_date"})
-                df["trade_date"] = pd.to_datetime(df["trade_date"], errors="coerce")
-                start_ts = pd.to_datetime(start)
-                end_ts = pd.to_datetime(end)
-                df = df[(df["trade_date"] >= start_ts) & (df["trade_date"] <= end_ts)]
-                if "amount" not in df.columns and {"close", "volume"}.issubset(df.columns):
-                    df["amount"] = pd.to_numeric(df["close"], errors="coerce") * pd.to_numeric(
-                        df["volume"], errors="coerce"
-                    )
-                records = df.to_dict("records")
-                if records:
-                    return _with_source(records, "akshare", code)
-
-        df = ak.stock_zh_a_hist(
-            symbol=symbol,
-            period="daily",
-            start_date=start,
-            end_date=end,
-            adjust="qfq",
-        )
+        df = client.bars(symbol=symbol, frequency=9, offset=400)
         if df is None or df.empty:
-            raise NoMarketDataError(f"No daily data for {code}", symbol=code, vendor="akshare")
-        return _with_source(df.to_dict("records"), "akshare", code)
+            raise NoMarketDataError(f"No mootdx daily data for {code}", symbol=code, vendor="mootdx")
+        df = df.copy()
+        date_col = "datetime" if "datetime" in df.columns else "date"
+        if date_col not in df.columns:
+            raise NoMarketDataError(f"mootdx schema missing date field for {code}", symbol=code, vendor="mootdx")
+        df["trade_date"] = pd.to_datetime(df[date_col], errors="coerce")
+        df = df[(df["trade_date"] >= start) & (df["trade_date"] <= end)]
+        if df.empty:
+            raise NoMarketDataError(f"No mootdx daily data in range for {code}", symbol=code, vendor="mootdx")
+        if "vol" in df.columns and "volume" not in df.columns:
+            df["volume"] = pd.to_numeric(df["vol"], errors="coerce")
+        if "turnover" in df.columns and "turn" not in df.columns:
+            df["turn"] = pd.to_numeric(df["turnover"], errors="coerce")
+        if "turn" in df.columns and "turnover_rate" not in df.columns:
+            df["turnover_rate"] = pd.to_numeric(df["turn"], errors="coerce")
+        if "amount" not in df.columns and {"close", "volume"}.issubset(df.columns):
+            df["amount"] = pd.to_numeric(df["close"], errors="coerce") * pd.to_numeric(df["volume"], errors="coerce")
+        return _with_source(df.to_dict("records"), "mootdx", code)
     except NoMarketDataError:
         raise
     except Exception as exc:
-        logger.warning("akshare get_daily failed for %s: %s", code, exc)
-        raise NoMarketDataError(str(exc), symbol=code, vendor="akshare") from exc
+        logger.warning("mootdx get_daily failed for %s: %s", code, exc)
+        raise NoMarketDataError(str(exc), symbol=code, vendor="mootdx") from exc
 
 
 def get_daily_baostock(
@@ -198,108 +222,118 @@ def get_daily_baostock(
             pass
 
 
-def get_capital_flow_akshare(
+def get_financial_baostock(
     code: str,
-    start_date: str | None = None,
-    end_date: str | None = None,
     trade_date: str | None = None,
-) -> list[dict[str, Any]] | dict[str, Any]:
-    """Individual A-share capital flow from AkShare."""
+) -> list[dict[str, Any]]:
+    """Quarterly financial snapshots from BaoStock, merged across available tables."""
 
-    if not code:
-        return {
-            "net_inflow_main": 0,
-            "confirmation": "未知",
-            "data_source": "akshare",
-            "note": "capital flow requires a stock code",
-        }
-    ak = _get_akshare()
-    symbol = _digits(code)
+    bs = _get_baostock()
+    login_result = bs.login()
+    if getattr(login_result, "error_code", "0") != "0":
+        raise VendorRateLimitError(getattr(login_result, "error_msg", "baostock login failed"), vendor="baostock")
+
+    datasets = [
+        "query_profit_data",
+        "query_operation_data",
+        "query_growth_data",
+        "query_balance_data",
+        "query_cash_flow_data",
+        "query_dupont_data",
+    ]
+    merged: dict[tuple[str, str], dict[str, Any]] = {}
     try:
-        df = ak.stock_individual_fund_flow(stock=symbol, market="sh" if _market_suffix(code) == "sh" else "sz")
-        if df is None or df.empty:
-            raise NoMarketDataError(f"No capital flow for {code}", symbol=code, vendor="akshare")
-        records = _with_source(df.to_dict("records"), "akshare", code)
-        return records
-    except NoMarketDataError:
-        raise
-    except Exception as exc:
-        logger.warning("akshare capital_flow failed for %s: %s", code, exc)
-        raise NoMarketDataError(str(exc), symbol=code, vendor="akshare") from exc
+        for year, quarter in _quarter_candidates(trade_date):
+            found_any = False
+            for fn_name in datasets:
+                fn = getattr(bs, fn_name, None)
+                if fn is None:
+                    continue
+                try:
+                    result = fn(code=_baostock_code(code), year=year, quarter=quarter)
+                except TypeError:
+                    continue
+                rows = _read_baostock_rows(result)
+                if not rows:
+                    continue
+                found_any = True
+                for row in rows:
+                    stat_date = str(row.get("statDate") or row.get("stat_date") or f"{year}Q{quarter}")
+                    pub_date = str(row.get("pubDate") or row.get("pub_date") or "")
+                    record = merged.setdefault(
+                        (stat_date, pub_date),
+                        {
+                            "code": code,
+                            "statDate": stat_date,
+                            "pubDate": pub_date,
+                            "year": int(year),
+                            "quarter": int(quarter),
+                            "data_source": "baostock",
+                        },
+                    )
+                    for key, value in row.items():
+                        if key == "code":
+                            record[key] = _normalize_baostock_code(value)
+                        elif key not in {"statDate", "pubDate"}:
+                            record[key] = value
+            if merged and not found_any:
+                # Once we have recent quarter data and then hit an empty quarter,
+                # stop scanning older periods to keep this cheap.
+                break
+    finally:
+        try:
+            bs.logout()
+        except Exception:
+            pass
+
+    records = sorted(
+        merged.values(),
+        key=lambda item: (str(item.get("statDate", "")), str(item.get("pubDate", ""))),
+        reverse=True,
+    )
+    if not records:
+        raise NoMarketDataError(f"No baostock financial data for {code}", symbol=code, vendor="baostock")
+
+    from .local_cache import save_cached_financial
+
+    save_cached_financial(code, records)
+    return _with_source(records, "baostock", code)
 
 
-def get_news_akshare(
+def get_financial_local(code: str, trade_date: str | None = None) -> list[dict[str, Any]]:
+    """Financial snapshots from local cache."""
+    del trade_date
+    from .local_cache import get_cached_financial
+
+    records = get_cached_financial(code)
+    if not records:
+        raise NoMarketDataError(f"No cached financial data for {code}", symbol=code, vendor="local_cache")
+    return _with_source(records, "local_cache", code)
+
+
+def get_news_local(
     code: str | None = None,
     sector: str | None = None,
     keyword: str | None = None,
-    days: int = 2,
-    limit: int = 50,
-    include_announcements: bool = True,
+    trade_date: str | None = None,
+    **kwargs: Any,
 ) -> list[dict[str, Any]]:
-    ak = _get_akshare()
-    code6 = _digits(code or keyword or sector or "")
+    """Ticker/sector news from local cache before hitting online sources."""
+    del kwargs
+    from .local_cache import get_cached_news, get_cached_sector_news
+
     records: list[dict[str, Any]] = []
-    if not code6:
-        raise NoMarketDataError("AkShare news requires a stock code", symbol=code or "", vendor="akshare")
-
-    try:
-        df = ak.stock_news_em(symbol=code6)
-        if df is not None and not df.empty:
-            for row in df.head(limit).to_dict("records"):
-                records.append({
-                    "title": row.get("新闻标题") or row.get("标题") or row.get("title") or "",
-                    "summary": row.get("新闻内容") or row.get("内容") or row.get("summary") or row.get("新闻标题") or "",
-                    "source": row.get("文章来源") or row.get("来源") or row.get("source") or "akshare",
-                    "time": row.get("发布时间") or row.get("time") or "",
-                    "url": row.get("新闻链接") or row.get("url") or "",
-                    "type": "news",
-                    "code": code,
-                    "data_source": "akshare",
-                })
-    except Exception as exc:
-        logger.warning("akshare stock_news_em failed for %s: %s", code6, exc)
-
-    if include_announcements and len(records) < limit:
-        try:
-            fn = (
-                getattr(ak, "stock_announcement_em", None)
-                or getattr(ak, "stock_individual_notice_report", None)
-                or getattr(ak, "stock_notice_report", None)
-            )
-            if fn is None:
-                df = None
-            elif getattr(fn, "__name__", "") == "stock_individual_notice_report":
-                df = fn(security=code6, symbol="全部")
-            elif getattr(fn, "__name__", "") == "stock_notice_report":
-                df = fn(symbol="全部")
-            else:
-                df = fn(symbol=code6)
-            if df is not None and not df.empty:
-                for row in df.head(max(0, limit - len(records))).to_dict("records"):
-                    records.append({
-                        "title": (
-                            row.get("公告标题")
-                            or row.get("title")
-                            or row.get("公告名称")
-                            or row.get("title_ch")
-                            or ""
-                        ),
-                        "summary": row.get("公告标题") or row.get("summary") or row.get("公告名称") or "",
-                        "source": "akshare",
-                        "time": row.get("公告时间") or row.get("time") or row.get("公告日期") or "",
-                        "url": row.get("公告链接") or row.get("url") or row.get("网址") or "",
-                        "type": "announcement",
-                        "code": code,
-                        "data_source": "akshare",
-                    })
-        except Exception as exc:
-            logger.warning("akshare stock_announcement_em failed for %s: %s", code6, exc)
-
-    if keyword:
-        records = [record for record in records if keyword.lower() in json.dumps(record, ensure_ascii=False).lower()]
+    if code:
+        records.extend(get_cached_news(code, trade_date=trade_date))
+    if sector:
+        records.extend(get_cached_sector_news(sector, trade_date=trade_date))
+    if keyword and not records:
+        records.extend(get_cached_sector_news(keyword, trade_date=trade_date))
     if not records:
-        raise NoMarketDataError(f"No AkShare news for {code or keyword or sector}", symbol=code or "", vendor="akshare")
-    return records[:limit]
+        raise NoMarketDataError("No cached news data", symbol=code or keyword or sector or "", vendor="local_cache")
+    return _with_source(records, "local_cache", code or "")
+
+
 
 
 def get_news_sina(
@@ -329,6 +363,7 @@ def get_news_sina(
     last_error: Exception | None = None
     for url, params in urls:
         try:
+            _vendor_jitter()
             response = requests.get(url, params=params, headers=_http_headers(), timeout=10)
             response.raise_for_status()
             response.encoding = response.apparent_encoding or response.encoding or "gb18030"
@@ -370,33 +405,69 @@ def get_news_sina(
     return records[:limit]
 
 
-def get_sector_akshare(top_n: int = 10) -> list[dict[str, Any]]:
-    ak = _get_akshare()
+def get_news_cls(
+    code: str | None = None,
+    sector: str | None = None,
+    keyword: str | None = None,
+    days: int = 2,
+    limit: int = 50,
+    include_announcements: bool = True,
+) -> list[dict[str, Any]]:
+    """财联社快讯 fallback, filtered locally by ticker/sector keyword."""
+    del days, include_announcements
+    query = str(keyword or sector or code or "").strip()
+    if not query:
+        raise NoMarketDataError("CLS news requires a keyword, sector, or code", symbol=code or "", vendor="cls")
+
     try:
-        df = ak.stock_board_concept_name_em()
-        if df is None or df.empty:
-            raise NoMarketDataError("No AkShare sector data", vendor="akshare")
-        records = []
-        for idx, row in enumerate(df.head(top_n).to_dict("records"), start=1):
-            change = row.get("涨跌幅", row.get("change_pct", 0))
-            try:
-                change_pct = float(change)
-            except (TypeError, ValueError):
-                change_pct = 0.0
-            records.append({
-                **row,
-                "rank": idx,
-                "sector_name": row.get("板块名称", row.get("sector_name", "")),
-                "change_pct": change_pct,
-                "strength_score": change_pct,
-                "data_source": "akshare",
-            })
-        if not records:
-            raise NoMarketDataError("No AkShare sector data", vendor="akshare")
-        return records
+        _vendor_jitter()
+        response = requests.get(
+            "https://www.cls.cn/nodeapi/telegraphList",
+            params={
+                "app": "CailianpressWeb",
+                "os": "web",
+                "sv": "8.4.6",
+                "sign": "9f8797a1f4de66c2370f7a03990d2737",
+            },
+            headers=_http_headers(),
+            timeout=10,
+        )
+        response.raise_for_status()
+        payload = response.json()
     except Exception as exc:
-        logger.warning("akshare sector failed: %s", exc)
-        raise NoMarketDataError(str(exc), vendor="akshare") from exc
+        logger.warning("cls news failed for %s: %s", query, exc)
+        raise NoMarketDataError(str(exc), symbol=code or query, vendor="cls") from exc
+
+    rows = (
+        payload.get("data", {}).get("roll_data", [])
+        or payload.get("data", {}).get("data", [])
+        or []
+    )
+    query_lower = query.lower()
+    records: list[dict[str, Any]] = []
+    for row in rows:
+        haystack = json.dumps(row, ensure_ascii=False).lower()
+        if query_lower not in haystack:
+            continue
+        title = str(row.get("title") or row.get("brief") or row.get("content") or "").strip()
+        summary = str(row.get("content") or row.get("brief") or title).strip()
+        records.append({
+            "title": title,
+            "summary": summary,
+            "source": "cls",
+            "time": row.get("ctime") or row.get("created_at") or row.get("time") or "",
+            "url": row.get("share_url") or row.get("url") or "",
+            "type": "telegraph",
+            "code": code,
+            "sector_name": sector,
+            "data_source": "cls",
+        })
+        if len(records) >= limit:
+            break
+
+    if not records:
+        raise NoMarketDataError(f"No CLS news for {query}", symbol=code or query, vendor="cls")
+    return records
 
 
 def get_sector_eastmoney(top_n: int = 10) -> list[dict[str, Any]]:
@@ -408,6 +479,7 @@ def get_sector_eastmoney(top_n: int = 10) -> list[dict[str, Any]]:
     last_error: Exception | None = None
     for sector_type, fs in specs:
         try:
+            _vendor_jitter()
             response = requests.get(
                 "https://push2.eastmoney.com/api/qt/clist/get",
                 params={
@@ -451,40 +523,6 @@ def get_sector_eastmoney(top_n: int = 10) -> list[dict[str, Any]]:
     return records[:top_n]
 
 
-def get_financial_akshare(code: str) -> list[dict[str, Any]]:
-    """Best-effort free financial indicators from AkShare."""
-
-    ak = _get_akshare()
-    symbol = _digits(code)
-    for fn_name in ("stock_financial_analysis_indicator", "stock_financial_abstract"):
-        fn = getattr(ak, fn_name, None)
-        if fn is None:
-            continue
-        try:
-            df = fn(symbol=symbol)
-            if df is not None and not df.empty:
-                return _with_source(df.to_dict("records"), "akshare", code)
-        except Exception as exc:
-            logger.debug("akshare %s failed for %s: %s", fn_name, code, exc)
-    raise NoMarketDataError(f"No financial data for {code}", symbol=code, vendor="akshare")
-
-
-def get_st_status_akshare() -> list[str]:
-    ak = _get_akshare()
-    try:
-        fn = getattr(ak, "stock_zh_a_st_em", None)
-        if fn is None:
-            return []
-        df = fn()
-        if df is None or df.empty:
-            return []
-        code_col = "代码" if "代码" in df.columns else "code"
-        return [str(code) for code in df[code_col].dropna().tolist()]
-    except Exception as exc:
-        logger.warning("akshare ST list failed: %s", exc)
-        return []
-
-
 def get_suspended_baostock(trade_date: str | None = None) -> list[str]:
     bs = _get_baostock()
     day = _fmt_iso(trade_date, date.today())
@@ -510,109 +548,33 @@ def get_suspended_baostock(trade_date: str | None = None) -> list[str]:
             pass
 
 
-def get_suspended_akshare(trade_date: str | None = None) -> list[str]:
-    """AkShare does not expose one stable suspended-list endpoint; return empty best effort."""
-
-    return []
 
 
-def get_delisting_akshare() -> list[str]:
-    """Best-effort delisting risk list using free AkShare ST data."""
+def get_st_status_local(trade_date: str | None = None) -> list[str]:
+    """Read cached ST list from local risk snapshot."""
+    from .local_cache import get_cached_risk_snapshot
 
-    return get_st_status_akshare()
-
-
-def get_northbound_flow_akshare(trade_date: str | None = None) -> dict[str, Any]:
-    ak = _get_akshare()
-    try:
-        fn = (
-            getattr(ak, "stock_hsgt_north_net_flow_in_em", None)
-            or getattr(ak, "stock_hsgt_hist_em", None)
-            or getattr(ak, "stock_hsgt_fund_flow_summary_em", None)
-        )
-        if fn is None:
-            return {"net_inflow": 0, "data_source": "akshare", "note": "northbound function unavailable"}
-        if getattr(fn, "__name__", "") == "stock_hsgt_hist_em":
-            df = fn(symbol="北向资金")
-        else:
-            df = fn()
-        if df is not None and not df.empty:
-            record = df.to_dict("records")[-1]
-            record["data_source"] = "akshare"
-            return record
-    except Exception as exc:
-        logger.warning("akshare northbound failed: %s", exc)
-    return {"net_inflow": 0, "data_source": "akshare", "note": "northbound data unavailable"}
+    snapshot = get_cached_risk_snapshot(trade_date)
+    value = snapshot.get("st_status", [])
+    return value if isinstance(value, list) else []
 
 
-def get_limit_up_tiers_akshare(trade_date: str | None = None) -> dict[str, Any]:
-    td = _fmt_yyyymmdd(trade_date, date.today())
-    try:
-        ak = _get_akshare()
-        df = ak.stock_zt_pool_em(date=td)
-        if df is None or df.empty:
-            return {"first_board": 0, "second_board": 0, "third_plus": 0, "stocks": []}
+def get_suspended_local(trade_date: str | None = None) -> list[str]:
+    """Read cached suspended list from local risk snapshot."""
+    from .local_cache import get_cached_risk_snapshot
 
-        first_board = 0
-        second_board = 0
-        third_plus = 0
-        stocks: list[dict[str, Any]] = []
-        for record in df.to_dict("records"):
-            board_count = record.get("连板数", record.get("连续涨停", 1))
-            try:
-                board_count = int(board_count)
-            except (TypeError, ValueError):
-                board_count = 1
-            if board_count <= 1:
-                first_board += 1
-            elif board_count == 2:
-                second_board += 1
-            else:
-                third_plus += 1
-            stocks.append({
-                "code": str(record.get("代码", "")),
-                "name": str(record.get("名称", "")),
-                "board_count": board_count,
-                "turnover": _float_or_none(record.get("换手率", record.get("换手", 0))),
-                "change_pct": _float_or_none(record.get("涨跌幅", 0)),
-            })
-        return {
-            "first_board": first_board,
-            "second_board": second_board,
-            "third_plus": third_plus,
-            "stocks": stocks,
-            "data_source": "akshare",
-        }
-    except Exception as exc:
-        logger.warning("limit-up tiers failed: %s", exc)
-        return {"first_board": 0, "second_board": 0, "third_plus": 0, "stocks": [], "data_source": "akshare"}
+    snapshot = get_cached_risk_snapshot(trade_date)
+    value = snapshot.get("suspended", [])
+    return value if isinstance(value, list) else []
 
 
-def get_dragon_tiger_akshare(trade_date: str | None = None) -> list[dict[str, Any]]:
-    ak = _get_akshare()
-    td = _fmt_yyyymmdd(trade_date, date.today())
-    for fn_name in ("stock_lhb_detail_em", "stock_lhb_stock_statistic_em"):
-        fn = getattr(ak, fn_name, None)
-        if fn is None:
-            continue
-        try:
-            df = fn(date=td)
-            if df is not None and not df.empty:
-                return _with_source(df.head(20).to_dict("records"), "akshare")
-        except Exception as exc:
-            logger.debug("akshare %s failed: %s", fn_name, exc)
-    return []
+def get_delisting_local(trade_date: str | None = None) -> list[str]:
+    """Read cached delisting list from local risk snapshot."""
+    from .local_cache import get_cached_risk_snapshot
 
-
-def get_margin_akshare(trade_date: str | None = None) -> list[dict[str, Any]]:
-    ak = _get_akshare()
-    try:
-        df = ak.stock_margin_detail_sse(date=_fmt_yyyymmdd(trade_date, date.today()))
-        if df is not None and not df.empty:
-            return _with_source(df.head(20).to_dict("records"), "akshare")
-    except Exception as exc:
-        logger.warning("akshare margin failed: %s", exc)
-    return []
+    snapshot = get_cached_risk_snapshot(trade_date)
+    value = snapshot.get("delisting", [])
+    return value if isinstance(value, list) else []
 
 
 def get_factors_computed(code: str = "", sector: str = "") -> list[dict[str, Any]]:
@@ -665,55 +627,6 @@ def find_similar_stub(sentiment: str = "", sector: str = "", event_type: str = "
     }
 
 
-def get_northbound_top10_akshare(trade_date: str | None = None) -> list[dict[str, Any]]:
-    """Top 10 northbound-bought stocks via akshare (hsgt_top10_em)."""
-    ak = _get_akshare()
-    try:
-        fn = getattr(ak, "stock_hsgt_top10_em", None)
-        if fn is None:
-            return []
-        td = _fmt_yyyymmdd(trade_date, date.today())
-        df = fn(date=td)
-        if df is not None and not df.empty:
-            results: list[dict[str, Any]] = []
-            for record in df.head(20).to_dict("records"):
-                results.append({
-                    "code": str(record.get("代码", "")),
-                    "name": str(record.get("名称", "")),
-                    "net_buy": _float_or_none(record.get("净买入", record.get("净买入额", 0))),
-                    "change_pct": _float_or_none(record.get("涨跌幅", 0)),
-                })
-            return results
-    except Exception as exc:
-        logger.warning("akshare northbound top10 failed: %s", exc)
-    return []
-
-
-def get_sector_constituents_akshare(sector_name: str = "") -> list[dict[str, Any]]:
-    """Get constituent stocks of a concept/industry board via akshare."""
-    if not sector_name:
-        return []
-    ak = _get_akshare()
-    for fn_name in ("stock_board_concept_cons_em", "stock_board_industry_cons_em"):
-        fn = getattr(ak, fn_name, None)
-        if fn is None:
-            continue
-        try:
-            df = fn(symbol=sector_name)
-            if df is not None and not df.empty:
-                results: list[dict[str, Any]] = []
-                for record in df.head(30).to_dict("records"):
-                    results.append({
-                        "code": str(record.get("代码", "")),
-                        "name": str(record.get("名称", "")),
-                        "sector": sector_name,
-                    })
-                return results
-        except Exception as exc:
-            logger.debug("akshare %s(%s) failed: %s", fn_name, sector_name, exc)
-    return []
-
-
 # ------------------------------------------------------------------
 # efinance-based adapters (fallback when eastmoney push2 endpoints are blocked)
 # ------------------------------------------------------------------
@@ -756,6 +669,7 @@ def get_sector_efinance(top_n: int = 10) -> list[dict[str, Any]]:
     board_changes: dict[str, list[float]] = defaultdict(list)
     for code in _get_probe_stocks():
         try:
+            _vendor_jitter()
             df = ef.stock.get_belong_board(code)
             if df is None or df.empty:
                 continue
@@ -800,6 +714,7 @@ def get_dragon_tiger_efinance(trade_date: str | None = None) -> list[dict[str, A
 
     td = trade_date or date.today().isoformat()
     try:
+        _vendor_jitter()
         df = ef.stock.get_daily_billboard(start_date=td, end_date=td)
         if df is None or df.empty:
             return []
@@ -866,6 +781,7 @@ def _build_board_index() -> dict[str, list[dict[str, str]]]:
     board_index: dict[str, list[dict[str, str]]] = defaultdict(list)
     for code in codes:
         try:
+            _vendor_jitter()
             df = ef.stock.get_belong_board(code)
             if df is None or df.empty:
                 continue
@@ -924,12 +840,12 @@ def get_sector_constituents_efinance(sector_name: str = "") -> list[dict[str, An
 # ------------------------------------------------------------------
 
 
-def get_sector_local(top_n: int = 10) -> list[dict[str, Any]]:
+def get_sector_local(top_n: int = 10, trade_date: str | None = None) -> list[dict[str, Any]]:
     """Sector ranking from local baostock cache."""
     from .local_cache import get_cached_sector_data
 
     try:
-        data = get_cached_sector_data(top_n=top_n)
+        data = get_cached_sector_data(trade_date=trade_date, top_n=top_n)
         if not data:
             raise NoMarketDataError("Local sector cache is empty — run build_full_cache first", vendor="local_cache")
         return data
@@ -937,12 +853,15 @@ def get_sector_local(top_n: int = 10) -> list[dict[str, Any]]:
         raise VendorNotConfiguredError("local_cache requires baostock", vendor="local_cache")
 
 
-def get_sector_constituents_local(sector_name: str = "") -> list[dict[str, Any]]:
+def get_sector_constituents_local(
+    sector_name: str = "",
+    trade_date: str | None = None,
+) -> list[dict[str, Any]]:
     """Sector constituents from local baostock cache."""
     from .local_cache import get_cached_sector_constituents
 
     try:
-        data = get_cached_sector_constituents(sector_name)
+        data = get_cached_sector_constituents(sector_name, trade_date=trade_date)
         if not data:
             raise NoMarketDataError(f"No cached constituents for {sector_name}", vendor="local_cache")
         return data
@@ -1027,44 +946,151 @@ def get_capital_flow_local(code: str = "", start_date: str | None = None,
     return records
 
 
+def get_market_breadth_local(trade_date: str | None = None) -> dict[str, Any]:
+    """Market breadth proxy from cached daily parquet universe."""
+    from .local_cache import get_cached_market_breadth
+
+    data = get_cached_market_breadth(trade_date=trade_date)
+    if not data:
+        raise NoMarketDataError("No cached market breadth data", vendor="local_cache")
+    return data
+
+
+def get_northbound_top10_local(trade_date: str | None = None) -> list[dict[str, Any]]:
+    """Northbound top-10 turnover from local cache, if prebuilt."""
+    from .local_cache import get_cached_northbound_top10
+
+    data = get_cached_northbound_top10(trade_date)
+    if not data:
+        raise NoMarketDataError("No cached northbound top10 data", vendor="local_cache")
+    return _with_source(data, "local_cache")
+
+
+def get_northbound_flow_local(trade_date: str | None = None) -> dict[str, Any]:
+    """Northbound flow proxy from cached top-10 records."""
+    rows = get_northbound_top10_local(trade_date)
+    net_buy = sum(float(item.get("net_buy", 0) or 0) for item in rows)
+    return {
+        "trade_date": trade_date,
+        "net_buy": net_buy,
+        "record_count": len(rows),
+        "data_source": "local_cache",
+        "coverage_note": "proxy_from_cached_northbound_top10",
+    }
+
+
+# ------------------------------------------------------------------
+# Tencent Finance real-time snapshot (PE, PB, turnover, market cap)
+# ------------------------------------------------------------------
+
+# Typical qt.gtimg.cn response field positions (varies by exchange/version).
+# We return all parsed fields as a dict so callers can pick what they need.
+_TENCENT_FIELDS: dict[int, str] = {
+    1: "market",      # 1=SH, 2=SZ
+    2: "name",
+    3: "code",
+    4: "price",
+    5: "pre_close",
+    6: "open",
+    7: "high",
+    8: "low",
+}
+
+
+def _parse_tencent_response(text: str, code: str) -> dict[str, Any]:
+    """Parse qt.gtimg.cn pipe-delimited response into a dict."""
+    match = re.search(r'"(.*)"', text)
+    if not match:
+        raise NoMarketDataError(f"Tencent snapshot: unexpected response for {code}", symbol=code, vendor="tencent")
+    parts = match.group(1).split("~")
+    result: dict[str, Any] = {"data_source": "tencent", "code": code}
+    for idx, value in enumerate(parts):
+        label = _TENCENT_FIELDS.get(idx) or f"field_{idx}"
+        result[label] = value.strip() if isinstance(value, str) else value
+    return result
+
+
+def get_snapshot_tencent(code: str, **kwargs: Any) -> dict[str, Any]:
+    """Real-time snapshot from Tencent Finance (PE/PB/turnover/market cap).
+
+    Returns a dict with all parsed fields. Key fields:
+    price, pre_close, open, high, low, name, code, pe (field_38/39),
+    turnover_rate, total_market_cap, amplitude, change_pct.
+
+    Positions 38+ vary between exchanges; callers should verify field meaning.
+    """
+    symbol = f"{_market_suffix(code)}{_digits(code)}"
+    try:
+        response = requests.get(
+            f"https://qt.gtimg.cn/q={symbol}",
+            headers=_http_headers(),
+            timeout=10,
+        )
+        response.raise_for_status()
+        response.encoding = "gbk"
+        return _parse_tencent_response(response.text.strip(), code)
+    except NoMarketDataError:
+        raise
+    except Exception as exc:
+        raise NoMarketDataError(f"Tencent snapshot failed for {code}: {exc}", symbol=code, vendor="tencent") from exc
+
+
+def get_snapshot_tencent_batch(codes: list[str]) -> list[dict[str, Any]]:
+    """Batch real-time snapshot from Tencent Finance (multiple codes per call)."""
+    query = ",".join(f"{_market_suffix(c)}{_digits(c)}" for c in codes)
+    try:
+        response = requests.get(
+            f"https://qt.gtimg.cn/q={query}",
+            headers=_http_headers(),
+            timeout=15,
+        )
+        response.raise_for_status()
+        response.encoding = "gbk"
+        text = response.text.strip()
+    except Exception as exc:
+        raise NoMarketDataError(f"Tencent batch snapshot failed: {exc}", vendor="tencent") from exc
+
+    results: list[dict[str, Any]] = []
+    for line in text.splitlines():
+        parsed = _parse_tencent_response(line, "")
+        if parsed.get("code"):
+            results.append(parsed)
+    return results
+
+
 def register_all_vendors() -> None:
-    """Register free vendor adapters."""
+    """Register free vendor adapters (no akshare dependency)."""
 
-    register_vendor_impl("get_daily", "akshare", get_daily_akshare)
-    register_vendor_impl("get_daily", "baostock", get_daily_baostock)
     register_vendor_impl("get_daily", "local_cache", get_daily_local)
+    register_vendor_impl("get_daily", "mootdx", get_daily_mootdx)
+    register_vendor_impl("get_daily", "baostock", get_daily_baostock)
+    register_vendor_impl("get_market_breadth", "local_cache", get_market_breadth_local)
 
-    register_vendor_impl("get_capital_flow", "akshare", get_capital_flow_akshare)
+    register_vendor_impl("get_financial", "local_cache", get_financial_local)
+    register_vendor_impl("get_financial", "baostock", get_financial_baostock)
     register_vendor_impl("get_capital_flow", "local_cache", get_capital_flow_local)
-    register_vendor_impl("get_news", "akshare", get_news_akshare)
+    register_vendor_impl("get_news", "local_cache", get_news_local)
     register_vendor_impl("get_news", "sina", get_news_sina)
-    register_vendor_impl("get_sector", "akshare", get_sector_akshare)
+    register_vendor_impl("get_news", "cls", get_news_cls)
     register_vendor_impl("get_sector", "eastmoney", get_sector_eastmoney)
     register_vendor_impl("get_sector", "efinance", get_sector_efinance)
     register_vendor_impl("get_sector", "local_cache", get_sector_local)
-    register_vendor_impl("get_financial", "akshare", get_financial_akshare)
 
-    register_vendor_impl("get_suspended", "akshare", get_suspended_akshare)
+    register_vendor_impl("get_suspended", "local_cache", get_suspended_local)
     register_vendor_impl("get_suspended", "baostock", get_suspended_baostock)
-    register_vendor_impl("get_st_status", "akshare", get_st_status_akshare)
-    register_vendor_impl("get_delisting", "akshare", get_delisting_akshare)
+    register_vendor_impl("get_st_status", "local_cache", get_st_status_local)
+    register_vendor_impl("get_delisting", "local_cache", get_delisting_local)
 
-    register_vendor_impl("get_northbound_flow", "akshare", get_northbound_flow_akshare)
-    register_vendor_impl("get_northbound_top10", "akshare", get_northbound_top10_akshare)
-    register_vendor_impl("get_limit_up_tiers", "akshare", get_limit_up_tiers_akshare)
     register_vendor_impl("get_limit_up_tiers", "local_cache", get_limit_up_tiers_local)
-    register_vendor_impl("get_dragon_tiger", "akshare", get_dragon_tiger_akshare)
+    register_vendor_impl("get_northbound_flow", "local_cache", get_northbound_flow_local)
+    register_vendor_impl("get_northbound_top10", "local_cache", get_northbound_top10_local)
     register_vendor_impl("get_dragon_tiger", "efinance", get_dragon_tiger_efinance)
     register_vendor_impl("get_dragon_tiger", "local_cache", get_dragon_tiger_local)
-    register_vendor_impl("get_margin", "akshare", get_margin_akshare)
-    register_vendor_impl("get_sector_constituents", "akshare", get_sector_constituents_akshare)
     register_vendor_impl("get_sector_constituents", "efinance", get_sector_constituents_efinance)
     register_vendor_impl("get_sector_constituents", "local_cache", get_sector_constituents_local)
+    register_vendor_impl("get_snapshot", "tencent", get_snapshot_tencent)
 
-    register_vendor_impl("get_factors", "akshare", get_factors_computed)
-    register_vendor_impl("get_factors", "baostock", get_factors_computed)
-    register_vendor_impl("check_crowding", "akshare", check_crowding_stub)
-    register_vendor_impl("find_similar", "akshare", find_similar_stub)
+    register_vendor_impl("get_factors", "local_cache", get_factors_computed)
 
 
 register_all_vendors()

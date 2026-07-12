@@ -13,6 +13,7 @@ import pandas as pd
 
 from ..agents.memory_agent import MemoryStore
 from ..config import config
+from ..core.atomic_write import atomic_write_text
 from ..strategy_rules import current_rulebook, enqueue_strategy_proposals
 from .review import ReviewEngine
 
@@ -73,9 +74,9 @@ def run_daily_review(
     summary = reviewer.summarize_entries(entries)
     proposals = enqueue_strategy_proposals(summary, path=audit_queue_path)
     report = reviewer.format_summary(summary)
-    summary_path = Path(config.get("results_dir", "data/results")) / "daily_review_summary.md"
+    summary_path = Path(config.get("results_dir")) / "daily_review_summary.md"
     summary_path.parent.mkdir(parents=True, exist_ok=True)
-    summary_path.write_text(report, encoding="utf-8")
+    atomic_write_text(summary_path, report)
     return DailyReviewResult(
         resolved_count=len(resolved),
         pending_count=pending_count,

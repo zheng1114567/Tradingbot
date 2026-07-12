@@ -29,9 +29,16 @@ from .data_agent.scanner import MarketScanner, ScanBundle
 from .graph.workflow import TradingSystem
 from .strategy_rules import load_strategy_proposals, review_strategy_proposal
 
+# 日志: 控制台 + 文件 (results_dir/runtime.log)
+_log_dir = Path(config.get("results_dir"))
+_log_dir.mkdir(parents=True, exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler(_log_dir / "runtime.log", encoding="utf-8"),
+    ],
 )
 logger = logging.getLogger(__name__)
 
@@ -104,7 +111,7 @@ def analyze_batch(tickers_file: str, debug: bool = False,
     reports = [report for _, report in sorted(results, key=lambda item: item[0])]
 
     # 保存汇总
-    summary_path = Path(config.get("results_dir", "data/results")) / "batch_summary.md"
+    summary_path = Path(config.get("results_dir")) / "batch_summary.md"
     summary_path.parent.mkdir(parents=True, exist_ok=True)
     atomic_write_text(summary_path, "\n\n---\n\n".join(reports))
     logger.info("Batch summary saved to %s", summary_path)
@@ -135,7 +142,7 @@ def review_memory(price_file: str | None = None, as_of: str | None = None) -> st
 
     summary = reviewer.summarize_entries(store.load_entries())
     report = reviewer.format_summary(summary)
-    review_path = Path(config.get("results_dir", "data/results")) / "review_summary.md"
+    review_path = Path(config.get("results_dir")) / "review_summary.md"
     review_path.parent.mkdir(parents=True, exist_ok=True)
     atomic_write_text(review_path, report)
     return report
@@ -156,7 +163,7 @@ def backtest_portfolio(signals_file: str, price_file: str) -> str:
         f"- 单笔平均收益: {result.summary.get('avg_trade_return', 0):+.2%}",
     ]
     report = "\n".join(lines)
-    results_dir = Path(config.get("results_dir", "data/results"))
+    results_dir = Path(config.get("results_dir"))
     results_dir.mkdir(parents=True, exist_ok=True)
     atomic_write_text(results_dir / "portfolio_backtest_summary.md", report)
     result.nav.to_csv(results_dir / "portfolio_nav.csv", index=False)
@@ -231,7 +238,7 @@ def scan_and_analyze(top_n: int = 10, trade_date: str | None = None,
     Returns a consolidated Markdown report.
     """
     trade_date = trade_date or str(date.today())
-    results_dir = Path(config.get("results_dir", "data/results"))
+    results_dir = Path(config.get("results_dir"))
     results_dir.mkdir(parents=True, exist_ok=True)
     scan_path = results_dir / f"scan_report_{trade_date}.md"
 
@@ -313,6 +320,8 @@ def _analyze_from_bundle(
         "daily": ticker_raw.get("daily", []),
         "market": shared.get("market", []),
         "sector_context": shared.get("sector_context", []),
+        "limit_up_summary": shared.get("limit_up_summary", {}),
+        "dragon_tiger": shared.get("dragon_tiger", []),
         "capital_flow": ticker_raw.get("capital_flow", []),
         "news": ticker_raw.get("news", []),
         "risk": shared.get("risk", {}),
@@ -350,6 +359,158 @@ def _analyze_from_bundle(
     return report
 
 
+def ask_llm(question: str, trade_date: str | None = None, debug: bool = False) -> str:
+    """自然语言问答：根据问题自动分析对应标的或板块并回答。
+
+    1. LLM 解析问题 → 提取 ticker/板块/意图
+    2. 扫描 + DataAgent 采集数据
+    3. 把 tier1/tier2 + 问题发给 LLM → 生成分析回答
+    """
+    trade_date = trade_date or str(date.today())
+    from .data_agent.scanner import MarketScanner
+
+    # Step 1: LLM 解析问题，提取目标
+    llm = _get_llm()
+    parse_prompt = (
+        f"你是一个量化交易系统的意图识别器。根据用户的提问，判断目标对象。"
+        f"只返回 JSON，格式: {{'type': 'ticker'|'sector'|'market'|'unknown', "
+        f"'target': '股票代码或板块名称或null', 'reason': '简短判断理由'}}\n"
+        f"如果提到具体公司名（如'茅台'），转换为 ticker（如 '600519.SH'）。"
+        f"如果提到板块（如'新能源车'、'白酒'），type 为 sector，target 为板块名。\n"
+        f"问题: {question}"
+    )
+    try:
+        parse_result = json.loads(str(llm.chat([("system", "只返回JSON，不要解释"), ("human", parse_prompt)], temperature=0, max_tokens=500)))
+        target_type = parse_result.get("type", "unknown")
+        target = parse_result.get("target", "")
+    except Exception as exc:
+        logger.warning("LLM question parsing failed: %s", exc)
+        target_type = "unknown"
+        target = ""
+
+    if debug:
+        print(f"[Ask] Parsed: type={target_type}, target={target}")
+
+    # Step 2: 采集数据
+    tier1_data: dict[str, Any] = {}
+    tier2_data: dict[str, Any] = {}
+    collected_context: str = ""
+
+    if target_type == "ticker" and target:
+        # 单个标的分析
+        try:
+            scanner = MarketScanner(top_sectors=5, top_n=10)
+            bundle = scanner.scan_and_collect(trade_date, top_n=10)
+            run = DataAgent().run(
+                DataAgentRequest(
+                    ticker=target,
+                    trade_date=trade_date,
+                    include_market=True,
+                    include_capital_flow=True,
+                    include_news=True,
+                    include_factors=True,
+                    include_risk=True,
+                    use_react_planner=False,
+                    use_llm_news_filter=True,
+                    fetch_news_full_text=False,
+                ),
+                raw_data={
+                    "daily": bundle.ticker_data.get(target, {}).get("daily", []),
+                    "market": bundle.shared_raw.get("market", []),
+                    "sector_context": bundle.shared_raw.get("sector_context", []),
+                    "limit_up_summary": bundle.shared_raw.get("limit_up_summary", {}),
+                    "dragon_tiger": bundle.shared_raw.get("dragon_tiger", []),
+                    "capital_flow": bundle.ticker_data.get(target, {}).get("capital_flow", []),
+                    "news": bundle.ticker_data.get(target, {}).get("news", []),
+                    "risk": bundle.shared_raw.get("risk", {}),
+                    "route_trace": bundle.route_trace,
+                },
+            )
+            ap = run.final_data.get("analysis", {}).get("agent_payload", {})
+            tier1_data = ap.get("tier1_data", {})
+            tier2_data = ap.get("tier2_data", {})
+            collected_context = f"标的 {target} 的分析数据"
+        except Exception as exc:
+            logger.error("Ticker data collection failed for %s: %s", target, exc)
+            collected_context = f"数据采集失败: {exc}"
+
+    elif target_type == "sector" and target:
+        # 板块分析
+        try:
+            scanner = MarketScanner(top_sectors=10, top_n=20)
+            results = scanner.scan(trade_date)
+            # 用板块名过滤候选
+            sector_results = [r for r in results if target.lower() in (r.sector or "").lower()]
+            top_sectors = scanner._last_scan_context.get("hot_sectors", [])
+            sector_info = [s for s in top_sectors if target.lower() in (s.get("sector_name", "") or "").lower()]
+            collected_context = json.dumps({
+                "matched_sectors": sector_info[:5],
+                "sector_candidates": [(r.ticker, r.name, r.sector, r.score) for r in sector_results[:10]],
+                "market_sentiment": scanner._last_scan_context.get("limit_up_summary", {}),
+            }, ensure_ascii=False)
+        except Exception as exc:
+            logger.error("Sector scan failed for %s: %s", target, exc)
+            collected_context = f"板块扫描失败: {exc}"
+
+    else:
+        # 市场全局或未知 → 扫描大盘
+        try:
+            scanner = MarketScanner(top_sectors=5, top_n=5)
+            results = scanner.scan(trade_date)
+            collected_context = json.dumps({
+                "top_sectors": [(s.get("sector_name"), s.get("change_pct")) for s in scanner._last_scan_context.get("hot_sectors", [])[:8]],
+                "limit_up": scanner._last_scan_context.get("limit_up_summary", {}),
+                "top_candidates": [(r.ticker, r.name, r.sector, r.score) for r in results[:10]],
+            }, ensure_ascii=False)
+        except Exception as exc:
+            logger.error("Market scan failed: %s", exc)
+            collected_context = f"市场扫描失败: {exc}"
+
+    # Step 3: LLM 综合分析
+    answer_prompt = (
+        f"你是一个A股量化交易分析师。用户提问: {question}\n\n"
+        f"以下是系统采集到的结构化数据，请根据这些数据给出分析回答:\n\n"
+        f"{collected_context}\n\n"
+    )
+
+    if tier1_data:
+        answer_prompt += f"## Tier 1 (市场摘要)\n{json.dumps(tier1_data, ensure_ascii=False, indent=2)}\n\n"
+    if tier2_data:
+        answer_prompt += f"## Tier 2 (详细数据)\n"
+        answer_prompt += f"- 日线记录: {len(tier2_data.get('price_data', []))} 条\n"
+        answer_prompt += f"- 因子记录: {len(tier2_data.get('factors', []))} 条\n"
+        answer_prompt += f"- 事件记录: {len(tier2_data.get('events', []))} 条\n"
+
+    answer_prompt += (
+        "\n请从以下角度回答:\n"
+        "1. 市场背景（大盘情绪、板块状态）\n"
+        "2. 标/板块的量化特征（因子、资金、技术面）\n"
+        "3. 风险和注意事项\n"
+        "4. 结论和建议\n"
+        "用中文回答，500字以内，Markdown格式。"
+    )
+
+    try:
+        answer = str(llm.chat(
+            [("system", "你是一个严谨的A股量化分析师。基于数据回答，不臆测。"), ("human", answer_prompt)],
+            temperature=0.3,
+            max_tokens=2000,
+        ))
+    except Exception as exc:
+        answer = f"⚠️ 分析生成失败: {exc}"
+
+    return f"# 智能问答\n\n**问题**: {question}\n\n---\n\n{answer}\n"
+
+
+def _get_llm():
+    """Get or create LLM client, trying configured provider then deepseek."""
+    from .llm.client import create_llm
+    try:
+        return create_llm()
+    except Exception:
+        return create_llm(provider="deepseek")
+
+
 def main():
     parser = argparse.ArgumentParser(description="多智能体量化交易分析系统")
     parser.add_argument("--ticker", "-t", help="股票代码 (如 000001.SZ)")
@@ -380,8 +541,13 @@ def main():
     parser.add_argument("--scan", action="store_true", help="扫描热点板块和强势股，自动分析 Top-N")
     parser.add_argument("--scan-top-n", type=int, default=10, help="扫描后分析 Top N 只股票 (默认 10)")
     parser.add_argument("--force", "-f", action="store_true", help="强制重新扫描，忽略缓存")
+    parser.add_argument("--ask", "-a", help="自然语言提问，如 '新能源汽车板块怎么样' 或 '贵州茅台能买吗'")
 
     args = parser.parse_args()
+
+    if args.ask:
+        print(report)
+        return
 
     if args.review:
         print(review_memory(price_file=args.price_file, as_of=args.date))
@@ -449,8 +615,15 @@ def main():
         return
 
     if not args.ticker:
-        parser.print_help()
-        sys.exit(1)
+        # 无参数时默认运行热点扫描
+        print(scan_and_analyze(
+            top_n=10,
+            trade_date=args.date,
+            debug=args.debug,
+            skip_backtest=args.skip_backtest,
+            force=args.force,
+        ))
+        return
 
     report = analyze_single(
         args.ticker,

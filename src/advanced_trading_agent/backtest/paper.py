@@ -10,6 +10,7 @@ from typing import Any
 import pandas as pd
 
 from ..config import config
+from ..core.atomic_write import atomic_write_text
 from .portfolio import ObservationPortfolioBacktester
 
 
@@ -35,8 +36,8 @@ class PaperTradingLedger:
     """Append-only paper ledger with deterministic settlement from prices."""
 
     def __init__(self, path: str | None = None):
-        default_path = Path(config.get("results_dir", "data/results")) / "paper_trading_ledger.jsonl"
-        self.path = Path(path or default_path).expanduser()
+        default_path = Path(config.get("results_dir")) / "paper_trading_ledger.jsonl"
+        self.path = Path(path or default_path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
 
     def load(self) -> list[dict[str, Any]]:
@@ -53,7 +54,7 @@ class PaperTradingLedger:
             json.dumps(self._json_safe(row), ensure_ascii=False, sort_keys=True)
             for row in rows
         ]
-        self.path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+        atomic_write_text(self.path, "\n".join(lines) + ("\n" if lines else ""))
 
     def record_signals(self, signals: pd.DataFrame | list[dict[str, Any]]) -> int:
         existing = self.load()

@@ -4,11 +4,16 @@ This module is the seam between collected DataAgent payloads and the debate
 adapters. Callers provide workflow state and contradictions; the harness
 returns scoped agent contexts plus a shared task prompt.
 """
+
 from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
 from typing import Any
+
+from ..agents.specs import build_roundtable_system_message
+from ..tool_nodes.registry import get_allowed_tool_names
+from .schemas import EvidenceItem
 
 
 _AGENT_ORDER = ("Market", "Event", "Analysis", "Backtest")
@@ -34,6 +39,7 @@ class RoundtableAgentContext:
     report: str
     evidence_text: str
     system_message: str
+    allowed_tool_names: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -43,6 +49,7 @@ class RoundtableContext:
     data_brief: DataAgentBrief
     agent_contexts: dict[str, RoundtableAgentContext] = field(default_factory=dict)
     shared_evidence_text: str = ""
+    evidence_board: list[EvidenceItem] = field(default_factory=list)
     task: str = ""
 
 
@@ -76,6 +83,7 @@ class RoundtableHarness:
         tier2 = state.get("tier2_data", {}) or {}
         brief = self._build_brief(state, tier1=tier1, tier2=tier2)
         shared = self._build_shared_evidence(brief, contradictions)
+        evidence_board = self.build_evidence_board(state)
         agent_contexts = {
             agent: self._build_agent_context(
                 agent,
@@ -83,6 +91,7 @@ class RoundtableHarness:
                 tier1=tier1,
                 tier2=tier2,
                 shared_evidence=shared,
+                evidence_board=evidence_board,
             )
             for agent in _AGENT_ORDER
         }
@@ -91,11 +100,13 @@ class RoundtableHarness:
             trade_date=brief.trade_date,
             contradictions=contradictions,
             shared_evidence=shared,
+            evidence_board=evidence_board,
         )
         return RoundtableContext(
             data_brief=brief,
             agent_contexts=agent_contexts,
             shared_evidence_text=shared,
+            evidence_board=evidence_board,
             task=task,
         )
 
@@ -142,6 +153,96 @@ class RoundtableHarness:
         ]
         return "\n".join(lines)
 
+    def build_evidence_board(
+        self,
+        state: dict[str, Any],
+    ) -> list[EvidenceItem]:
+        """Build a shared, traceable evidence board from workflow state.
+
+        Extracts key data points from tier1/tier2 and agent reports,
+        assigning each a unique ID for cross-referencing in debate.
+        """
+        evidence: list[EvidenceItem] = []
+        tier1 = state.get("tier1_data", {}) or {}
+        tier2 = state.get("tier2_data", {}) or {}
+        idx = 0
+
+        def _add(
+            agent: str,
+            field: str,
+            value: Any,
+            *,
+            tag: str | None = None,
+        ) -> str:
+            nonlocal idx
+            idx += 1
+            eid = f"ev_{agent.lower()}_{idx:03d}"
+            evidence.append(
+                EvidenceItem(
+                    id=eid,
+                    agent=agent,
+                    field_path=field,
+                    value=str(value)[:200],
+                    contradiction_tag=tag,
+                )
+            )
+            return eid
+
+        # Market evidence from tier1
+        capital = tier1.get("capital", {}) or {}
+        if capital.get("confirmation"):
+            _add("Market", "tier1_data.capital.confirmation", capital["confirmation"])
+        sentiment = tier1.get("sentiment", {}) or {}
+        if sentiment.get("sentiment"):
+            _add("Market", "tier1_data.sentiment.sentiment", sentiment["sentiment"])
+        market = tier1.get("market", {}) or {}
+        if market.get("index_change_pct"):
+            _add(
+                "Market",
+                "tier1_data.market.index_change_pct",
+                market["index_change_pct"],
+            )
+        sector = tier1.get("sector", {}) or {}
+        if sector.get("leading_sector"):
+            _add("Market", "tier1_data.sector.leading_sector", sector["leading_sector"])
+
+        # Event evidence from tier2
+        events = tier2.get("events", []) or []
+        for i, ev in enumerate(events[:3]):
+            _add("Event", f"tier2_data.events[{i}].title", ev.get("title", ""))
+            if ev.get("direction"):
+                _add("Event", f"tier2_data.events[{i}].direction", ev["direction"])
+
+        # Analysis evidence from tier2
+        factors = tier2.get("factors", []) or []
+        for i, fct in enumerate(factors[:5]):
+            _add("Analysis", f"tier2_data.factors[{i}].name", fct.get("name", ""))
+            if fct.get("score") is not None:
+                _add("Analysis", f"tier2_data.factors[{i}].score", fct["score"])
+
+        # Backtest evidence from tier2
+        samples = tier2.get("backtest_samples", []) or []
+        _add("Backtest", "tier2_data.backtest_samples.count", len(samples))
+
+        # Agent report summaries
+        for agent_name, key in [
+            ("Market", "market_report_obj"),
+            ("Event", "event_report_obj"),
+            ("Analysis", "analysis_report_obj"),
+            ("Backtest", "backtest_report_obj"),
+        ]:
+            rpt = state.get(key)
+            if rpt:
+                _add(
+                    agent_name,
+                    f"{key}.decision",
+                    getattr(rpt, "decision", None)
+                    if hasattr(rpt, "decision")
+                    else "N/A",
+                )
+
+        return evidence
+
     def _build_agent_context(
         self,
         agent: str,
@@ -150,20 +251,24 @@ class RoundtableHarness:
         tier1: dict[str, Any],
         tier2: dict[str, Any],
         shared_evidence: str,
+        evidence_board: list | None = None,
     ) -> RoundtableAgentContext:
         report = self._agent_report(state, agent)
         evidence = self._agent_evidence(agent, tier1=tier1, tier2=tier2)
+        allowed_tool_names = get_allowed_tool_names(agent.lower())
         system_message = self._system_message(
             agent=agent,
             report=report,
             evidence=evidence,
             shared_evidence=shared_evidence,
+            evidence_board=evidence_board or [],
         )
         return RoundtableAgentContext(
             name=agent,
             report=report,
             evidence_text=evidence,
             system_message=system_message,
+            allowed_tool_names=allowed_tool_names,
         )
 
     def _agent_evidence(
@@ -196,7 +301,9 @@ class RoundtableHarness:
             }
         elif agent == "Backtest":
             payload = {
-                "backtest_samples": self._limit_list(tier2.get("backtest_samples", []), 8),
+                "backtest_samples": self._limit_list(
+                    tier2.get("backtest_samples", []), 8
+                ),
                 "price_data_tail": self._limit_list(tier2.get("price_data", []), 10),
                 "data_quality": tier2.get("data_quality", {}),
             }
@@ -211,33 +318,16 @@ class RoundtableHarness:
         report: str,
         evidence: str,
         shared_evidence: str,
+        evidence_board: list | None = None,
     ) -> str:
-        focus = {
-            "Market": "市场温度、资金确认、仓位约束、行业环境",
-            "Event": "事件传导、证据等级、定价状态、证伪条件",
-            "Analysis": "因子排序、拥挤风险、择时过滤、数据质量",
-            "Backtest": "样本量、胜率、超额收益、统计可靠性",
-        }[agent]
-        return f"""你是 {agent} Agent，参加 Round 2 圆桌会议。
-
-边界规则:
-1. 只能引用自己的 AgentContext、DATA_AGENT_BRIEF 和你已有的报告。
-2. 只能引用自己的 AgentContext 中的数据字段；不要替其他 Agent 解释其私有证据。
-3. 如果证据缺失，必须明确说“数据不足”，不得补造外部数据。
-4. 必须回应矛盾点，并说明对最终裁定的影响: upgrade/neutral/downgrade。
-5. 输出包含: 立场、引用证据、对矛盾的解释、对最终裁定的压力。
-
-关注范围: {focus}
-
-DATA_AGENT_BRIEF:
-{shared_evidence[: self.char_limit]}
-
-AgentContext:
-{evidence[: self.char_limit]}
-
-既有报告:
-{report[: self.char_limit]}
-"""
+        return build_roundtable_system_message(
+            agent=agent,
+            report=report,
+            evidence=evidence,
+            shared_evidence=shared_evidence,
+            evidence_board=evidence_board or [],
+            char_limit=self.char_limit,
+        )
 
     def _build_task(
         self,
@@ -246,12 +336,22 @@ AgentContext:
         trade_date: str,
         contradictions: list[str],
         shared_evidence: str,
+        evidence_board: list | None = None,
     ) -> str:
+        board_section = ""
+        if evidence_board:
+            formatted = "\n".join(
+                f"  [{e.id}] {e.agent}: {e.field_path} = {e.value[:80]}"
+                for e in evidence_board
+            )
+            board_section = (
+                f"\n共享证据板 (引用时使用 [ev_xxxxx]):\n{formatted[:1000]}\n"
+            )
         return f"""请进行 Round 2 圆桌会议。
 
 DATA_AGENT_BRIEF:
 {shared_evidence[: self.char_limit]}
-
+{board_section}
 标的: {ticker}
 交易日: {trade_date}
 
@@ -260,7 +360,7 @@ DATA_AGENT_BRIEF:
 
 会议规则:
 1. 每个 Agent 必须基于自己的 AgentContext 发言，不能复述或发明其他 Agent 的私有数据。
-2. 每次发言都要指出引用的 DataAgent 字段或报告片段。
+2. 每次发言都要指出引用的 DataAgent 字段或报告片段，使用 [ev_xxxxx] ID 引用证据。
 3. Moderator 最后输出 unresolved_conflicts、final_pressure(upgrade/neutral/downgrade) 和风控关注点。
 4. 如果证据链不足，final_pressure 应偏 neutral 或 downgrade，不得强行 upgrade。
 """

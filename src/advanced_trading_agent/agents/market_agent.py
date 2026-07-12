@@ -16,6 +16,7 @@ ToolNode 执行实际调用, LLM 读取结果生成报告。
 - 而是"LLM自己决定要看什么数据, ToolNode去取"
 - 匹配 TradingAgents 的 ToolNode 模式
 """
+
 from __future__ import annotations
 
 import logging
@@ -23,17 +24,16 @@ from datetime import date
 from typing import Any
 
 from ..llm.client import LLMClient
-from ..tool_nodes.market_tools import (
-    MarketTools,
-    get_capital_flow,
-    get_limit_up_tiers,
-    get_market_sentiment,
-    get_northbound_flow,
-    get_sector_rotation,
+from ..tool_nodes.market_tools import MarketTools
+from ..tool_nodes.registry import get_agent_tools
+from .contract import (
+    basic_self_check,
+    build_agent_update,
+    build_react_agent,
+    run_react_agent,
 )
-from .contract import basic_self_check, build_agent_update
-from .react_runner import run_prebuilt_react
 from .schemas import MarketReport
+from .specs import get_agent_skill
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +49,13 @@ SENTIMENT_POSITION_CAP = {
 
 def create_market_agent(llm: LLMClient, tools: MarketTools | None = None):
     """创建 Market Agent 节点函数"""
+    skill = get_agent_skill("market")
+    react_agent = build_react_agent(
+        llm=llm,
+        tools=get_agent_tools("market"),
+        system_prompt=skill.react_prompt,
+        response_format=MarketReport,
+    )
 
     def market_node(state: dict[str, Any]) -> dict[str, Any]:
         trade_date = state.get("trade_date", str(date.today()))
@@ -129,23 +136,7 @@ def create_market_agent(llm: LLMClient, tools: MarketTools | None = None):
         ]
         prompt = "\n".join(prompt_lines)
 
-        react_prompt = (
-            "你是 A 股市场分析师。必须用可用工具检查市场情绪、资金、板块轮动和涨停梯队，"
-            "再输出结构化市场分析。仓位上限必须服从硬规则。"
-        )
-        report, react_trace = run_prebuilt_react(
-            llm=llm,
-            tools=[
-                get_market_sentiment,
-                get_northbound_flow,
-                get_capital_flow,
-                get_sector_rotation,
-                get_limit_up_tiers,
-            ],
-            prompt=react_prompt,
-            user_content=prompt,
-            response_format=MarketReport,
-        )
+        report, react_trace = run_react_agent(react_agent, prompt)
         if react_trace:
             tool_calls.extend(react_trace)
 
@@ -153,13 +144,13 @@ def create_market_agent(llm: LLMClient, tools: MarketTools | None = None):
             if report is None:
                 report = llm.chat(
                     messages=[
-                        ("system", "你是 A 股市场分析师。评估当前市场温度和资金状态。"),
+                        ("system", skill.fallback_system_prompt),
                         ("human", prompt),
                     ],
                     response_format=MarketReport,
                 )
             # 规则覆盖 LLM (仓位上限必须遵守)
-            if hasattr(report, 'position_cap'):
+            if hasattr(report, "position_cap"):
                 report.position_cap = min(report.position_cap, position_cap)
         except Exception as e:
             logger.warning("LLM market analysis failed, using rules: %s", e)
@@ -167,7 +158,9 @@ def create_market_agent(llm: LLMClient, tools: MarketTools | None = None):
                 market_state=sentiment_level,
                 position_cap=position_cap,
                 capital_confirmation=capital_conf,
-                sector_preference=[s.get("sector_name", "") for s in sector_rotation[:3]],
+                sector_preference=[
+                    s.get("sector_name", "") for s in sector_rotation[:3]
+                ],
                 reasoning=f"规则判断: 情绪{sentiment_level}, 仓位上限{position_cap:.0%}",
             )
 
@@ -188,7 +181,9 @@ def create_market_agent(llm: LLMClient, tools: MarketTools | None = None):
             state,
             sender="Market Agent",
             report_key="market_report",
-            report=report.to_markdown() if hasattr(report, "to_markdown") else str(report),
+            report=report.to_markdown()
+            if hasattr(report, "to_markdown")
+            else str(report),
             report_obj_key="market_report_obj",
             report_obj=report,
             evidence=evidence,

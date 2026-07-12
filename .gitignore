@@ -6,3 +6,4 @@ data/cache/
 data/results/
 .venv/
 *.egg-info/
+.tmp_ata/

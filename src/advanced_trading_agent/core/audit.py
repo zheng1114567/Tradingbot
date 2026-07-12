@@ -137,6 +137,7 @@ def format_roundtable_visualization(round2_state: dict[str, Any]) -> str:
     fallback = round2_state.get("fallback_reason", "")
     completed = round2_state.get("completed", False)
     round_count = round2_state.get("round_count", 0)
+    round_history = round2_state.get("round_history", [])
 
     lines.append(f"- **Provider**: {provider}")
     lines.append(f"- **Rounds**: {round_count}")
@@ -145,27 +146,30 @@ def format_roundtable_visualization(round2_state: dict[str, Any]) -> str:
         lines.append(f"- **Fallback reason**: {fallback}")
     lines.append("")
 
-    contradictions = round2_state.get("contradictions", [])
-    if contradictions:
+    contradiction_records = round2_state.get("contradiction_records", [])
+    if contradiction_records:
         lines.append("### Contradictions Identified")
         lines.append("")
-        for i, c in enumerate(contradictions, 1):
-            lines.append(f"{i}. {c}")
+        for i, c in enumerate(contradiction_records, 1):
+            desc = c.get("description", str(c)) if isinstance(c, dict) else str(c)
+            lines.append(f"{i}. {desc}")
         lines.append("")
 
-    questions = round2_state.get("questions", [])
-    if questions:
+    if round_history:
         lines.append("### Debate Rounds")
         lines.append("")
-        for idx, item in enumerate(questions, start=1):
-            source = item.get("source_agent", "System")
-            contradiction = item.get("data_source", "")
-            question = item.get("question", "")
-            lines.append(f"#### Round {idx} — {source} 质询")
-            lines.append("")
-            lines.append(f"> **矛盾点**: {contradiction[:200]}")
-            lines.append("")
-            lines.append(f"**质询问题**: {question[:300]}")
+        for round_data in round_history:
+            rn = round_data.get("round_number", "?")
+            lines.append(f"#### Round {rn + 1}")
+            for turn in round_data.get("turns", []):
+                agent = turn.get("agent_name", "?")
+                stance = turn.get("stance", {})
+                pressure = stance.get("pressure", "neutral")
+                confidence = stance.get("confidence", 0)
+                reasoning = (stance.get("reasoning", "") or "")[:200]
+                lines.append(f"- **{agent}**: pressure={pressure}, conf={confidence:.1f}")
+                if reasoning:
+                    lines.append(f"  - {reasoning}")
             lines.append("")
             lines.append("| Agent | Position | Evidence Cited | Impact |")
             lines.append("|-------|----------|----------------|--------|")

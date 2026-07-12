@@ -76,6 +76,26 @@ class TestCleaner:
         assert "turnover_rate" in result.columns
         assert result.iloc[0]["pct_chg"] == 2.0
 
+    def test_clean_daily_handles_duplicate_normalized_columns(self):
+        data = [
+            {
+                "trade_date": "2026-07-10",
+                "code": "603259.SH",
+                "open": 10,
+                "high": 11,
+                "low": 9,
+                "close": 10.5,
+                "vol": 1000,
+                "volume": 1000,
+                "amount": 10500,
+            }
+        ]
+
+        result = DataCleaner.clean_daily(data)
+
+        assert list(result.columns).count("volume") == 1
+        assert result.iloc[0]["volume"] == 1000
+
 
 class TestFactors:
     """测试因子公式单位."""

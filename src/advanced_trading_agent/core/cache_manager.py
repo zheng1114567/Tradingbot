@@ -149,9 +149,7 @@ class CacheManager:
     }
 
     def __init__(self, cache_dir: str | None = None):
-        self.cache_dir = Path(
-            cache_dir or config.get("data_cache_dir", "data/cache")
-        )
+        self.cache_dir = Path(cache_dir or config.get("data_cache_dir"))
         self.cache_dir.mkdir(parents=True, exist_ok=True)
 
     def _cache_path(self, key: str) -> Path:

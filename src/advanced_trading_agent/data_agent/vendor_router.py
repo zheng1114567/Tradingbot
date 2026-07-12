@@ -66,21 +66,24 @@ class VendorFatalError(VendorError):
 # ============================================================
 
 class DataVendor(str, Enum):
-    AKSHARE = "akshare"
+    MOOTDX = "mootdx"
     BAOSTOCK = "baostock"
     EASTMONEY = "eastmoney"
     SINA = "sina"
+    CLS = "cls"
+    TENCENT = "tencent"
+    LOCAL_CACHE = "local_cache"
 
 
 # 工具分类
 TOOL_CATEGORIES = {
     "market_data": {
         "description": "行情数据 (日K, 分钟K)",
-        "tools": ["get_daily", "get_minute"],
+        "tools": ["get_daily", "get_minute", "get_market_breadth"],
     },
     "fundamental_data": {
         "description": "基本面数据",
-        "tools": ["get_financial", "get_balance", "get_income", "get_cashflow"],
+        "tools": ["get_financial", "get_balance", "get_income", "get_cashflow", "get_snapshot"],
     },
     "news_data": {
         "description": "新闻数据",
@@ -126,8 +129,8 @@ def get_vendor_for_tool(method: str) -> str:
             primary = [v.strip() for v in vendor_config.split(",") if v.strip()]
             if primary:
                 return primary[0]
-            return DataVendor.AKSHARE.value
-    return DataVendor.AKSHARE.value
+            return ""
+    return ""
 
 
 def get_vendor_chain(method: str) -> list[str]:
@@ -143,7 +146,7 @@ def get_vendor_chain(method: str) -> list[str]:
             break
 
     if not chain:
-        chain = [DataVendor.AKSHARE.value]
+        chain = []
 
     # Append registered vendors not already in the chain
     registered = list(_VENDOR_IMPLEMENTATIONS.get(method, {}).keys())

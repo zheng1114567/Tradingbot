@@ -71,7 +71,7 @@ class DataManifest:
         return asdict(self)
 
     def save(self, results_dir: str | None = None) -> Path:
-        base_dir = Path(results_dir or config.get("results_dir", "data/results"))
+        base_dir = Path(results_dir or config.get("results_dir"))
         manifest_dir = base_dir / "manifests"
         manifest_dir.mkdir(parents=True, exist_ok=True)
         ticker = _safe_path_part(self.ticker.replace(".", "_"), "unknown_ticker")

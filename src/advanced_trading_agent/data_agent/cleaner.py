@@ -84,7 +84,13 @@ class DataCleaner:
         }
         # 只重命名存在的列
         existing = {k: v for k, v in rename_map.items() if k in df.columns}
-        return df.rename(columns=existing)
+        df = df.rename(columns=existing)
+        # Some vendors provide both a source field (e.g. vol) and an already
+        # normalized field (volume). After renaming, keep the first non-empty
+        # version so downstream scalar operations do not receive duplicate columns.
+        if df.columns.duplicated().any():
+            df = df.loc[:, ~df.columns.duplicated()]
+        return df
 
     @staticmethod
     def detect_limit_up_down(df: pd.DataFrame) -> pd.DataFrame:

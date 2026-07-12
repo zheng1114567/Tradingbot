@@ -17,30 +17,24 @@ from typing import Annotated, Any, TypedDict
 from langgraph.graph import MessagesState
 
 
-class QuestionItem(TypedDict):
-    """Round 2 交叉质询中的单个问题"""
-    source_agent: str   # 提问 Agent
-    target_agent: str   # 被质询 Agent
-    question: str
-    answer: str | None
-    answers: list[dict[str, Any]]
-    data_source: str  # 质询基于的数据矛盾
-
-
 class Round2State(TypedDict):
     """Round 2 辩论状态"""
     active: bool                 # 是否启动 Round 2
     round_count: int             # 当前轮数
     max_rounds: int              # 最大轮数 (8)
-    questions: list[QuestionItem]
-    contradictions: list[str]    # 发现的矛盾摘要
     current_speaker: str         # 当前发言 Agent
     completed: bool              # 是否完成
     summary: str                 # 圆桌会议总结
-    provider: str                # autogen / deterministic / none
-    fallback_reason: str         # AutoGen 失败或空结果原因
+    provider: str                # debate_engine / none
+    fallback_reason: str         # 引擎失败原因
     final_pressure: str          # upgrade / neutral / downgrade
     unresolved_conflicts: list[str]
+
+    # === 新字段: 结构化辩论数据 ===
+    contradiction_records: list[dict]  # ContradictionRecord.model_dump()
+    evidence_board: list[dict]         # EvidenceItem.model_dump()
+    round_history: list[dict]          # 多轮辩论历史
+    moderator_output: dict | None      # ModeratorOutput.model_dump()
 
 
 class AgentState(MessagesState):

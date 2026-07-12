@@ -46,6 +46,15 @@ _BOOL_TRUE = ("true", "1", "yes", "on")
 _BOOL_FALSE = ("false", "0", "no", "off")
 _VALID_PROVIDERS = frozenset({"deepseek", "openai", "anthropic"})
 
+# Config keys whose values are file-system paths — auto-expand ~ on env-var overrides
+_PATH_KEYS = frozenset({
+    "results_dir",
+    "data_cache_dir",
+    "memory_log_path",
+    "memory_index_path",
+    "strategy_audit_queue_path",
+})
+
 
 def _load_dotenv() -> None:
     """加载 .env 文件 (如果存在)"""
@@ -127,13 +136,13 @@ class Config:
             "output_language": "Chinese",
             # 数据
             "data_vendors": {
-                "market_data": "akshare,baostock",            # A股免费源优先
-                "fundamental_data": "akshare,baostock",
-                "news_data": "akshare,sina",
-                "capital_flow": "akshare",
-                "a_share_specific": "akshare,eastmoney",
-                "analysis": "akshare,baostock",
-                "risk_data": "akshare,baostock",
+                "market_data": "local_cache,mootdx,baostock",  # 本地缓存优先，在线源只做补缺
+                "fundamental_data": "local_cache,baostock",  # 季度财务快照，命中缓存优先
+                "news_data": "local_cache,sina,cls",
+                "capital_flow": "local_cache",
+                "a_share_specific": "local_cache,efinance,eastmoney",
+                "analysis": "baostock",
+                "risk_data": "local_cache,baostock",
             },
             # 风控
             "risk_config": {
@@ -204,6 +213,8 @@ class Config:
                     if t < 0.0 or t > 2.0:
                         raise ValueError(f"Temperature must be in [0.0, 2.0], got {t}")
                 self._config[config_key] = value
+                if config_key in _PATH_KEYS:
+                    self._config[config_key] = str(Path(str(value)).expanduser())
             except ValueError as e:
                 raise ValueError(f"Invalid value for {env_var}: {e}") from e
 

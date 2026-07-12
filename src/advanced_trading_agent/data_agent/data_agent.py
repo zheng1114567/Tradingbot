@@ -9,6 +9,7 @@ The agent records each stage of a data run:
 """
 from __future__ import annotations
 
+import logging
 import json
 import os
 import re
@@ -34,6 +35,8 @@ from .request import DataAgentRequest
 from .scanner import ScanBundle
 from .stock_profile import StockProfile, StockProfileResolver
 from .vendor_router import get_vendor_chain, route_to_vendor
+
+logger = logging.getLogger(__name__)
 
 
 RouteFn = Callable[..., Any]
@@ -141,7 +144,7 @@ class DataAgent:
         profile_resolver: StockProfileResolver | None = None,
     ) -> None:
         self._route_fn = route_fn
-        self._results_dir = Path(results_dir or config.get("results_dir", "data/results"))
+        self._results_dir = Path(results_dir or config.get("results_dir"))
         self._planner = planner or DataAgentPlanner()
         self._llm_client = llm_client
         self._profile_resolver = profile_resolver or StockProfileResolver()
@@ -395,6 +398,9 @@ class DataAgent:
         daily = raw_data.get("daily", [])
         market = raw_data.get("market", [])
         sector_context = raw_data.get("sector_context", [])
+        limit_up_summary = raw_data.get("limit_up_summary", {})
+        dragon_tiger = raw_data.get("dragon_tiger", [])
+        market_breadth = raw_data.get("market_breadth", {})
         capital_flow = raw_data.get("capital_flow", [])
         news = raw_data.get("news", [])
         risk = raw_data.get("risk", {})
@@ -406,6 +412,9 @@ class DataAgent:
             ("stock.daily", daily),
             ("market.daily", market),
             ("sector.context", sector_context),
+            ("market.limit_up_summary", [limit_up_summary] if isinstance(limit_up_summary, dict) and limit_up_summary else []),
+            ("market.dragon_tiger", dragon_tiger),
+            ("market.breadth", [market_breadth] if isinstance(market_breadth, dict) and market_breadth else []),
             ("stock.capital_flow", capital_flow),
             ("news.events", news),
         ]
@@ -425,6 +434,9 @@ class DataAgent:
             "daily": daily,
             "market": market,
             "sector_context": sector_context,
+            "limit_up_summary": limit_up_summary if isinstance(limit_up_summary, dict) else {},
+            "dragon_tiger": dragon_tiger if isinstance(dragon_tiger, list) else [],
+            "market_breadth": market_breadth if isinstance(market_breadth, dict) else {},
             "capital_flow": capital_flow,
             "news": news,
             "risk": risk if isinstance(risk, dict) else {},
@@ -465,7 +477,29 @@ class DataAgent:
                 field_name="sector.context",
                 route_trace=route_trace,
                 top_n=request.sector_top_n,
+                trade_date=request.normalized_trade_date(),
             )
+        market_breadth = self._safe_route(
+            "get_market_breadth",
+            manifest,
+            field_name="market.breadth",
+            route_trace=route_trace,
+            trade_date=request.normalized_trade_date(),
+        )
+        limit_up_summary = self._safe_route(
+            "get_limit_up_tiers",
+            manifest,
+            field_name="market.limit_up_summary",
+            route_trace=route_trace,
+            trade_date=request.normalized_trade_date(),
+        )
+        dragon_tiger = self._safe_route(
+            "get_dragon_tiger",
+            manifest,
+            field_name="market.dragon_tiger",
+            route_trace=route_trace,
+            trade_date=request.normalized_trade_date(),
+        )
         capital_flow = []
         if request.include_capital_flow:
             capital_flow = self._safe_route(
@@ -485,7 +519,9 @@ class DataAgent:
                 field_name="news.events",
                 route_trace=route_trace,
                 code=request.ticker,
+                sector=request.sector_keyword,
                 keyword=request.news_keyword,
+                trade_date=request.normalized_trade_date(),
             )
             if request.fetch_news_full_text and isinstance(news, list):
                 news = self._enrich_news_full_text(news)
@@ -498,6 +534,7 @@ class DataAgent:
                 manifest,
                 field_name="risk.st_status",
                 route_trace=route_trace,
+                trade_date=request.normalized_trade_date(),
             )
             suspended = self._safe_route(
                 "get_suspended",
@@ -511,6 +548,7 @@ class DataAgent:
                 manifest,
                 field_name="risk.delisting",
                 route_trace=route_trace,
+                trade_date=request.normalized_trade_date(),
             )
 
         return {
@@ -519,6 +557,9 @@ class DataAgent:
             "daily": daily,
             "market": market,
             "sector_context": sector_context,
+            "limit_up_summary": limit_up_summary if isinstance(limit_up_summary, dict) else {},
+            "dragon_tiger": dragon_tiger if isinstance(dragon_tiger, list) else [],
+            "market_breadth": market_breadth if isinstance(market_breadth, dict) else {},
             "capital_flow": capital_flow,
             "news": news,
             "risk": {
@@ -589,6 +630,9 @@ class DataAgent:
             market_df = DataCleaner.clean_daily(market_raw)
         else:
             market_df = pd.DataFrame()
+        limit_up_summary = raw_payload.get("limit_up_summary")
+        dragon_tiger_raw = raw_payload.get("dragon_tiger")
+        market_breadth = raw_payload.get("market_breadth")
         sector_raw = raw_payload.get("sector_context")
         sector_context = self._clean_sector_context(sector_raw if isinstance(sector_raw, list) else [])
         risk_raw = raw_payload.get("risk", {})
@@ -610,6 +654,12 @@ class DataAgent:
                 "record_count": len(sector_context),
                 "records": sector_context,
             },
+            "limit_up_summary": limit_up_summary if isinstance(limit_up_summary, dict) else {},
+            "dragon_tiger": {
+                "record_count": len(dragon_tiger_raw) if isinstance(dragon_tiger_raw, list) else 0,
+                "records": dragon_tiger_raw if isinstance(dragon_tiger_raw, list) else [],
+            },
+            "market_breadth": market_breadth if isinstance(market_breadth, dict) else {},
             "capital_flow": {
                 "record_count": len(capital_flow),
                 "records": capital_flow,
@@ -631,6 +681,9 @@ class DataAgent:
         daily_records = cleaned_payload.get("daily", {}).get("records", [])
         market_records = cleaned_payload.get("market", {}).get("records", [])
         sector_records = cleaned_payload.get("sector_context", {}).get("records", [])
+        limit_up_summary = cleaned_payload.get("limit_up_summary", {})
+        dragon_tiger_records = cleaned_payload.get("dragon_tiger", {}).get("records", [])
+        market_breadth = cleaned_payload.get("market_breadth", {})
         news_records = cleaned_payload.get("news", {}).get("records", [])
         daily_df = pd.DataFrame(daily_records)
         market_df = pd.DataFrame(market_records)
@@ -665,7 +718,12 @@ class DataAgent:
             factor_df = FactorCalculator.run_all(daily_df.copy())
             factor_records = _records_from_frame(factor_df, limit=request.max_return_records)
 
-        market_summary = self._summarize_market(market_df)
+        market_summary = self._summarize_market(
+            market_df,
+            limit_up_summary=limit_up_summary if isinstance(limit_up_summary, dict) else {},
+            dragon_tiger_records=dragon_tiger_records if isinstance(dragon_tiger_records, list) else [],
+            market_breadth=market_breadth if isinstance(market_breadth, dict) else {},
+        )
         sector_summary = self._summarize_sector_context(sector_records, request)
         data_quality = {
             "daily_consistency": self._build_daily_consistency_report(
@@ -687,6 +745,7 @@ class DataAgent:
             daily_records=daily_records,
             factor_records=factor_records,
             event_records=event_records,
+            dragon_tiger_records=dragon_tiger_records if isinstance(dragon_tiger_records, list) else [],
             data_quality=data_quality,
         )
 
@@ -699,6 +758,10 @@ class DataAgent:
             "capital": capital_summary,
             "risk": risk_summary,
             "data_quality": data_quality,
+            "dragon_tiger": {
+                "record_count": len(dragon_tiger_records),
+                "records": dragon_tiger_records,
+            },
             "events": {
                 "record_count": len(event_records),
                 "records": event_records,
@@ -715,13 +778,29 @@ class DataAgent:
         }
 
     @classmethod
-    def _summarize_market(cls, market_df: pd.DataFrame) -> dict[str, Any]:
+    def _summarize_market(
+        cls,
+        market_df: pd.DataFrame,
+        *,
+        limit_up_summary: dict[str, Any] | None = None,
+        dragon_tiger_records: list[dict[str, Any]] | None = None,
+        market_breadth: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        limit_up_summary = limit_up_summary or {}
+        dragon_tiger_records = dragon_tiger_records or []
+        market_breadth = market_breadth or {}
         if market_df.empty:
             return {
                 "index_close": 0,
                 "index_change_pct": 0,
                 "sentiment": "未知",
                 "sentiment_score": 50,
+                "advance_count": int(market_breadth.get("advance_count", 0) or 0),
+                "decline_count": int(market_breadth.get("decline_count", 0) or 0),
+                "limit_up_count": 0,
+                "limit_down_count": 0,
+                "dragon_tiger_count": len(dragon_tiger_records),
+                "breadth_sample_size": int(market_breadth.get("sample_size", 0) or 0),
             }
         if "trade_date" in market_df.columns:
             market_df["trade_date"] = pd.to_datetime(market_df["trade_date"], errors="coerce")
@@ -746,6 +825,18 @@ class DataAgent:
             "index_change_pct": pct_value,
             "sentiment": sentiment,
             "sentiment_score": score,
+            "advance_count": int(market_breadth.get("advance_count", 0) or 0),
+            "decline_count": int(market_breadth.get("decline_count", 0) or 0),
+            "limit_up_count": int(sum(limit_up_summary.get(key, 0) or 0 for key in ("first_board", "second_board", "third_plus"))),
+            "limit_down_count": 0,
+            "limit_up_breakdown": {
+                "first_board": int(limit_up_summary.get("first_board", 0) or 0),
+                "second_board": int(limit_up_summary.get("second_board", 0) or 0),
+                "third_plus": int(limit_up_summary.get("third_plus", 0) or 0),
+            },
+            "dragon_tiger_count": len(dragon_tiger_records),
+            "breadth_sample_size": int(market_breadth.get("sample_size", 0) or 0),
+            "breadth_coverage_note": str(market_breadth.get("coverage_note", "")),
             "data_source": latest.get("data_source", ""),
         }
 
@@ -820,16 +911,21 @@ class DataAgent:
         daily_records: list[dict[str, Any]],
         factor_records: list[dict[str, Any]],
         event_records: list[dict[str, Any]],
+        dragon_tiger_records: list[dict[str, Any]],
         data_quality: dict[str, Any],
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         tier1 = {
             "market": {
                 "index_close": market_summary.get("index_close", 0),
                 "index_change_pct": market_summary.get("index_change_pct", 0),
-                "advance_count": 0,
-                "decline_count": 0,
-                "limit_up_count": 0,
-                "limit_down_count": 0,
+                "advance_count": market_summary.get("advance_count", 0),
+                "decline_count": market_summary.get("decline_count", 0),
+                "limit_up_count": market_summary.get("limit_up_count", 0),
+                "limit_down_count": market_summary.get("limit_down_count", 0),
+                "limit_up_breakdown": market_summary.get("limit_up_breakdown", {}),
+                "dragon_tiger_count": market_summary.get("dragon_tiger_count", 0),
+                "breadth_sample_size": market_summary.get("breadth_sample_size", 0),
+                "breadth_coverage_note": market_summary.get("breadth_coverage_note", ""),
             },
             "sentiment": {
                 "sentiment": market_summary.get("sentiment", "未知"),
@@ -849,6 +945,8 @@ class DataAgent:
             "factors": factor_records,
             "events": event_records,
             "sector_context": sector_summary,
+            "limit_up_summary": market_summary.get("limit_up_breakdown", {}),
+            "dragon_tiger": dragon_tiger_records if isinstance(dragon_tiger_records, list) else [],
             "backtest_samples": [],
             "data_summary": summary,
             "data_quality": data_quality,
@@ -1312,14 +1410,16 @@ class DataAgent:
                 "content_error": record.get("content_error"),
                 "direction": record.get("direction", "中性"),
                 "confidence": record.get("confidence", 0.5),
-                "transmission_path": "新闻输入",
-                "direct_beneficiaries": [request.ticker],
+                "transmission_path": record.get("transmission_path", "新闻输入"),
+                "direct_beneficiaries": record.get("direct_beneficiaries") or [request.sector_keyword or request.ticker],
                 "evidence_level": "公开新闻",
                 "pricing_status": "未定价",
-                "chain_quality": "weak",
+                "chain_quality": record.get("chain_quality", "weak"),
                 "event_time": record.get("event_time"),
                 "source": record.get("source", ""),
                 "url": record.get("url"),
+                "news_scope": record.get("news_scope", "ticker"),
+                "sector_name": record.get("sector_name"),
                 "raw": record.get("raw", {}),
             })
         return events
@@ -1466,9 +1566,11 @@ class DataAgent:
             "ticker": request.ticker,
             "trade_date": request.normalized_trade_date(),
             "news_keyword": request.news_keyword,
+            "sector_keyword": request.sector_keyword,
             "task": (
                 "Select news relevant to this ticker, its company, its business, or its sector for downstream trading agents. "
-                "If title or summary directly contains the ticker keyword, company name, or clearly describes this company, keep it unless it is obviously unrelated. "
+                "If sector_keyword is present, sector-level news is valid even when it does not mention the ticker directly. "
+                "If title or summary directly contains the ticker keyword, company name, sector keyword, or clearly describes this company or its board, keep it unless it is obviously unrelated. "
                 "Return one decision for every candidate in the same event_id space. "
                 "Return only JSON with key decisions: list of objects containing event_id, keep, "
                 "relevance from 0 to 1, direction in 正面/负面/中性, confidence from 0 to 1, and reason."
@@ -1503,11 +1605,16 @@ class DataAgent:
         news_records: list[dict[str, Any]],
         request: DataAgentRequest,
     ) -> list[dict[str, Any]]:
-        keyword = (request.news_keyword or "").lower()
+        keywords = [
+            str(request.sector_keyword or "").lower(),
+            str(request.news_keyword or "").lower(),
+            str(request.ticker or "").lower(),
+        ]
+        keywords = [keyword for keyword in keywords if keyword]
         selected = []
         for record in news_records:
             haystack = json.dumps(record, ensure_ascii=False).lower()
-            if not keyword or keyword in haystack:
+            if not keywords or any(keyword in haystack for keyword in keywords):
                 selected.append({
                     **record,
                     "llm_relevance": 0.5,

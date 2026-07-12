@@ -1,5 +1,6 @@
 """供应商路由测试 — 测试免费数据源错误处理和降级链."""
 import pytest
+from advanced_trading_agent.config import config
 from advanced_trading_agent.data_agent.vendor_router import (
     DataVendor,
     VendorRateLimitError,
@@ -16,12 +17,24 @@ from advanced_trading_agent.data_agent.vendor_router import (
 from advanced_trading_agent.data_agent import vendor_router
 
 
+DEFAULT_DATA_VENDORS = {
+    "market_data": "local_cache,mootdx,baostock",
+    "fundamental_data": "local_cache,baostock",
+    "news_data": "local_cache,sina,cls",
+    "capital_flow": "local_cache",
+    "a_share_specific": "local_cache,efinance,eastmoney",
+    "analysis": "baostock",
+    "risk_data": "local_cache,baostock",
+}
+
+
 class TestVendorChain:
     """供应商降级链测试"""
 
     def setup_method(self):
         _VENDOR_IMPLEMENTATIONS.clear()
         vendor_router._DEFAULT_VENDOR_REGISTRATION_ATTEMPTED = False
+        config.update({"data_vendors": DEFAULT_DATA_VENDORS.copy()})
 
     def test_simple_success(self):
         def impl(code):
@@ -92,14 +105,13 @@ class TestVendorChain:
         register_vendor_impl("get_daily", "akshare", a)
         register_vendor_impl("get_daily", "baostock", b)
         register_vendor_impl("get_daily", "baostock_backup", c)
-        original = get_vendor_chain("get_daily")
-        from advanced_trading_agent.config import config
+        original = config.get("data_vendors").copy()
         config.update({"data_vendors": {"market_data": "akshare,baostock,baostock_backup"}})
         try:
             result = route_to_vendor("get_daily", code="x")
             assert result == {"ok": True}
         finally:
-            config.update({"data_vendors": {"market_data": ",".join(original)}})
+            config.update({"data_vendors": original})
 
     def test_route_trace_records_attempts(self):
         trace = []
@@ -112,8 +124,13 @@ class TestVendorChain:
 
         register_vendor_impl("get_daily", "akshare", a)
         register_vendor_impl("get_daily", "baostock", b)
+        original = config.get("data_vendors").copy()
+        config.update({"data_vendors": {"market_data": "akshare,baostock"}})
 
-        result = route_to_vendor("get_daily", code="000001.SZ", _route_trace=trace)
+        try:
+            result = route_to_vendor("get_daily", code="000001.SZ", _route_trace=trace)
+        finally:
+            config.update({"data_vendors": original})
 
         assert result == [{"code": "000001.SZ"}]
         assert trace[0]["vendor"] == "akshare"
@@ -125,7 +142,7 @@ class TestVendorChain:
     def test_fallback_order_across_vendors(self):
         """使用已知的 get_daily 方法测试降级顺序"""
         chain = get_vendor_chain("get_daily")
-        assert chain == ["akshare", "baostock"]
+        assert chain[:3] == ["local_cache", "mootdx", "baostock"]
         # 注册 mock 到链中的第一个供应商
         first_vendor = chain[0]
         def mock_impl(code):
@@ -135,7 +152,7 @@ class TestVendorChain:
         assert result == {"mock": "data"}
 
     def test_configured_chains_are_free_only(self):
-        free_vendors = {"akshare", "baostock", "eastmoney", "sina"}
+        free_vendors = {"local_cache", "mootdx", "baostock", "eastmoney", "efinance", "sina", "cls"}
         for method in [
             "get_daily",
             "get_capital_flow",
@@ -151,8 +168,8 @@ class TestVendorChain:
             assert set(chain) <= free_vendors
 
     def test_news_and_sector_have_free_fallbacks(self):
-        assert get_vendor_chain("get_news") == ["akshare", "sina"]
-        assert get_vendor_chain("get_sector") == ["akshare", "eastmoney"]
+        assert get_vendor_chain("get_news") == ["local_cache", "sina", "cls"]
+        assert get_vendor_chain("get_sector") == ["local_cache", "efinance", "eastmoney"]
 
     def test_default_vendor_registration_covers_tool_methods(self):
         ensure_default_vendor_registration()
@@ -167,12 +184,10 @@ class TestVendorChain:
             "get_suspended",
             "get_delisting",
             "get_northbound_flow",
+            "get_northbound_top10",
             "get_limit_up_tiers",
             "get_dragon_tiger",
-            "get_margin",
             "get_factors",
-            "check_crowding",
-            "find_similar",
         ]:
             registered = set(_VENDOR_IMPLEMENTATIONS.get(method, {}))
             expected = set(get_vendor_chain(method))

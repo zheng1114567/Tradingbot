@@ -39,7 +39,7 @@ from ..agents import (
     create_memory_agent,
     create_report_agent,
 )
-from ..agents.contract import basic_self_check, build_agent_update
+from ..agents.contract import basic_self_check, build_agent_update, build_node_audit_update
 from ..agents.schemas import BacktestReport, Confidence
 from ..agents.system_agent import create_system_agent
 from ..config import config
@@ -51,7 +51,6 @@ from .conditional import (
     after_risk_check_1,
     after_risk_check_3,
     after_round1,
-    after_round2_turn,
 )
 from .risk_nodes import create_risk_check_1, create_risk_check_2, create_risk_check_3
 from .state import AgentState
@@ -147,7 +146,7 @@ def create_workflow() -> StateGraph:
     workflow.add_node("Skip Backtest", skip_backtest_node)
     workflow.add_node("Risk Check 2", risk2_node)
     workflow.add_node("Round 2 Judge", sa_round2_judge)
-    workflow.add_node("Round 2 Debate", _create_round2_node(llm))
+    workflow.add_node("Round 2 Debate", _create_round2_subgraph(llm))
     workflow.add_node("Risk Check 3", risk3_node)
     workflow.add_node("System Final Decision", sa_final)
     workflow.add_node("Approval Agent", approval_node)
@@ -191,19 +190,13 @@ def create_workflow() -> StateGraph:
     # 硬风控2 → Round 2 Judge
     workflow.add_edge("Risk Check 2", "Round 2 Judge")
 
-    # Round 2 Judge: 判断是否进辩论
+    # Round 2 Judge -> Round 2 subgraph -> Risk Check 3
     workflow.add_conditional_edges(
         "Round 2 Judge",
         after_round1,
         {"round2": "Round 2 Debate", "finalize": "Risk Check 3"},
     )
-
-    # Round 2 辩论: 每轮结束后判断是否继续
-    workflow.add_conditional_edges(
-        "Round 2 Debate",
-        after_round2_turn,
-        {"continue_round2": "Round 2 Debate", "finalize": "Risk Check 3"},
-    )
+    workflow.add_edge("Round 2 Debate", "Risk Check 3")
 
     # 硬风控3: HARD_VETO → 直接生成报告, PASS → 进入裁定
     workflow.add_conditional_edges(
@@ -220,62 +213,23 @@ def create_workflow() -> StateGraph:
     return workflow.compile()
 
 
-def _create_round2_node(llm: LLMClient):
-    """创建 Round 2 圆桌质询节点
+def _create_round2_subgraph(llm: LLMClient) -> StateGraph:
+    """Round 2 辩论子图 — 内部管理多轮辩论循环
 
-    一轮圆桌:
-    1. System Agent 针对矛盾点提出问题
-    2. 选择相关 Agent 发言
-    3. 用各 Agent 的既有报告形成回答
-    4. 写回问题、回答和圆桌总结
+    strict_autogen 模式:
+    - Round 2 只允许 AutoGen 执行
+    - AutoGen 失败时不再回退到 DebateEngine
+    - 失败信息写入 round2_state, 由上游显式暴露
     """
-    def _targets_for(contradiction: str) -> list[str]:
-        targets = []
-        lowered = contradiction.lower()
-        if "market" in lowered:
-            targets.append("Market")
-        if "event" in lowered:
-            targets.append("Event")
-        if "analysis" in lowered:
-            targets.append("Analysis")
-        if "backtest" in lowered:
-            targets.append("Backtest")
-        return targets or ["Market", "Event", "Analysis", "Backtest"]
 
-    harness = RoundtableHarness()
-
-    def _fallback_answer(target: str, contradiction: str, report: str, evidence: str) -> str:
-        report_excerpt = report.replace("\n", " ")[:180]
-        evidence_excerpt = evidence.replace("\n", " ")[:360]
-        return (
-            f"{target} 回答: 基于 AgentContext 和当前报告，针对矛盾“{contradiction}”，"
-            f"可引用数据证据为：{evidence_excerpt}；报告依据为：{report_excerpt}。"
-            "若上述证据不足以消除矛盾，应进入最终裁定的反对意见。"
-        )
-
-    def _build_summary(questions: list[dict[str, Any]]) -> str:
-        if not questions:
-            return ""
-        lines = ["Round 2 圆桌会议总结:"]
-        for idx, item in enumerate(questions, start=1):
-            lines.append(f"{idx}. 矛盾: {item.get('data_source', '')}")
-            lines.append(f"   质询: {item.get('question', '')}")
-            for answer in item.get("answers", []):
-                lines.append(
-                    f"   - {answer.get('target_agent', 'Agent')}: "
-                    f"{answer.get('answer', '')}"
-                )
-        lines.append("结论: 未消除的分歧必须进入最终裁定和风控理由。")
-        return "\n".join(lines)
-
-    def round2_node(state: AgentState) -> dict[str, Any]:
+    def debate_turn(state: AgentState) -> dict[str, Any]:
+        """执行一轮辩论"""
         round2 = state.get("round2_state", {})
         count = round2.get("round_count", 0)
-        contradictions = round2.get("contradictions", [])
         max_rounds = round2.get("max_rounds", 8)
 
-        # 当前轮质询
-        if count >= max_rounds or not contradictions:
+        contradictions_raw = round2.get("contradiction_records", [])
+        if not contradictions_raw:
             return {
                 "round2_state": {
                     **round2,
@@ -284,126 +238,100 @@ def _create_round2_node(llm: LLMClient):
                 },
             }
 
+        autogen_roundtable = AutoGenRoundtable(harness=RoundtableHarness())
         try:
-            result = AutoGenRoundtable().run(state)
-            if result.summary:
-                return {
-                    "round2_state": {
-                        **round2,
-                        "round_count": max_rounds,
-                        "questions": result.questions,
-                        "current_speaker": "AutoGenRoundtable",
-                        "completed": True,
-                        "summary": result.summary,
-                        "unresolved_conflicts": result.unresolved_conflicts,
-                        "final_pressure": result.final_pressure,
-                        "provider": result.provider,
-                        "fallback_reason": result.fallback_reason,
-                    },
-                    "round2_summary": result.summary,
-                }
-        except Exception as e:
-            fallback_reason = f"{type(e).__name__}: {e}"
-            logger.warning(
-                "AutoGen roundtable failed, falling back to deterministic roundtable: %s",
-                e,
+            autogen_result = autogen_roundtable.run(state)
+            result = {
+                "round_count": autogen_result.round_count or max(count, 1),
+                "completed": True,
+                "current_speaker": "System_Moderator",
+                "summary": autogen_result.summary,
+                "questions": autogen_result.questions,
+                "final_pressure": autogen_result.final_pressure,
+                "unresolved_conflicts": autogen_result.unresolved_conflicts,
+                "provider": autogen_result.provider,
+                "fallback_reason": autogen_result.fallback_reason,
+                "contradiction_records": contradictions_raw,
+                "evidence_board": autogen_result.evidence_board,
+                "round_history": autogen_result.round_history,
+                "moderator_output": autogen_result.moderator_output,
+            }
+            tool_calls = [
+                {"agent": agent_name, **call}
+                for agent_name, calls in autogen_result.tool_calls_by_agent.items()
+                for call in calls
+            ]
+            evidence = [
+                "provider=autogen",
+                f"contradictions={len(contradictions_raw)}",
+                f"round_count={result['round_count']}",
+                f"tool_events={len(tool_calls)}",
+            ]
+            return build_node_audit_update(
+                sender="Round 2 Debate",
+                round2_state={**round2, **result},
+                evidence=evidence,
+                tool_calls=tool_calls,
+                self_check=basic_self_check(
+                    evidence=evidence,
+                    passed_rules=["autogen_roundtable_executed", "roundtable_tools_whitelisted"],
+                    warnings=[],
+                    confidence=autogen_result.final_pressure,
+                ),
             )
-        else:
-            fallback_reason = "AutoGen returned empty summary"
-
-        # 提出质询 (LLM 生成问题, 失败则确定性降级)
-        contradiction = contradictions[count % len(contradictions)] if contradictions else ""
-        context = harness.build_context(state, contradictions)
-
-        prompt = f"""Round 2 交叉质询 - 第 {count + 1} 轮
-
-发现的矛盾:
-{contradiction}
-
-DATA_AGENT_BRIEF:
-{context.shared_evidence_text[:1200]}
-
-请针对上述矛盾提出一个精准的质询问题。
-质询必须基于 DataAgent 数据矛盾和各 Agent 可见证据, 不能是泛泛的问题。"""
-
-        try:
-            response = llm.chat([
-                ("system", "你是在 Round 2 交叉质询中提出问题的 System Agent。"),
-                ("human", prompt),
-            ])
-            question = response if isinstance(response, str) else str(response)
-        except Exception:
-            question = f"关于矛盾 '{contradiction[:50]}', 请相关 Agent 提供更多数据支撑。"
-
-        questions = list(round2.get("questions", []))
-        answers = []
-        for target in _targets_for(contradiction):
-            agent_context = context.agent_contexts[target]
-            answer_prompt = f"""Round 2 圆桌会议 - {target} Agent 发言
-
-矛盾:
-{contradiction}
-
-System 质询:
-{question}
-
-AgentContext:
-{agent_context.evidence_text[:1200]}
-
-{target} Agent 当前报告:
-{agent_context.report[:1200]}
-
-请只基于该 AgentContext、DATA_AGENT_BRIEF 和该 Agent 报告回答:
-1. 是否坚持原判断
-2. 支撑证据，必须点名引用 DataAgent 字段或报告片段
-3. 对最终裁定的影响
-回答要简洁。"""
-            try:
-                response = llm.chat([
-                    ("system", agent_context.system_message),
-                    ("human", answer_prompt),
-                ])
-                answer = response if isinstance(response, str) else str(response)
-            except Exception:
-                answer = _fallback_answer(
-                    target,
-                    contradiction,
-                    agent_context.report,
-                    agent_context.evidence_text,
-                )
-            answers.append({
-                "target_agent": target,
-                "answer": answer,
-                "evidence": agent_context.evidence_text[:800],
-            })
-
-        questions.append({
-            "source_agent": "System",
-            "target_agent": ",".join(a["target_agent"] for a in answers),
-            "question": question,
-            "answer": "\n".join(f"{a['target_agent']}: {a['answer']}" for a in answers),
-            "answers": answers,
-            "data_source": contradiction,
-        })
-        summary = _build_summary(questions)
-
-        return {
-            "round2_state": {
-                **round2,
+        except Exception as e:
+            logger.error("AutoGen roundtable failed in strict_autogen mode, round %d: %s", count, e)
+            result = {
                 "round_count": count + 1,
-                "questions": questions,
-                "current_speaker": "System",
-                "completed": count + 1 >= max_rounds,
-                "summary": summary,
-                "provider": "deterministic",
-                "fallback_reason": fallback_reason,
+                "completed": True,
+                "current_speaker": "",
+                "summary": f"Round {count + 1} AutoGen 圆桌失败: {e}",
                 "final_pressure": "neutral",
-                "unresolved_conflicts": contradictions,
-            },
-            "round2_summary": summary,
-        }
+                "unresolved_conflicts": [
+                    c.get("description", str(c))
+                    for c in contradictions_raw
+                ],
+                "provider": "autogen",
+                "fallback_reason": f"strict_autogen_failed: {type(e).__name__}: {e}",
+                "contradiction_records": contradictions_raw,
+                "evidence_board": round2.get("evidence_board", []),
+                "round_history": round2.get("round_history", []),
+                "moderator_output": None,
+            }
+            evidence = [
+                "provider=autogen",
+                "mode=strict_autogen",
+                f"autogen_failed={type(e).__name__}",
+                f"contradictions={len(contradictions_raw)}",
+            ]
+            return build_node_audit_update(
+                sender="Round 2 Debate",
+                round2_state={**round2, **result},
+                evidence=evidence,
+                tool_calls=[],
+                self_check=basic_self_check(
+                    evidence=evidence,
+                    passed_rules=["strict_autogen_enforced"],
+                    warnings=[f"AutoGen roundtable failed: {e}"],
+                    confidence="neutral",
+                ),
+            )
 
-    return round2_node
+    def after_turn(state: AgentState) -> str:
+        round2 = state.get("round2_state", {})
+        if round2.get("completed") or round2.get("round_count", 0) >= round2.get("max_rounds", 8):
+            return "finalize"
+        return "continue"
+
+    builder = StateGraph(AgentState)
+    builder.add_node("debate_turn", debate_turn)
+    builder.add_edge(START, "debate_turn")
+    builder.add_conditional_edges(
+        "debate_turn",
+        after_turn,
+        {"continue": "debate_turn", "finalize": END},
+    )
+    return builder.compile()
 
 
 class TradingSystem:
@@ -508,8 +436,8 @@ class TradingSystem:
                 "active": False,
                 "round_count": 0,
                 "max_rounds": 8,
-                "questions": [],
-                "contradictions": [],
+                
+                
                 "current_speaker": "",
                 "completed": False,
                 "summary": "",
@@ -517,6 +445,10 @@ class TradingSystem:
                 "fallback_reason": "",
                 "final_pressure": "neutral",
                 "unresolved_conflicts": [],
+                "contradiction_records": [],
+                "evidence_board": [],
+                "round_history": [],
+                "moderator_output": None,
             },
             "round2_summary": "",
             "system_decision_obj": None,

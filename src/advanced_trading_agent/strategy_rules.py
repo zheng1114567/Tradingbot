@@ -80,7 +80,7 @@ def strategy_audit_queue_path(path: str | None = None) -> Path:
     if configured:
         target = Path(configured).expanduser()
     else:
-        target = Path(config.get("results_dir", "data/results")) / "strategy_audit_queue.jsonl"
+        target = Path(config.get("results_dir")) / "strategy_audit_queue.jsonl"
     target.parent.mkdir(parents=True, exist_ok=True)
     return target
 

@@ -27,6 +27,8 @@ class FactorCalculator:
             return df
         if "net_profit" in df.columns and "equity" in df.columns:
             df["roe"] = df["net_profit"] / df["equity"].replace(0, np.nan)
+        else:
+            logger.warning("Factor 'roe' skipped: OHLCV-only data has no net_profit/equity fields")
         return df
 
     @staticmethod
@@ -36,6 +38,8 @@ class FactorCalculator:
             return df
         if "revenue" in df.columns and "cost" in df.columns:
             df["gross_margin"] = (df["revenue"] - df["cost"]) / df["revenue"].replace(0, np.nan)
+        else:
+            logger.warning("Factor 'gross_margin' skipped: OHLCV-only data has no revenue/cost fields")
         return df
 
     # ============================================================
@@ -47,6 +51,8 @@ class FactorCalculator:
         """营收增速 (同比)"""
         if "revenue" in df.columns and len(df) > periods:
             df["revenue_growth"] = df["revenue"].pct_change(periods=periods)
+        else:
+            logger.warning("Factor 'revenue_growth' skipped: missing 'revenue' column or insufficient rows")
         return df
 
     @staticmethod
@@ -54,6 +60,8 @@ class FactorCalculator:
         """利润增速 (同比)"""
         if "net_profit" in df.columns and len(df) > periods:
             df["profit_growth"] = df["net_profit"].pct_change(periods=periods)
+        else:
+            logger.warning("Factor 'profit_growth' skipped: missing 'net_profit' column or insufficient rows")
         return df
 
     # ============================================================
@@ -65,6 +73,8 @@ class FactorCalculator:
         """PE 历史分位数"""
         if "pe" in df.columns and len(df) > 20:
             df["pe_quantile"] = df["pe"].rank(pct=True)
+        else:
+            logger.warning("Factor 'pe_quantile' skipped: missing 'pe' column or fewer than 20 rows")
         return df
 
     @staticmethod
@@ -72,6 +82,8 @@ class FactorCalculator:
         """PB 历史分位数"""
         if "pb" in df.columns and len(df) > 20:
             df["pb_quantile"] = df["pb"].rank(pct=True)
+        else:
+            logger.warning("Factor 'pb_quantile' skipped: missing 'pb' column or fewer than 20 rows")
         return df
 
     # ============================================================
@@ -139,6 +151,8 @@ class FactorCalculator:
             df["turnover"] = df["turnover_rate"] / 100
         elif "volume" in df.columns and "float_shares" in df.columns:
             df["turnover"] = df["volume"] / df["float_shares"].replace(0, np.nan)
+        else:
+            logger.warning("Factor 'turnover_rate' skipped: missing turnover_rate/turnover/float_shares columns")
         return df
 
     @staticmethod
@@ -182,18 +196,26 @@ class FactorCalculator:
                 "ma_trend": 0.15,
             }
         score = pd.Series(0.0, index=df.index)
+        used_factors: list[str] = []
+        skipped_factors: list[str] = []
         for factor, weight in weights.items():
             if factor not in df.columns:
+                skipped_factors.append(factor)
                 continue
             valid = df[factor].notna() & (~np.isinf(df[factor].replace([np.inf, -np.inf], np.nan)))
             if valid.sum() < 10:
+                skipped_factors.append(f"{factor}(<10 valid)")
                 continue
             std = df.loc[valid, factor].std()
             if pd.isna(std) or std == 0:
+                skipped_factors.append(f"{factor}(zero std)")
                 continue
             z = (df[factor] - df.loc[valid, factor].mean()) / std
             score += z.fillna(0) * weight
+            used_factors.append(factor)
         df["composite_score"] = score
+        if skipped_factors:
+            logger.info("Composite score skipped factors: %s; used: %s", skipped_factors, used_factors or ["none"])
         return df
 
     @staticmethod

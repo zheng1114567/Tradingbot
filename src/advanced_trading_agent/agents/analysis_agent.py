@@ -7,16 +7,23 @@ Analysis Agent 读取预计算因子, 做解释、排序、识别风险。
 LLM 职责: 解释因子、识别异常、给出择时建议
 非 LLM 职责: factor 计算 (DataService)、排序 (工具函数)
 """
+
 from __future__ import annotations
 
 import logging
 from typing import Any
 
 from ..llm.client import LLMClient
-from ..tool_nodes.analysis_tools import AnalysisTools, check_crowding, get_factors, rank_stocks
-from .contract import basic_self_check, build_agent_update
-from .react_runner import run_prebuilt_react
+from ..tool_nodes.analysis_tools import AnalysisTools
+from ..tool_nodes.registry import get_agent_tools
+from .contract import (
+    basic_self_check,
+    build_agent_update,
+    build_react_agent,
+    run_react_agent,
+)
 from .schemas import AnalysisReport, StockRanking
+from .specs import get_agent_skill
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +41,13 @@ def _normalize_score(value: Any, default: float = 5.0) -> float:
 
 def create_analysis_agent(llm: LLMClient, tools: AnalysisTools | None = None):
     """创建 Analysis Agent 节点函数"""
+    skill = get_agent_skill("analysis")
+    react_agent = build_react_agent(
+        llm=llm,
+        tools=get_agent_tools("analysis"),
+        system_prompt=skill.react_prompt,
+        response_format=AnalysisReport,
+    )
 
     def analysis_node(state: dict[str, Any]) -> dict[str, Any]:
         ticker = state.get("company_of_interest", "")
@@ -45,11 +59,13 @@ def create_analysis_agent(llm: LLMClient, tools: AnalysisTools | None = None):
         factors = analysis_tools.get_factor_data(code=ticker, top_n=20)
         if not factors:
             factors = factors_raw
-        tool_calls = [{
-            "tool": "get_factor_data",
-            "args": {"code": ticker, "top_n": 20},
-            "records": len(factors or []),
-        }]
+        tool_calls = [
+            {
+                "tool": "get_factor_data",
+                "args": {"code": ticker, "top_n": 20},
+                "records": len(factors or []),
+            }
+        ]
 
         # 确定性排序 (不用 LLM)
         sorted_factors = sorted(
@@ -71,18 +87,20 @@ def create_analysis_agent(llm: LLMClient, tools: AnalysisTools | None = None):
             if valuation_score and valuation_score > 8:
                 warnings.append("估值偏高")
 
-            rankings.append(StockRanking(
-                code=f.get("code", ""),
-                name=f.get("name", ""),
-                composite_score=_normalize_score(f.get("composite_score")),
-                main_driver=f"质量:{f.get('quality_score', 'N/A')} "
-                            f"成长:{f.get('growth_score', 'N/A')}",
-                warnings=warnings,
-            ))
+            rankings.append(
+                StockRanking(
+                    code=f.get("code", ""),
+                    name=f.get("name", ""),
+                    composite_score=_normalize_score(f.get("composite_score")),
+                    main_driver=f"质量:{f.get('quality_score', 'N/A')} "
+                    f"成长:{f.get('growth_score', 'N/A')}",
+                    warnings=warnings,
+                )
+            )
 
         # LLM 分析因子模式
         factor_details = "\n".join(
-            f"{r.name}({r.code}): {r.composite_score:.1f}分 {'⚠'+'|'.join(r.warnings) if r.warnings else ''}"
+            f"{r.name}({r.code}): {r.composite_score:.1f}分 {'⚠' + '|'.join(r.warnings) if r.warnings else ''}"
             for r in rankings[:5]
         )
 
@@ -102,17 +120,7 @@ def create_analysis_agent(llm: LLMClient, tools: AnalysisTools | None = None):
 
 输出结构化分析报告。"""
 
-        react_prompt = (
-            "你是 A 股因子分析师。必须先用工具检查因子、排序和拥挤度，"
-            "再输出结构化因子分析；个股排序最终必须以确定性排序结果为准。"
-        )
-        report, react_trace = run_prebuilt_react(
-            llm=llm,
-            tools=[get_factors, rank_stocks, check_crowding],
-            prompt=react_prompt,
-            user_content=prompt,
-            response_format=AnalysisReport,
-        )
+        report, react_trace = run_react_agent(react_agent, prompt)
         if react_trace:
             tool_calls.extend(react_trace)
 
@@ -120,7 +128,7 @@ def create_analysis_agent(llm: LLMClient, tools: AnalysisTools | None = None):
             if report is None:
                 report = llm.chat(
                     messages=[
-                        ("system", "你是 A 股因子分析师。基于因子数据分析, 不凭感觉。"),
+                        ("system", skill.fallback_system_prompt),
                         ("human", prompt),
                     ],
                     response_format=AnalysisReport,
@@ -131,9 +139,9 @@ def create_analysis_agent(llm: LLMClient, tools: AnalysisTools | None = None):
         except Exception as e:
             logger.warning("LLM analysis failed, using deterministic: %s", e)
             report = AnalysisReport(
-                sector_score=sum(
-                    r.composite_score for r in rankings
-                ) / len(rankings) if rankings else None,
+                sector_score=sum(r.composite_score for r in rankings) / len(rankings)
+                if rankings
+                else None,
                 stock_rankings=rankings,
                 factor_explanation="基于因子数据的确定性排序 (LLM不可用)",
                 factor_warnings=[],
@@ -157,7 +165,9 @@ def create_analysis_agent(llm: LLMClient, tools: AnalysisTools | None = None):
             state,
             sender="Analysis Agent",
             report_key="analysis_report",
-            report=report.to_markdown() if hasattr(report, "to_markdown") else str(report),
+            report=report.to_markdown()
+            if hasattr(report, "to_markdown")
+            else str(report),
             report_obj_key="analysis_report_obj",
             report_obj=report,
             evidence=evidence,

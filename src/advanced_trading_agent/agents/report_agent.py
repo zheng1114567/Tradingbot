@@ -76,7 +76,7 @@ def _build_audit_trace(
 
 def _round2_markdown(state: dict[str, Any]) -> str:
     round2 = state.get("round2_state", {}) or {}
-    if not round2.get("contradictions") and not state.get("round2_summary"):
+    if not round2.get("contradiction_records") and not state.get("round2_summary"):
         return ""
     return format_roundtable_visualization(round2)
 
@@ -187,7 +187,7 @@ def create_report_agent(llm=None):
         md = "\n\n---\n\n".join(s for s in sections if s)
 
         # 保存文件 (atomic writes)
-        results_dir = Path(config.get("results_dir", "data/results"))
+        results_dir = Path(config.get("results_dir"))
         safe_ticker = _safe_path_part(ticker.replace(".", "_"), "unknown_ticker")
         safe_trade_date = _safe_path_part(trade_date, "unknown_date")
         save_dir = results_dir / safe_ticker

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import date, timedelta
@@ -18,10 +19,16 @@ from typing import Any
 import pandas as pd
 
 from ..config import config
+from ..core.atomic_write import atomic_write_text
 
 logger = logging.getLogger(__name__)
 
-_CACHE_DIR = Path(config.get("results_dir", "data/results")) / "local_cache"
+_CACHE_DIR = Path(config.get("results_dir")) / "local_cache"
+_SAFE_PATH_PART = re.compile(r"[^A-Za-z0-9_.\-\u4e00-\u9fff]+")
+
+
+def _workspace_cache_dir() -> Path:
+    return Path(config.get("project_dir", ".")) / "local_cache"
 
 
 @dataclass
@@ -29,10 +36,14 @@ class LocalCache:
     """Local data cache independent of eastmoney push2 endpoints."""
 
     days_back: int = 30
-    cache_dir: Path = _CACHE_DIR
+    cache_dir: Path = field(default_factory=lambda: _CACHE_DIR)
 
     def __post_init__(self) -> None:
-        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            self.cache_dir.mkdir(parents=True, exist_ok=True)
+        except PermissionError:
+            self.cache_dir = _workspace_cache_dir()
+            self.cache_dir.mkdir(parents=True, exist_ok=True)
 
     # ------------------------------------------------------------------
     # Public API
@@ -54,7 +65,7 @@ class LocalCache:
 
         logger.info("Building sector cache for %s from baostock...", td)
         data = self._build_sector_cache(td)
-        cache_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), "utf-8")
+        atomic_write_text(cache_path, json.dumps(data, ensure_ascii=False, indent=2))
         return data
 
     def ensure_daily_data(
@@ -85,13 +96,13 @@ class LocalCache:
         # 1. Industry index (stock → industry mapping)
         industry_map = self._fetch_industry_map()
         ind_path = self.cache_dir / "industry_map.json"
-        ind_path.write_text(json.dumps(industry_map, ensure_ascii=False), "utf-8")
+        atomic_write_text(ind_path, json.dumps(industry_map, ensure_ascii=False))
         logger.info("Industry map: %d stocks → %d industries cached", len(industry_map), len(set(industry_map.values())))
 
         # 2. Build sector ranking from recent daily data
         sector_data = self._build_sector_cache(td)
         sec_path = self.cache_dir / f"sector_cache_{td}.json"
-        sec_path.write_text(json.dumps(sector_data, ensure_ascii=False, indent=2), "utf-8")
+        atomic_write_text(sec_path, json.dumps(sector_data, ensure_ascii=False, indent=2))
         logger.info("Sector cache: %d sectors ranked", len(sector_data.get("sectors", [])))
 
         # 3. Compute and cache daily data for top stocks
@@ -304,7 +315,10 @@ def get_cached_sector_data(trade_date: str | None = None, top_n: int = 10) -> li
     return sectors[:top_n]
 
 
-def get_cached_sector_constituents(sector_name: str) -> list[dict[str, Any]]:
+def get_cached_sector_constituents(
+    sector_name: str,
+    trade_date: str | None = None,
+) -> list[dict[str, Any]]:
     """Convenience: get constituents for a sector from local cache.
 
     Reads from board_index.json created by build_cache.py.
@@ -324,7 +338,7 @@ def get_cached_sector_constituents(sector_name: str) -> list[dict[str, Any]]:
                 return stocks
 
     # Fall back to baostock-computed cache
-    data = cache.ensure_sector_data()
+    data = cache.ensure_sector_data(trade_date)
     constituents = data.get("constituents", {})
     return constituents.get(sector_name, [])
 
@@ -338,8 +352,113 @@ def get_cached_daily(ticker: str, start_date: str | None = None,
         df = pd.read_parquet(cache_path)
         if "trade_date" in df.columns:
             df["trade_date"] = pd.to_datetime(df["trade_date"])
+        if start_date or end_date:
+            date_col = _daily_date_column(df)
+            if date_col:
+                df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
+                date_values = df[date_col].dt.date
+                if start_date:
+                    start = pd.to_datetime(_normalize_date(start_date)).date()
+                    df = df[date_values >= start]
+                    date_values = df[date_col].dt.date
+                if end_date:
+                    end = pd.to_datetime(_normalize_date(end_date)).date()
+                    df = df[date_values <= end]
         return df.to_dict("records")
     return cache.ensure_daily_data(ticker, start_date, end_date)
+
+
+def get_cached_market_breadth(trade_date: str | None = None) -> dict[str, Any]:
+    """Compute a market-breadth proxy from cached daily parquet files."""
+    td = trade_date or date.today().isoformat()
+    cache = LocalCache()
+    daily_dir = cache.cache_dir / "daily"
+    if not daily_dir.exists():
+        return {}
+
+    advance_count = 0
+    decline_count = 0
+    flat_count = 0
+    sample_size = 0
+    matched_rows = 0
+    target = pd.to_datetime(td).date()
+
+    for path in daily_dir.glob("*.parquet"):
+        try:
+            df = pd.read_parquet(path)
+        except Exception:
+            continue
+        if df.empty:
+            continue
+        date_col = None
+        for candidate in ("trade_date", "datetime", "date"):
+            if candidate in df.columns:
+                date_col = candidate
+                break
+        if date_col is None:
+            continue
+        df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
+        df = df.sort_values(date_col)
+        matched = df[df[date_col].dt.date == target]
+        if matched.empty:
+            continue
+        row = matched.iloc[-1]
+        row_position = int(matched.index[-1])
+        pct = None
+        for candidate in ("pct_chg", "pctChg", "change_pct"):
+            if candidate in row.index:
+                try:
+                    pct = float(row[candidate])
+                    break
+                except (TypeError, ValueError):
+                    pct = None
+        if pct is None and "close" in df.columns:
+            close_series = pd.to_numeric(df["close"], errors="coerce")
+            pre_close = None
+            for candidate in ("preclose", "pre_close"):
+                if candidate in df.columns:
+                    pre_close_series = pd.to_numeric(df[candidate], errors="coerce")
+                    try:
+                        pre_close = float(pre_close_series.loc[row_position])
+                    except (KeyError, TypeError, ValueError):
+                        pre_close = None
+                    break
+            if pre_close is None:
+                positions = list(df.index)
+                ordinal = positions.index(row_position) if row_position in positions else -1
+                if ordinal > 0:
+                    try:
+                        pre_close = float(close_series.loc[positions[ordinal - 1]])
+                    except (KeyError, TypeError, ValueError):
+                        pre_close = None
+            try:
+                last_close = float(close_series.loc[row_position])
+                if pre_close:
+                    pct = (last_close / pre_close - 1.0) * 100
+            except (KeyError, TypeError, ValueError, ZeroDivisionError):
+                pct = None
+        if pct is None:
+            continue
+        matched_rows += 1
+        if pct > 0:
+            advance_count += 1
+        elif pct < 0:
+            decline_count += 1
+        else:
+            flat_count += 1
+        sample_size += 1
+
+    if sample_size == 0:
+        return {}
+    return {
+        "trade_date": td,
+        "advance_count": advance_count,
+        "decline_count": decline_count,
+        "flat_count": flat_count,
+        "sample_size": sample_size,
+        "coverage_note": "proxy_from_cached_daily_universe",
+        "matched_rows": matched_rows,
+    }
 
 
 def get_cached_dragon_tiger(trade_date: str | None = None) -> list[dict[str, Any]]:
@@ -362,6 +481,86 @@ def get_cached_limit_up(trade_date: str | None = None) -> dict[str, Any]:
     return {}
 
 
+def get_cached_news(ticker: str, trade_date: str | None = None) -> list[dict[str, Any]]:
+    """Read cached ticker news from local storage."""
+    td = trade_date or date.today().isoformat()
+    cache = LocalCache()
+    path = cache.cache_dir / "news" / td / f"{ticker.replace('.', '_')}.json"
+    if path.exists():
+        data = json.loads(path.read_text("utf-8"))
+        if isinstance(data, list):
+            return data
+    return []
+
+
+def get_cached_northbound_top10(trade_date: str | None = None) -> list[dict[str, Any]]:
+    """Read cached northbound top-10 turnover data."""
+    td = trade_date or date.today().isoformat()
+    cache = LocalCache()
+    candidates = [
+        cache.cache_dir / f"northbound_top10_{td}.json",
+        cache.cache_dir / f"northbound_{td}.json",
+    ]
+    for path in candidates:
+        if path.exists():
+            data = json.loads(path.read_text("utf-8"))
+            if isinstance(data, list):
+                return data
+            if isinstance(data, dict):
+                rows = data.get("top10") or data.get("records") or data.get("data")
+                if isinstance(rows, list):
+                    return rows
+    return []
+
+
+def get_cached_sector_news(sector_name: str, trade_date: str | None = None) -> list[dict[str, Any]]:
+    """Read cached sector news from local storage."""
+    td = trade_date or date.today().isoformat()
+    cache = LocalCache()
+    path = cache.cache_dir / "sector_news" / td / f"{_safe_path_part(sector_name, 'sector')}.json"
+    if path.exists():
+        data = json.loads(path.read_text("utf-8"))
+        if isinstance(data, list):
+            return data
+    return []
+
+
+def get_cached_financial(ticker: str) -> list[dict[str, Any]]:
+    """Read cached financial records for one ticker."""
+    candidates = [
+        LocalCache().cache_dir / "financial" / f"{ticker.replace('.', '_')}.json",
+        _workspace_cache_dir() / "financial" / f"{ticker.replace('.', '_')}.json",
+    ]
+    for path in candidates:
+        if path.exists():
+            data = json.loads(path.read_text("utf-8"))
+            if isinstance(data, list):
+                return data
+    return []
+
+
+def save_cached_financial(ticker: str, records: list[dict[str, Any]]) -> str:
+    """Persist financial records for one ticker into local cache."""
+    candidates = [
+        LocalCache().cache_dir / "financial",
+        _workspace_cache_dir() / "financial",
+    ]
+    payload = json.dumps(records, ensure_ascii=False, indent=2)
+    last_error: Exception | None = None
+    for directory in candidates:
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+            path = directory / f"{ticker.replace('.', '_')}.json"
+            atomic_write_text(path, payload)
+            return str(path)
+        except PermissionError as exc:
+            last_error = exc
+            continue
+    if last_error is not None:
+        raise last_error
+    raise PermissionError("failed to persist cached financial records")
+
+
 def get_cached_risk_blacklist() -> list[dict[str, str]]:
     """Read cached risk blacklist (delisted/ST/suspended)."""
     cache = LocalCache()
@@ -369,3 +568,38 @@ def get_cached_risk_blacklist() -> list[dict[str, str]]:
     if path.exists():
         return json.loads(path.read_text("utf-8"))
     return []
+
+
+def get_cached_risk_snapshot(trade_date: str | None = None) -> dict[str, Any]:
+    """Read cached daily risk snapshot."""
+    td = trade_date or date.today().isoformat()
+    cache = LocalCache()
+    path = cache.cache_dir / f"risk_{td}.json"
+    if path.exists():
+        data = json.loads(path.read_text("utf-8"))
+        if isinstance(data, dict):
+            return data
+    return {
+        "st_status": [],
+        "suspended": [],
+        "delisting": [],
+    }
+
+
+def _safe_path_part(value: str, fallback: str) -> str:
+    safe = _SAFE_PATH_PART.sub("_", value).strip("._")
+    return safe or fallback
+
+
+def _daily_date_column(df: pd.DataFrame) -> str | None:
+    for candidate in ("trade_date", "datetime", "date"):
+        if candidate in df.columns:
+            return candidate
+    return None
+
+
+def _normalize_date(value: str) -> str:
+    raw = str(value)
+    if len(raw) == 8 and raw.isdigit():
+        return f"{raw[:4]}-{raw[4:6]}-{raw[6:]}"
+    return raw

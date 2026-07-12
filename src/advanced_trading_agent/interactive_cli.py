@@ -549,8 +549,8 @@ def normalize_line(line: str) -> str:
 
 
 def status_text(context: SessionContext | None = None) -> str:
-    results_dir = config.get("results_dir", "data/results")
-    memory_dir = config.get("memory_dir", "data/memory")
+    results_dir = config.get("results_dir")
+    memory_dir = config.get("memory_log_path", "N/A")
     lines = [
         "Runtime status:",
         f"  results_dir: {results_dir}",
@@ -582,8 +582,8 @@ def config_text() -> str:
 
 
 def _configured_results_dir(results_dir: str | None = None) -> Path:
-    configured = results_dir or config.get("results_dir", "data/results")
-    return Path(str(configured)).expanduser()
+    configured = results_dir or config.get("results_dir")
+    return Path(str(configured))
 
 
 def _normalize_ticker_for_path(ticker: str | None) -> str | None:

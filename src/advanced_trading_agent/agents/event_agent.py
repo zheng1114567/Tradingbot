@@ -12,27 +12,36 @@ LLM 决定搜索什么事件 → ToolNode 搜索财联社/东方财富 → LLM �
 4. 已定价检查: 连续大涨 → 标记已定价
 5. 证据等级: 低等级不能单独支撑推荐
 """
+
 from __future__ import annotations
 
 import logging
 from typing import Any
 
 from ..llm.client import LLMClient
-from ..tool_nodes.event_tools import (
-    EventTools,
-    get_announcements,
-    get_calendar,
-    search_news,
+from ..tool_nodes.event_tools import EventTools
+from ..tool_nodes.registry import get_agent_tools
+from .contract import (
+    basic_self_check,
+    build_agent_update,
+    build_react_agent,
+    run_react_agent,
 )
-from .contract import basic_self_check, build_agent_update
-from .react_runner import run_prebuilt_react
 from .schemas import EventReport
+from .specs import get_agent_skill
 
 logger = logging.getLogger(__name__)
 
 
 def create_event_agent(llm: LLMClient, tools: EventTools | None = None):
     """创建 Event Agent 节点函数"""
+    skill = get_agent_skill("event")
+    react_agent = build_react_agent(
+        llm=llm,
+        tools=get_agent_tools("event"),
+        system_prompt=skill.react_prompt,
+        response_format=EventReport,
+    )
 
     def event_node(state: dict[str, Any]) -> dict[str, Any]:
         ticker = state.get("company_of_interest", "")
@@ -64,20 +73,28 @@ def create_event_agent(llm: LLMClient, tools: EventTools | None = None):
             text = str(item)
             entities = event_tools.detect_entity(text)
             detected_entities.extend(entities)
-        tool_calls.append({
-            "tool": "detect_entity",
-            "args": {"items": len(news_items)},
-            "records": len(detected_entities),
-        })
+        tool_calls.append(
+            {
+                "tool": "detect_entity",
+                "args": {"items": len(news_items)},
+                "records": len(detected_entities),
+            }
+        )
 
-        event_summary = "\n".join(
-            f"- [{e.get('event_type', '?')}] {e.get('summary', str(e))[:100]}"
-            for e in events_raw[:10]
-        ) if events_raw else "暂无结构化事件数据"
+        event_summary = (
+            "\n".join(
+                f"- [{e.get('event_type', '?')}] {e.get('summary', str(e))[:100]}"
+                for e in events_raw[:10]
+            )
+            if events_raw
+            else "暂无结构化事件数据"
+        )
 
-        news_summary = "\n".join(
-            f"- {str(n)[:80]}" for n in news_items[:10]
-        ) if news_items else "暂无相关新闻"
+        news_summary = (
+            "\n".join(f"- {str(n)[:80]}" for n in news_items[:10])
+            if news_items
+            else "暂无相关新闻"
+        )
 
         entities_summary = "未检测到明确主题"
         if detected_entities:
@@ -115,17 +132,7 @@ def create_event_agent(llm: LLMClient, tools: EventTools | None = None):
 
 请分析最重要的事件。输出结构化报告。"""
 
-        react_prompt = (
-            "你是 A 股事件分析师。必须用工具搜索新闻、公告或日历事件，"
-            "再按反伪链条规则判断事件是否有交易价值。"
-        )
-        report, react_trace = run_prebuilt_react(
-            llm=llm,
-            tools=[search_news, get_announcements, get_calendar],
-            prompt=react_prompt,
-            user_content=prompt,
-            response_format=EventReport,
-        )
+        report, react_trace = run_react_agent(react_agent, prompt)
         if react_trace:
             tool_calls.extend(react_trace)
 
@@ -133,9 +140,7 @@ def create_event_agent(llm: LLMClient, tools: EventTools | None = None):
             if report is None:
                 report = llm.chat(
                     messages=[
-                        ("system",
-                         "你是 A 股事件分析师。严格遵守反伪链条规则。"
-                         "没有明确实体映射的事件, 只能给 indirect。"),
+                        ("system", skill.fallback_system_prompt),
                         ("human", prompt),
                     ],
                     response_format=EventReport,
@@ -176,7 +181,9 @@ def create_event_agent(llm: LLMClient, tools: EventTools | None = None):
             state,
             sender="Event Agent",
             report_key="event_report",
-            report=report.to_markdown() if hasattr(report, "to_markdown") else str(report),
+            report=report.to_markdown()
+            if hasattr(report, "to_markdown")
+            else str(report),
             report_obj_key="event_report_obj",
             report_obj=report,
             evidence=evidence,

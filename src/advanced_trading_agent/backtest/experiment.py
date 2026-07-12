@@ -57,8 +57,8 @@ class ExperimentRegistry:
     """Append-only registry for backtests, paper runs, and ablations."""
 
     def __init__(self, path: str | None = None):
-        default_path = Path(config.get("results_dir", "data/results")) / "experiment_registry.jsonl"
-        self.path = Path(path or default_path).expanduser()
+        default_path = Path(config.get("results_dir")) / "experiment_registry.jsonl"
+        self.path = Path(path or default_path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
 
     def register(

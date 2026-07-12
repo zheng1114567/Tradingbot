@@ -65,9 +65,10 @@ class MockLLM:
             return _default_for(response_format)
         return "mock response"
 
-    @property
-    def client(self):
-        return "mock"
+    def as_langchain_chat_model(self):
+        """Return a mock LangChain-compatible model for create_react_agent."""
+        from unittest.mock import MagicMock
+        return MagicMock()
 
 
 _DEFAULTS: dict = {}
@@ -379,7 +380,7 @@ class TestSystemAgent:
         sa = create_system_agent(mock_llm)
         result = sa["round2_judge"](state)
         assert result["round2_state"]["active"] is True
-        assert len(result["round2_state"]["contradictions"]) > 0
+        assert len(result["round2_state"]["contradiction_records"]) > 0
 
     def test_final_decision(self, mock_llm, base_state):
         sa = create_system_agent(mock_llm)
@@ -634,8 +635,7 @@ class TestReportAgent:
                     "active": True,
                     "round_count": 8,
                     "max_rounds": 8,
-                    "questions": [],
-                    "contradictions": ["Market/Event conflict"],
+                    "contradiction_records": [{"id": "ct_0", "description": "Market/Event conflict", "agents_involved": [], "detection_method": "pattern", "severity": "medium"}],
                     "current_speaker": "AutoGenRoundtable",
                     "completed": True,
                     "summary": "System_Moderator: final_pressure=downgrade",

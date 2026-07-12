@@ -25,8 +25,9 @@ from typing import Any
 from ..core.cache_manager import Tier1Data, WINTER_SENTIMENTS, decide_tier2_loading
 from ..core.data_quality import DataQualityChecker
 from ..llm.client import LLMClient
-from ..risk.hard_risk import HardRiskController, RiskVerdictType
+from ..risk.hard_risk import HardRiskController
 from ..risk.soft_risk import SignalType, SoftRiskController
+from ..roundtable.contradiction_detector import ContradictionDetector
 from .contract import basic_self_check, build_node_audit_update
 from .schemas import DecisionType, RiskVerdict, SystemDecision, SystemRubric
 
@@ -251,39 +252,35 @@ def create_system_agent(llm: LLMClient):
     def round2_judge_node(state: dict[str, Any]) -> dict[str, Any]:
         """判断是否需要 Round 2 交叉质询
 
-        进入 Round 2 的条件:
-        1. 存在明确的矛盾 (如 Market 说资金背离但 Event 说利好)
-        2. Backtest 样本不足 (< 30) 但 Analysis 排序靠前
-        3. 至少 2 个 Agent 的观点存在分歧
+        使用 ContradictionDetector 进行双层矛盾检测:
+        - 第一层: 8 个确定性模式
+        - 第二层: LLM 语义检测 (仅当第一层发现 < 2 个矛盾时)
         """
         market_rpt = state.get("market_report_obj")
         event_rpt = state.get("event_report_obj")
         analysis_rpt = state.get("analysis_report_obj")
         backtest_rpt = state.get("backtest_report_obj")
+        memory_recall = state.get("memory_recall")
 
-        contradictions = []
+        detector = ContradictionDetector()
+        records = detector.detect(
+            market_rpt=market_rpt,
+            event_rpt=event_rpt,
+            analysis_rpt=analysis_rpt,
+            backtest_rpt=backtest_rpt,
+            memory_recall=memory_recall,
+            llm=llm,
+        )
 
-        # 检查矛盾
-        if market_rpt and event_rpt:
-            if (market_rpt.capital_confirmation in ("资金背离", "资金不足")
-                    and event_rpt.direction == "利好"):
-                contradictions.append(
-                    f"Market:资金{market_rpt.capital_confirmation} ↔ Event:{event_rpt.direction}"
-                )
-
-        if backtest_rpt and analysis_rpt:
-            if (backtest_rpt.sample_size < 30
-                    and analysis_rpt.stock_rankings
-                    and analysis_rpt.stock_rankings[0].composite_score > 7):
-                contradictions.append(
-                    f"Backtest:样本不足({backtest_rpt.sample_size}) ↔ Analysis:高分"
-                )
-
+        contradictions = [r.description for r in records]
+        contradiction_records = [r.model_dump(mode="json") for r in records]
         needs_round2 = len(contradictions) > 0
 
         evidence = [
             f"contradictions={len(contradictions)}",
             f"needs_round2={needs_round2}",
+            f"detection_patterns={sum(1 for r in records if r.detection_method == 'pattern')}",
+            f"detection_llm={sum(1 for r in records if r.detection_method == 'llm')}",
         ]
 
         return build_node_audit_update(
@@ -292,10 +289,18 @@ def create_system_agent(llm: LLMClient):
                 "active": needs_round2,
                 "round_count": 0,
                 "max_rounds": 8,
-                "questions": [],
                 "contradictions": contradictions,
+                "contradiction_records": contradiction_records,
+                "evidence_board": [],
+                "round_history": [],
+                "moderator_output": None,
                 "current_speaker": "",
                 "completed": not needs_round2,
+                "summary": "",
+                "provider": "none",
+                "fallback_reason": "",
+                "final_pressure": "neutral",
+                "unresolved_conflicts": contradictions,
             },
             system_state="round2" if needs_round2 else "finalizing",
             evidence=evidence + contradictions,
@@ -400,11 +405,27 @@ def create_system_agent(llm: LLMClient):
         agent_summary = "\n".join(summary_lines)
 
         round2_summary = ""
-        if round2 and round2.get("contradictions"):
-            round2_summary = "\n".join(
-                f"- {c}" for c in round2["contradictions"]
-            )
-        round2_final_pressure = str(round2.get("final_pressure", "neutral") or "neutral")
+        # Read structured moderator output with unresolved conflicts
+        moderator_output = round2.get("moderator_output")
+        contradiction_records = round2.get("contradiction_records", [])
+        if moderator_output:
+            round2_final_pressure = str(moderator_output.get("final_pressure", "neutral"))
+            unresolved_ids = moderator_output.get("unresolved_contradiction_ids", [])
+            # Enhance round2_summary with structured data for rubric consumption
+            structured_summary_parts = [round2_summary] if round2_summary else []
+            for rec in contradiction_records:
+                if rec.get("id") in unresolved_ids:
+                    structured_summary_parts.append(
+                        f"  - 未解决 [{rec['id']}]: {rec.get('description', '')}"
+                    )
+            if not moderator_output.get("converged", True):
+                structured_summary_parts.append("  - Round 2 辩论未收敛")
+            if structured_summary_parts:
+                round2_summary = "\n".join(structured_summary_parts)
+        else:
+            # Backward compat: old keyword-based parsing
+            round2_final_pressure = str(round2.get("final_pressure", "neutral") or "neutral")
+
         round2_provider = str(round2.get("provider", "") or "")
         round2_fallback_reason = str(round2.get("fallback_reason", "") or "")
         if round2_table_summary:

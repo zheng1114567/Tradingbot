@@ -15,9 +15,10 @@ DataAgent to re-fetch the same data later.
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass, field
 from datetime import date
-from typing import Any, TypedDict
+from typing import Any, Callable, TypedDict
 
 from ..core.vendor import timed_vendor_call
 from .vendor_router import route_to_vendor
@@ -47,8 +48,8 @@ class ScanBundle:
 
     trade_date: str
     results: list[ScanResult]
-    shared_raw: dict[str, Any] = field(default_factory=dict)
-    ticker_data: dict[str, dict[str, Any]] = field(default_factory=dict)
+    shared_raw: ScanSharedRaw = field(default_factory=dict)
+    ticker_data: dict[str, ScanTickerRaw] = field(default_factory=dict)
     route_trace: list[dict[str, Any]] = field(default_factory=list)
 
 
@@ -62,6 +63,27 @@ class _ScorerEntry(TypedDict):
     reasons: list[str]
 
 
+class ScanRiskRaw(TypedDict):
+    st_status: list[str]
+    suspended: list[str]
+    delisting: list[str]
+
+
+class ScanSharedRaw(TypedDict, total=False):
+    market: list[dict[str, Any]]
+    sector_context: list[dict[str, Any]]
+    limit_up_summary: dict[str, Any]
+    dragon_tiger: list[dict[str, Any]]
+    market_breadth: dict[str, Any]
+    risk: ScanRiskRaw
+
+
+class ScanTickerRaw(TypedDict, total=False):
+    daily: list[dict[str, Any]]
+    capital_flow: list[dict[str, Any]]
+    news: list[dict[str, Any]]
+
+
 class MarketScanner:
     """Discover trending stocks through multi-channel scanning.
 
@@ -70,11 +92,23 @@ class MarketScanner:
     2. Limit-up pool details (momentum signal)
     3. Northbound top holdings (smart money signal)
     4. Dragon-tiger list (institutional signal)
+    5. Short-term technical signals (MA trend, breakout, momentum — from local cache)
     """
 
-    def __init__(self, top_sectors: int = 5, top_n: int = 20):
+    def __init__(
+        self,
+        top_sectors: int = 5,
+        top_n: int = 20,
+        base_candidates: int | None = None,
+        per_sector_cap: int | None = None,
+        *,
+        route_fn: Callable[..., Any] = route_to_vendor,
+    ):
         self.top_sectors = top_sectors
         self.top_n = top_n
+        self.base_candidates = min(base_candidates or 12, top_n)
+        self.per_sector_cap = per_sector_cap or max(2, math.ceil(top_n / 3))
+        self._route_fn = route_fn
         self._last_scan_context: dict[str, Any] = {}
 
     def scan(self, trade_date: str | None = None) -> list[ScanResult]:
@@ -95,11 +129,14 @@ class MarketScanner:
         # Channel 4: Dragon-tiger
         self._scan_dragon_tiger(td, scorer)
 
+        # Channel 5: Short-term technical signals (from local cache, no API)
+        self._scan_short_term_signals(td, scorer)
+
         self._last_scan_context = ctx
 
         # Build ranked results
-        results = self._rank(scorer)
-        return results[:self.top_n]
+        ranked = self._rank(scorer)
+        return self._select_candidates(ranked, ctx)
 
     # ------------------------------------------------------------------
     # Channel scanners
@@ -108,7 +145,7 @@ class MarketScanner:
     def _scan_hot_sectors(self, td: str, scorer: dict[str, _ScorerEntry], ctx: dict[str, Any]) -> None:
         """Find top sectors and their constituent stocks."""
         try:
-            sectors = route_to_vendor("get_sector", top_n=self.top_sectors * 2)
+            sectors = self._route_fn("get_sector", top_n=self.top_sectors * 2, trade_date=td)
         except Exception as exc:
             logger.warning("Sector scan failed: %s", exc)
             return
@@ -131,7 +168,11 @@ class MarketScanner:
                 continue
 
             try:
-                constituents = route_to_vendor("get_sector_constituents", sector_name=sector_name)
+                constituents = self._route_fn(
+                    "get_sector_constituents",
+                    sector_name=sector_name,
+                    trade_date=td,
+                )
             except Exception:
                 continue
 
@@ -170,7 +211,7 @@ class MarketScanner:
     def _scan_limit_up(self, td: str, scorer: dict[str, _ScorerEntry], ctx: dict[str, Any]) -> None:
         """Score stocks in the limit-up pool."""
         try:
-            data = route_to_vendor("get_limit_up_tiers", trade_date=td)
+            data = self._route_fn("get_limit_up_tiers", trade_date=td)
         except Exception as exc:
             logger.warning("Limit-up scan failed: %s", exc)
             return
@@ -212,15 +253,27 @@ class MarketScanner:
     def _scan_northbound(self, td: str, scorer: dict[str, _ScorerEntry], ctx: dict[str, Any]) -> None:
         """Score stocks with northbound net buying."""
         try:
-            top10 = route_to_vendor("get_northbound_top10", trade_date=td)
+            top10 = self._route_fn("get_northbound_top10", trade_date=td)
         except Exception as exc:
-            logger.warning("Northbound scan failed: %s", exc)
+            ctx["northbound_status"] = {
+                "status": "unavailable",
+                "reason": str(exc),
+            }
+            logger.info("Northbound scan unavailable: %s", exc)
             return
 
         if not isinstance(top10, list):
+            ctx["northbound_status"] = {
+                "status": "unavailable",
+                "reason": "non-list response",
+            }
             return
 
         ctx["northbound_top10"] = top10
+        ctx["northbound_status"] = {
+            "status": "available",
+            "record_count": len(top10),
+        }
 
         for stock in top10:
             code = str(stock.get("code", ""))
@@ -248,7 +301,7 @@ class MarketScanner:
     def _scan_dragon_tiger(self, td: str, scorer: dict[str, _ScorerEntry]) -> None:
         """Score stocks appearing on dragon-tiger list."""
         try:
-            dt_list = route_to_vendor("get_dragon_tiger", trade_date=td)
+            dt_list = self._route_fn("get_dragon_tiger", trade_date=td)
         except Exception as exc:
             logger.warning("Dragon-tiger scan failed: %s", exc)
             return
@@ -275,6 +328,70 @@ class MarketScanner:
             scorer[ticker]["score"] += score
             if "dragon_tiger" not in scorer[ticker]["sources"]:
                 scorer[ticker]["sources"].append("dragon_tiger")
+
+    def _scan_short_term_signals(self, td: str, scorer: dict[str, _ScorerEntry]) -> None:
+        """Score stocks using cached short-term technical signals.
+
+        Reads from short_term_signals_{date}.json (computed by build_cache
+        or compute_short_term_signals). Stocks with composite >= 60
+        get a confidence bonus; stocks with composite <= 40 get a penalty.
+
+        This channel uses only local cache — no API calls.
+        """
+        from pathlib import Path
+        from ..config import config
+
+        cache_dir = Path(config.get("results_dir")) / "local_cache"
+        path = cache_dir / f"short_term_signals_{td}.json"
+        if not path.exists():
+            logger.debug("Short-term signal cache not found: %s", path)
+            return
+
+        try:
+            import json
+            data = json.loads(path.read_text("utf-8"))
+        except Exception as exc:
+            logger.warning("Failed to read short-term signals: %s", exc)
+            return
+
+        signals_data = data.get("signals", {})
+        if not signals_data:
+            return
+
+        ctx_signals = {
+            "signal_tickers": len(signals_data),
+            "signal_top_bullish": [],
+        }
+
+        scored = 0
+        for ticker, report in signals_data.items():
+            composite = float(report.get("composite", 50))
+            n_sig = int(report.get("n_signals", 0))
+
+            if ticker not in scorer:
+                continue
+
+            if composite >= 60:
+                bonus = (composite - 60) / 40 * 3.0  # 0~3分
+                scorer[ticker]["score"] += bonus
+                scorer[ticker]["sources"].append("short_term_signal")
+                scorer[ticker]["reasons"].append(
+                    f"短线信号 {composite:.0f}/100 ({n_sig}个信号共振)"
+                )
+                scored += 1
+                if len(ctx_signals["signal_top_bullish"]) < 5:
+                    ctx_signals["signal_top_bullish"].append(
+                        f"{ticker}({composite:.0f})"
+                    )
+            elif composite <= 40:
+                penalty = (40 - composite) / 40 * 1.5  # 0~1.5分
+                scorer[ticker]["score"] = max(0, scorer[ticker]["score"] - penalty)
+                scorer[ticker]["reasons"].append(
+                    f"短线信号偏弱 {composite:.0f}/100"
+                )
+
+        self._last_scan_context["short_term_signals"] = ctx_signals
+        logger.debug("Short-term signal scan: scored %d tickers from cache", scored)
 
     # ------------------------------------------------------------------
     # Ranking
@@ -316,6 +433,71 @@ class MarketScanner:
         results.sort(key=lambda r: r.score, reverse=True)
         return results
 
+    def _select_candidates(
+        self,
+        ranked: list[ScanResult],
+        ctx: dict[str, Any],
+    ) -> list[ScanResult]:
+        """Select a dynamic candidate pool with per-sector caps.
+
+        Rules:
+        - concentrated tape -> shrink candidate pool
+        - broad tape -> widen candidate pool
+        - always enforce a per-sector cap to avoid one-theme domination
+        """
+        if not ranked:
+            return []
+
+        # 过滤退市股和无格式代码
+        filtered: list[ScanResult] = []
+        for r in ranked:
+            if "退" in r.name:
+                continue
+            if "." not in r.ticker:
+                normalized = self._normalize_ticker(r.ticker)
+                if normalized == r.ticker:
+                    continue  # still has no suffix, skip
+            filtered.append(r)
+
+        dynamic_limit = self._dynamic_candidate_limit(filtered, ctx)
+        selected: list[ScanResult] = []
+        sector_counts: dict[str, int] = {}
+
+        for result in filtered:
+            sector = result.sector or "未识别"
+            if sector_counts.get(sector, 0) >= self.per_sector_cap:
+                continue
+            selected.append(result)
+            sector_counts[sector] = sector_counts.get(sector, 0) + 1
+            if len(selected) >= dynamic_limit:
+                break
+
+        return selected
+
+    def _dynamic_candidate_limit(
+        self,
+        ranked: list[ScanResult],
+        ctx: dict[str, Any],
+    ) -> int:
+        """Adjust candidate count based on breadth of leading sectors."""
+        if not ranked:
+            return 0
+
+        distinct_sectors = {result.sector for result in ranked[: min(len(ranked), self.base_candidates)] if result.sector}
+        hot_sectors = ctx.get("hot_sectors", [])
+        strong_hot_count = sum(
+            1
+            for sector in hot_sectors
+            if float(sector.get("strength_score", 0) or 0) >= 2.5
+            or float(sector.get("change_pct", 0) or 0) >= 2.5
+        )
+
+        if len(distinct_sectors) <= 2 or strong_hot_count <= 2:
+            return min(self.top_n, max(8, self.base_candidates - 2))
+        if len(distinct_sectors) >= 5 or strong_hot_count >= 4:
+            return min(self.top_n, self.base_candidates + 3)
+        return min(self.top_n, self.base_candidates)
+
     @staticmethod
     def _normalize_ticker(code: str) -> str:
         """Normalize a raw stock code to 000001.SZ format."""
@@ -326,7 +508,7 @@ class MarketScanner:
             return f"{code}.SH"
         if code.startswith(("0", "3")):
             return f"{code}.SZ"
-        if code.startswith(("8", "4")):
+        if code.startswith(("8", "4", "920")):
             return f"{code}.BJ"
         return code
 
@@ -350,6 +532,7 @@ class MarketScanner:
                 "limit_up": "涨停",
                 "northbound": "北向",
                 "dragon_tiger": "龙虎",
+                "short_term_signal": "信号",
             }
             src = "+".join(source_icon.get(s, s) for s in r.source.split("+")[:2])
             lines.append(f"| {i} | {r.ticker} | {r.name} | {src} | {r.sector[:12]} | {r.score:.1f} | {r.reason[:50]} |")
@@ -589,7 +772,7 @@ class MarketScanner:
         self,
         trade_date: str,
         route_trace: list[dict[str, Any]] | None = None,
-    ) -> dict[str, Any]:
+    ) -> ScanSharedRaw:
         """Collect market-wide data shared across all tickers.
 
         Returns a dict with keys matching DataAgent._collect_raw shared fields:
@@ -601,14 +784,20 @@ class MarketScanner:
 
         market = self._safe_fetch("get_daily", trace, code="000001.SH",
                                   start_date=trade_date, end_date=trade_date)
-        sector_context = self._safe_fetch("get_sector", trace, top_n=20)
-        st_status = self._safe_fetch("get_st_status", trace)
+        sector_context = self._safe_fetch("get_sector", trace, top_n=20, trade_date=trade_date)
+        limit_up_summary = self._safe_fetch("get_limit_up_tiers", trace, trade_date=trade_date)
+        dragon_tiger = self._safe_fetch("get_dragon_tiger", trace, trade_date=trade_date)
+        market_breadth = self._safe_fetch("get_market_breadth", trace, trade_date=trade_date)
+        st_status = self._safe_fetch("get_st_status", trace, trade_date=trade_date)
         suspended = self._safe_fetch("get_suspended", trace, trade_date=trade_date)
-        delisting = self._safe_fetch("get_delisting", trace)
+        delisting = self._safe_fetch("get_delisting", trace, trade_date=trade_date)
 
         return {
             "market": market if isinstance(market, list) else [],
             "sector_context": sector_context if isinstance(sector_context, list) else [],
+            "limit_up_summary": limit_up_summary if isinstance(limit_up_summary, dict) else {},
+            "dragon_tiger": dragon_tiger if isinstance(dragon_tiger, list) else [],
+            "market_breadth": market_breadth if isinstance(market_breadth, dict) else {},
             "risk": {
                 "st_status": st_status if isinstance(st_status, list) else [],
                 "suspended": suspended if isinstance(suspended, list) else [],
@@ -622,7 +811,7 @@ class MarketScanner:
         trade_date: str,
         news_keyword: str | None = None,
         route_trace: list[dict[str, Any]] | None = None,
-    ) -> dict[str, Any]:
+    ) -> ScanTickerRaw:
         """Collect per-ticker raw data: daily, capital_flow, news.
 
         Returns a dict with keys matching the per-ticker portion of
@@ -636,7 +825,11 @@ class MarketScanner:
                                  start_date=None, end_date=trade_date)
         capital_flow = self._safe_fetch("get_capital_flow", trace, code=ticker,
                                         start_date=None, end_date=trade_date)
-        news = self._safe_fetch("get_news", trace, code=ticker, keyword=news_keyword)
+        from .local_cache import get_cached_news
+
+        news = get_cached_news(ticker, trade_date=trade_date)
+        if news_keyword and not news:
+            logger.debug("No cached news for %s/%s; skipping online news during scan", ticker, trade_date)
 
         return {
             "daily": daily if isinstance(daily, list) else [],
@@ -672,7 +865,7 @@ class MarketScanner:
         shared = self.collect_shared_data(td, route_trace)
 
         # Phase 3: collect per-ticker data for top candidates
-        ticker_data: dict[str, dict[str, Any]] = {}
+        ticker_data: dict[str, ScanTickerRaw] = {}
         for r in results[:limit]:
             logger.info("Collecting data for %s %s", r.ticker, r.name)
             ticker_data[r.ticker] = self.collect_ticker_data(
@@ -687,8 +880,8 @@ class MarketScanner:
             route_trace=route_trace,
         )
 
-    @staticmethod
     def _safe_fetch(
+        self,
         method: str,
         route_trace: list[dict[str, Any]],
         **kwargs: Any,
@@ -696,7 +889,10 @@ class MarketScanner:
         """Call route_to_vendor with timing and error tracking."""
         try:
             result, elapsed_ms = timed_vendor_call(
-                method, route_trace=route_trace, **kwargs,
+                method,
+                route_trace=route_trace,
+                route_fn=self._route_fn,
+                **kwargs,
             )
             record_count = len(result) if isinstance(result, list) else None
             logger.debug("Fetched %s in %.0fms (%d records)", method, elapsed_ms, record_count or 0)

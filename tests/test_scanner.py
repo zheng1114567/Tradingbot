@@ -105,6 +105,64 @@ class TestMarketScanner:
         results = scanner.scan()
         assert isinstance(results, list)
 
+    def test_select_candidates_enforces_sector_cap(self):
+        scanner = MarketScanner(top_n=10, base_candidates=10, per_sector_cap=2)
+        ranked = [
+            ScanResult(ticker="000001.SZ", name="A", source="hot_sector", sector="银行", score=10.0, reason=""),
+            ScanResult(ticker="000002.SZ", name="B", source="hot_sector", sector="银行", score=9.8, reason=""),
+            ScanResult(ticker="000003.SZ", name="C", source="hot_sector", sector="银行", score=9.6, reason=""),
+            ScanResult(ticker="000004.SZ", name="D", source="hot_sector", sector="券商", score=9.4, reason=""),
+            ScanResult(ticker="000005.SZ", name="E", source="hot_sector", sector="券商", score=9.2, reason=""),
+            ScanResult(ticker="000006.SZ", name="F", source="hot_sector", sector="科技", score=9.0, reason=""),
+        ]
+        ctx = {"hot_sectors": [{"sector_name": "银行", "strength_score": 3.0, "change_pct": 2.0}]}
+
+        selected = scanner._select_candidates(ranked, ctx)
+
+        assert len([r for r in selected if r.sector == "银行"]) == 2
+        assert selected[0].ticker == "000001.SZ"
+        assert selected[1].ticker == "000002.SZ"
+        assert "000003.SZ" not in {r.ticker for r in selected}
+
+    def test_dynamic_candidate_limit_shrinks_when_sectors_concentrated(self):
+        scanner = MarketScanner(top_n=15, base_candidates=12, per_sector_cap=5)
+        ranked = [
+            ScanResult(ticker=f"00000{i}.SZ", name=str(i), source="hot_sector", sector="银行", score=10 - i * 0.1, reason="")
+            for i in range(1, 10)
+        ]
+        ranked += [
+            ScanResult(ticker="600001.SH", name="X", source="hot_sector", sector="券商", score=8.0, reason=""),
+            ScanResult(ticker="600002.SH", name="Y", source="hot_sector", sector="券商", score=7.9, reason=""),
+        ]
+        ctx = {
+            "hot_sectors": [
+                {"sector_name": "银行", "strength_score": 3.5, "change_pct": 3.2},
+                {"sector_name": "券商", "strength_score": 2.0, "change_pct": 1.0},
+            ]
+        }
+
+        limit = scanner._dynamic_candidate_limit(ranked, ctx)
+        assert limit == 10
+
+    def test_dynamic_candidate_limit_widens_when_breadth_is_high(self):
+        scanner = MarketScanner(top_n=15, base_candidates=12, per_sector_cap=5)
+        sectors = ["银行", "券商", "科技", "军工", "电力", "医药"]
+        ranked = [
+            ScanResult(ticker=f"{i:06d}.SZ", name=str(i), source="hot_sector", sector=sector, score=10 - i * 0.1, reason="")
+            for i, sector in enumerate(sectors, start=1)
+        ]
+        ctx = {
+            "hot_sectors": [
+                {"sector_name": "银行", "strength_score": 3.5, "change_pct": 3.2},
+                {"sector_name": "券商", "strength_score": 3.2, "change_pct": 2.9},
+                {"sector_name": "科技", "strength_score": 3.0, "change_pct": 2.8},
+                {"sector_name": "军工", "strength_score": 2.7, "change_pct": 2.6},
+            ]
+        }
+
+        limit = scanner._dynamic_candidate_limit(ranked, ctx)
+        assert limit == 15
+
     # -- collect_shared_data --
 
     def test_collect_shared_data_returns_expected_keys(self):

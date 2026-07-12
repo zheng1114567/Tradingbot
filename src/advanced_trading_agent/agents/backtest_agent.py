@@ -13,6 +13,7 @@ Backtest Agent — 历史证据审查员
 - Phase A: 运行结束存 pending
 - Phase B: 下次运行拉真实收益反思
 """
+
 from __future__ import annotations
 
 import logging
@@ -20,10 +21,16 @@ from datetime import date
 from typing import Any
 
 from ..llm.client import LLMClient
-from ..tool_nodes.backtest_tools import BacktestTools, find_similar, run_backtest
-from .contract import basic_self_check, build_agent_update
-from .react_runner import run_prebuilt_react
+from ..tool_nodes.backtest_tools import BacktestTools
+from ..tool_nodes.registry import get_agent_tools
+from .contract import (
+    basic_self_check,
+    build_agent_update,
+    build_react_agent,
+    run_react_agent,
+)
 from .schemas import BacktestReport, Confidence
+from .specs import get_agent_skill
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +39,13 @@ MIN_SAMPLE_SIZE = 30  # 最小样本量阈值
 
 def create_backtest_agent(llm: LLMClient, tools: BacktestTools | None = None):
     """创建 Backtest Agent 节点函数"""
+    skill = get_agent_skill("backtest")
+    react_agent = build_react_agent(
+        llm=llm,
+        tools=get_agent_tools("backtest"),
+        system_prompt=skill.react_prompt,
+        response_format=BacktestReport,
+    )
 
     def backtest_node(state: dict[str, Any]) -> dict[str, Any]:
         ticker = state.get("company_of_interest", "")
@@ -42,18 +56,19 @@ def create_backtest_agent(llm: LLMClient, tools: BacktestTools | None = None):
         # 先用工具跑回测
         backtest_tools = tools or BacktestTools()
         bt_result = backtest_tools.run_backtest(ticker, trade_date)
-        tool_calls = [{
-            "tool": "run_backtest",
-            "args": {"ticker": ticker, "trade_date": trade_date},
-            "records": 1 if bt_result else 0,
-        }]
+        tool_calls = [
+            {
+                "tool": "run_backtest",
+                "args": {"ticker": ticker, "trade_date": trade_date},
+                "records": 1 if bt_result else 0,
+            }
+        ]
 
         # 从 Tier 2 回测样本获取统计
         sample_size = 0
         win_rate = 0
         avg_excess = 0
         best_period = None
-        confidence = "low"
 
         if backtest_samples:
             s = backtest_samples[0]
@@ -61,7 +76,6 @@ def create_backtest_agent(llm: LLMClient, tools: BacktestTools | None = None):
             win_rate = s.get("win_rate", 0)
             avg_excess = s.get("avg_excess_return", 0)
             best_period = s.get("best_holding_period")
-            confidence = s.get("confidence", "low")
         elif bt_result:
             sample_size = 1  # 只有当前样本
             win_rate = 0
@@ -96,17 +110,7 @@ def create_backtest_agent(llm: LLMClient, tools: BacktestTools | None = None):
 请评估当前标的是否有足够的历史证据支撑买入。
 输出结构化回测验证报告。"""
 
-        react_prompt = (
-            "你是 A 股历史证据审查员。必须用工具运行回测并查找相似历史样本，"
-            "再输出结构化报告。样本不足、胜率不足和负超额收益必须降级。"
-        )
-        report, react_trace = run_prebuilt_react(
-            llm=llm,
-            tools=[run_backtest, find_similar],
-            prompt=react_prompt,
-            user_content=prompt,
-            response_format=BacktestReport,
-        )
+        report, react_trace = run_react_agent(react_agent, prompt)
         if react_trace:
             tool_calls.extend(react_trace)
 
@@ -114,9 +118,7 @@ def create_backtest_agent(llm: LLMClient, tools: BacktestTools | None = None):
             if report is None:
                 report = llm.chat(
                     messages=[
-                        ("system",
-                         "你是 A 股历史证据审查员。样本不足时不能支撑买入。"
-                         "必须同时考虑成功样本和失败样本。"),
+                        ("system", skill.fallback_system_prompt),
                         ("human", prompt),
                     ],
                     response_format=BacktestReport,
@@ -155,7 +157,9 @@ def create_backtest_agent(llm: LLMClient, tools: BacktestTools | None = None):
             state,
             sender="Backtest Agent",
             report_key="backtest_report",
-            report=report.to_markdown() if hasattr(report, "to_markdown") else str(report),
+            report=report.to_markdown()
+            if hasattr(report, "to_markdown")
+            else str(report),
             report_obj_key="backtest_report_obj",
             report_obj=report,
             evidence=evidence,

@@ -1,9 +1,8 @@
 """Tests for MarketScanner and ScanBundle."""
 from __future__ import annotations
 
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
-import pytest
 from advanced_trading_agent.data_agent.scanner import MarketScanner, ScanBundle, ScanResult
 
 
@@ -198,6 +197,47 @@ class TestMarketScanner:
         assert isinstance(data["capital_flow"], list)
         assert isinstance(data["news"], list)
 
+    def test_collect_ticker_data_enriches_cached_news_full_text(self, monkeypatch):
+        class FakeResponse:
+            status_code = 200
+            apparent_encoding = "utf-8"
+            encoding = "utf-8"
+            text = (
+                "<html><body>"
+                "<p>Ping An Bank released a detailed operating update with retail banking evidence.</p>"
+                "<p>The full article contains enough context for downstream trading agents.</p>"
+                "</body></html>"
+            )
+
+            def raise_for_status(self):
+                return None
+
+        def fake_route(method, **kwargs):
+            return []
+
+        def fake_news(ticker, *, trade_date=None):
+            return [{
+                "title": "Ping An Bank operating update",
+                "summary": "Short summary",
+                "url": "https://example.test/news",
+            }]
+
+        def fake_get(url, **kwargs):
+            assert url == "https://example.test/news"
+            return FakeResponse()
+
+        monkeypatch.setattr("advanced_trading_agent.data_agent.local_cache.get_cached_news", fake_news)
+        monkeypatch.setattr("advanced_trading_agent.data_agent.news_text.requests.get", fake_get)
+
+        scanner = MarketScanner(route_fn=fake_route)
+        data = scanner.collect_ticker_data("000001.SZ", "2026-07-10")
+
+        news = data["news"][0]
+        assert news["full_text_source"] == "scanner"
+        assert news["full_text_attempted"] is True
+        assert news["content_status"] == "full_text"
+        assert "downstream trading agents" in news["evidence_text"]
+
     # -- scan_and_collect --
 
     def test_scan_and_collect_returns_scan_bundle(self):
@@ -219,11 +259,41 @@ class TestMarketScanner:
         result_tickers = {r.ticker for r in bundle.results[:3]}
         for ticker in bundle.ticker_data:
             assert ticker in result_tickers
+    def test_scan_bundle_raw_for_ticker_returns_canonical_payload(self):
+        bundle = ScanBundle(
+            trade_date="2026-07-10",
+            results=[],
+            shared_raw={
+                "market": [{"close": 3000}],
+                "sector_context": [{"sector_name": "银行"}],
+                "limit_up_summary": {"first_board": 1},
+                "dragon_tiger": [{"code": "000001"}],
+                "market_breadth": {"advance_count": 10},
+                "risk": {"st_status": [], "suspended": [], "delisting": []},
+            },
+            ticker_data={
+                "000001.SZ": {
+                    "daily": [{"close": 10}],
+                    "capital_flow": [{"net_mf_amount": 1}],
+                    "news": [{"title": "news"}],
+                }
+            },
+            route_trace=[{"method": "get_daily", "status": "success"}],
+        )
+
+        payload = bundle.raw_for_ticker("000001.SZ")
+
+        assert payload["daily"] == [{"close": 10}]
+        assert payload["market"] == [{"close": 3000}]
+        assert payload["market_breadth"] == {"advance_count": 10}
+        assert payload["news"] == [{"title": "news"}]
+        assert payload["route_trace"] == bundle.route_trace
 
     def test_scan_and_collect_empty_results(self):
         """When scan finds nothing, scan_and_collect returns empty bundle."""
         scanner = MarketScanner(top_sectors=0, top_n=5)
-        bundle = scanner.scan_and_collect("2026-07-10", top_n=3)
+        with patch.object(scanner, "scan", return_value=[]):
+            bundle = scanner.scan_and_collect("2026-07-10", top_n=3)
         assert isinstance(bundle, ScanBundle)
         assert bundle.results == []
         assert bundle.ticker_data == {}
@@ -245,10 +315,10 @@ class TestMarketScanner:
         errors = [t for t in trace if t.get("status") == "error"]
         assert len(errors) >= 1
 
-    @patch("advanced_trading_agent.data_agent.scanner.route_to_vendor")
-    def test_safe_fetch_success(self, mock_route):
-        mock_route.return_value = [{"close": 10.0}]
+    def test_safe_fetch_success(self):
         scanner = MarketScanner()
+        mock_route = MagicMock(return_value=[{"close": 10.0}])
+        scanner._route_fn = mock_route
         trace: list = []
         result = scanner._safe_fetch("get_daily", trace, code="000001.SZ")
         assert result == [{"close": 10.0}]

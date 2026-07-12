@@ -17,10 +17,12 @@ from __future__ import annotations
 import logging
 import math
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, datetime, timezone
 from typing import Any, Callable, TypedDict
 
 from ..core.vendor import timed_vendor_call
+from .scan_cleaning import clean_data_agent_raw as clean_raw_payload
+from .news_text import enrich_news_full_text
 from .vendor_router import route_to_vendor
 
 logger = logging.getLogger(__name__)
@@ -51,6 +53,22 @@ class ScanBundle:
     shared_raw: ScanSharedRaw = field(default_factory=dict)
     ticker_data: dict[str, ScanTickerRaw] = field(default_factory=dict)
     route_trace: list[dict[str, Any]] = field(default_factory=list)
+
+    def raw_for_ticker(self, ticker: str) -> dict[str, Any]:
+        """Return the canonical raw payload consumed by DataAgent."""
+        ticker_raw = self.ticker_data.get(ticker, {})
+        return {
+            "daily": ticker_raw.get("daily", []),
+            "market": self.shared_raw.get("market", []),
+            "sector_context": self.shared_raw.get("sector_context", []),
+            "limit_up_summary": self.shared_raw.get("limit_up_summary", {}),
+            "dragon_tiger": self.shared_raw.get("dragon_tiger", []),
+            "market_breadth": self.shared_raw.get("market_breadth", {}),
+            "capital_flow": ticker_raw.get("capital_flow", []),
+            "news": ticker_raw.get("news", []),
+            "risk": self.shared_raw.get("risk", {}),
+            "route_trace": self.route_trace,
+        }
 
 
 class _ScorerEntry(TypedDict):
@@ -811,8 +829,15 @@ class MarketScanner:
         trade_date: str,
         news_keyword: str | None = None,
         route_trace: list[dict[str, Any]] | None = None,
+        fetch_news_full_text: bool = True,
+        *,
+        start_date: str | None = None,
+        sector_keyword: str | None = None,
+        include_capital_flow: bool = True,
+        include_news: bool = True,
+        prefer_cached_news: bool = True,
     ) -> ScanTickerRaw:
-        """Collect per-ticker raw data: daily, capital_flow, news.
+        """Collect per-ticker raw data: daily, capital_flow, enriched news.
 
         Returns a dict with keys matching the per-ticker portion of
         DataAgent._collect_raw: daily, capital_flow, news.
@@ -822,14 +847,32 @@ class MarketScanner:
             trace = route_trace
 
         daily = self._safe_fetch("get_daily", trace, code=ticker,
-                                 start_date=None, end_date=trade_date)
-        capital_flow = self._safe_fetch("get_capital_flow", trace, code=ticker,
-                                        start_date=None, end_date=trade_date)
+                                 start_date=start_date, end_date=trade_date)
+        capital_flow = []
+        if include_capital_flow:
+            capital_flow = self._safe_fetch("get_capital_flow", trace, code=ticker,
+                                            start_date=start_date, end_date=trade_date)
         from .local_cache import get_cached_news
 
-        news = get_cached_news(ticker, trade_date=trade_date)
-        if news_keyword and not news:
-            logger.debug("No cached news for %s/%s; skipping online news during scan", ticker, trade_date)
+        news = []
+        if include_news:
+            if prefer_cached_news:
+                news = get_cached_news(ticker, trade_date=trade_date)
+            if not news:
+                news = self._safe_fetch(
+                    "get_news",
+                    trace,
+                    code=ticker,
+                    sector=sector_keyword,
+                    keyword=news_keyword,
+                    trade_date=trade_date,
+                )
+            if not news and not prefer_cached_news:
+                news = get_cached_news(ticker, trade_date=trade_date)
+            if news_keyword and not news:
+                logger.debug("No news for %s/%s during scan collection", ticker, trade_date)
+        if fetch_news_full_text and isinstance(news, list) and news:
+            news = enrich_news_full_text(news, source="scanner")
 
         return {
             "daily": daily if isinstance(daily, list) else [],
@@ -837,11 +880,103 @@ class MarketScanner:
             "news": news if isinstance(news, list) else [],
         }
 
+    def collect_data_agent_raw(
+        self,
+        request: Any,
+        route_trace: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        """Collect all raw inputs needed by DataAgent, owned by scan layer."""
+        trace: list[dict[str, Any]] = []
+        if route_trace is not None:
+            trace = route_trace
+
+        trade_date = request.normalized_trade_date()
+        end_date = request.normalized_end_date() or trade_date
+
+        shared: ScanSharedRaw = {}
+        if request.include_market:
+            market = self._safe_fetch(
+                "get_daily",
+                trace,
+                code="000001.SH",
+                start_date=request.start_date or end_date,
+                end_date=end_date,
+            )
+            shared["market"] = market if isinstance(market, list) else []
+            limit_up_summary = self._safe_fetch("get_limit_up_tiers", trace, trade_date=trade_date)
+            dragon_tiger = self._safe_fetch("get_dragon_tiger", trace, trade_date=trade_date)
+            market_breadth = self._safe_fetch("get_market_breadth", trace, trade_date=trade_date)
+            shared["limit_up_summary"] = limit_up_summary if isinstance(limit_up_summary, dict) else {}
+            shared["dragon_tiger"] = dragon_tiger if isinstance(dragon_tiger, list) else []
+            shared["market_breadth"] = market_breadth if isinstance(market_breadth, dict) else {}
+        else:
+            shared["market"] = []
+            shared["limit_up_summary"] = {}
+            shared["dragon_tiger"] = []
+            shared["market_breadth"] = {}
+
+        if request.include_sector_context:
+            sector_context = self._safe_fetch(
+                "get_sector",
+                trace,
+                top_n=request.sector_top_n,
+                trade_date=trade_date,
+            )
+            shared["sector_context"] = sector_context if isinstance(sector_context, list) else []
+        else:
+            shared["sector_context"] = []
+
+        if request.include_risk:
+            st_status = self._safe_fetch("get_st_status", trace, trade_date=trade_date)
+            suspended = self._safe_fetch("get_suspended", trace, trade_date=trade_date)
+            delisting = self._safe_fetch("get_delisting", trace, trade_date=trade_date)
+            shared["risk"] = {
+                "st_status": self._risk_value("get_st_status", st_status, trace),
+                "suspended": self._risk_value("get_suspended", suspended, trace),
+                "delisting": self._risk_value("get_delisting", delisting, trace),
+            }
+        else:
+            shared["risk"] = {"st_status": [], "suspended": [], "delisting": []}
+
+        ticker_raw = self.collect_ticker_data(
+            request.ticker,
+            end_date,
+            request.news_keyword,
+            trace,
+            request.fetch_news_full_text,
+            start_date=request.start_date,
+            sector_keyword=request.sector_keyword,
+            include_capital_flow=request.include_capital_flow,
+            include_news=request.include_news,
+            prefer_cached_news=False,
+        )
+
+        return {
+            **shared,
+            **ticker_raw,
+            "route_trace": trace,
+        }
+
+    @staticmethod
+    def clean_data_agent_raw(raw_payload: dict[str, Any]) -> dict[str, Any]:
+        """Clean raw data for DataAgent; scan owns this stage."""
+        return clean_raw_payload(raw_payload, now_fn=lambda: datetime.now(timezone.utc).isoformat())
+
+    @staticmethod
+    def _risk_value(method: str, value: Any, route_trace: list[dict[str, Any]]) -> list[Any] | dict[str, Any]:
+        if isinstance(value, list):
+            for attempt in reversed(route_trace):
+                if attempt.get("method") == method and attempt.get("status") == "error":
+                    return {"error": attempt.get("error", "unknown"), "method": method}
+            return value
+        return value if isinstance(value, dict) else []
+
     def scan_and_collect(
         self,
         trade_date: str | None = None,
         top_n: int | None = None,
         news_keyword: str | None = None,
+        fetch_news_full_text: bool = True,
     ) -> ScanBundle:
         """Scan for hot stocks and collect raw data for top candidates in one pass.
 
@@ -869,7 +1004,7 @@ class MarketScanner:
         for r in results[:limit]:
             logger.info("Collecting data for %s %s", r.ticker, r.name)
             ticker_data[r.ticker] = self.collect_ticker_data(
-                r.ticker, td, news_keyword, route_trace,
+                r.ticker, td, news_keyword, route_trace, fetch_news_full_text,
             )
 
         return ScanBundle(
@@ -899,4 +1034,10 @@ class MarketScanner:
             return result
         except Exception as exc:
             logger.warning("Fetch %s failed: %s", method, exc)
+            if route_trace is not None:
+                route_trace.append({
+                    "method": method,
+                    "status": "error",
+                    "error": str(exc),
+                })
             return []

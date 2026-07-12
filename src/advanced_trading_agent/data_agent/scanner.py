@@ -15,12 +15,12 @@ DataAgent to re-fetch the same data later.
 from __future__ import annotations
 
 import logging
-import time
 from dataclasses import dataclass, field
 from datetime import date
-from typing import Any
+from typing import Any, TypedDict
 
-from .vendor_router import get_vendor_chain, route_to_vendor
+from ..core.vendor import timed_vendor_call
+from .vendor_router import route_to_vendor
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +52,16 @@ class ScanBundle:
     route_trace: list[dict[str, Any]] = field(default_factory=list)
 
 
+class _ScorerEntry(TypedDict):
+    """Internal accumulator for multi-channel scoring evidence."""
+    name: str
+    score: float
+    sectors: list[str]
+    sources: list[str]
+    board_count: int
+    reasons: list[str]
+
+
 class MarketScanner:
     """Discover trending stocks through multi-channel scanning.
 
@@ -70,7 +80,7 @@ class MarketScanner:
     def scan(self, trade_date: str | None = None) -> list[ScanResult]:
         """Run full market scan and return ranked results."""
         td = trade_date or date.today().isoformat()
-        scorer: dict[str, dict[str, Any]] = {}  # ticker -> accumulated evidence
+        scorer: dict[str, _ScorerEntry] = {}  # ticker -> accumulated evidence
         ctx: dict[str, Any] = {"trade_date": td}
 
         # Channel 1: Hot sectors → constituents (primary)
@@ -95,7 +105,7 @@ class MarketScanner:
     # Channel scanners
     # ------------------------------------------------------------------
 
-    def _scan_hot_sectors(self, td: str, scorer: dict[str, dict[str, Any]], ctx: dict[str, Any]) -> None:
+    def _scan_hot_sectors(self, td: str, scorer: dict[str, _ScorerEntry], ctx: dict[str, Any]) -> None:
         """Find top sectors and their constituent stocks."""
         try:
             sectors = route_to_vendor("get_sector", top_n=self.top_sectors * 2)
@@ -157,7 +167,7 @@ class MarketScanner:
                 info["sources"].append("cross_sector")
                 info["reasons"].append(f"出现在 {len(info['sectors'])} 个热点板块: {', '.join(info['sectors'][:3])}")
 
-    def _scan_limit_up(self, td: str, scorer: dict[str, dict[str, Any]], ctx: dict[str, Any]) -> None:
+    def _scan_limit_up(self, td: str, scorer: dict[str, _ScorerEntry], ctx: dict[str, Any]) -> None:
         """Score stocks in the limit-up pool."""
         try:
             data = route_to_vendor("get_limit_up_tiers", trade_date=td)
@@ -199,7 +209,7 @@ class MarketScanner:
             if board >= 2:
                 scorer[ticker]["reasons"].append(f"{board}连板涨停")
 
-    def _scan_northbound(self, td: str, scorer: dict[str, dict[str, Any]], ctx: dict[str, Any]) -> None:
+    def _scan_northbound(self, td: str, scorer: dict[str, _ScorerEntry], ctx: dict[str, Any]) -> None:
         """Score stocks with northbound net buying."""
         try:
             top10 = route_to_vendor("get_northbound_top10", trade_date=td)
@@ -235,7 +245,7 @@ class MarketScanner:
             if net_buy > 0:
                 scorer[ticker]["reasons"].append(f"北向净买入 {net_buy/1e8:.1f}亿")
 
-    def _scan_dragon_tiger(self, td: str, scorer: dict[str, dict[str, Any]]) -> None:
+    def _scan_dragon_tiger(self, td: str, scorer: dict[str, _ScorerEntry]) -> None:
         """Score stocks appearing on dragon-tiger list."""
         try:
             dt_list = route_to_vendor("get_dragon_tiger", trade_date=td)
@@ -270,7 +280,7 @@ class MarketScanner:
     # Ranking
     # ------------------------------------------------------------------
 
-    def _rank(self, scorer: dict[str, dict[str, Any]]) -> list[ScanResult]:
+    def _rank(self, scorer: dict[str, _ScorerEntry]) -> list[ScanResult]:
         results: list[ScanResult] = []
         for ticker, info in scorer.items():
             sectors = info.get("sectors", [])
@@ -684,20 +694,13 @@ class MarketScanner:
         **kwargs: Any,
     ) -> Any:
         """Call route_to_vendor with timing and error tracking."""
-        vendor_chain = get_vendor_chain(method)
         try:
-            start = time.perf_counter()
-            result = route_to_vendor(method, _route_trace=route_trace, **kwargs)
-            elapsed_ms = (time.perf_counter() - start) * 1000
+            result, elapsed_ms = timed_vendor_call(
+                method, route_trace=route_trace, **kwargs,
+            )
             record_count = len(result) if isinstance(result, list) else None
             logger.debug("Fetched %s in %.0fms (%d records)", method, elapsed_ms, record_count or 0)
             return result
         except Exception as exc:
             logger.warning("Fetch %s failed: %s", method, exc)
-            route_trace.append({
-                "method": method,
-                "vendor": vendor_chain[0] if vendor_chain else "unknown",
-                "status": "error",
-                "error": str(exc),
-            })
             return []

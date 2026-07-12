@@ -12,25 +12,27 @@ from __future__ import annotations
 import json
 import os
 import re
-import time
 from html import unescape
 from dataclasses import asdict, dataclass, field
-from datetime import date, datetime, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
 import numpy as np
 import pandas as pd
 import requests
-from pydantic import BaseModel, Field, field_validator
 
 from ..config import config
 from ..core.atomic_write import atomic_write_json, atomic_write_text
 from ..core.audit import audit_event, build_data_collection_summary
+from ..core.vendor import timed_vendor_call
 from .cleaner import DataCleaner
 from .factors import FactorCalculator
 from .manifest import DataManifest
 from .planner import DataAgentPlan, DataAgentPlanner
+from .request import DataAgentRequest
+from .scanner import ScanBundle
+from .stock_profile import StockProfile, StockProfileResolver
 from .vendor_router import get_vendor_chain, route_to_vendor
 
 
@@ -96,191 +98,6 @@ def _json_default(value: Any) -> Any:
     raise TypeError(f"Object of type {value.__class__.__name__} is not JSON serializable")
 
 
-class DataAgentRequest(BaseModel):
-    """Input boundary for a standalone data-agent run (Pydantic-validated)."""
-
-    ticker: str
-    trade_date: str | None = None
-    start_date: str | None = None
-    end_date: str | None = None
-    include_market: bool = True
-    include_capital_flow: bool = True
-    include_news: bool = True
-    include_factors: bool = True
-    include_risk: bool = True
-    include_sector_context: bool = True
-    news_keyword: str | None = None
-    sector_keyword: str | None = None
-    use_llm_news_filter: bool = True
-    fetch_news_full_text: bool = True
-    news_relevance_threshold: float = Field(default=0.5, ge=0.0, le=1.0)
-    use_react_planner: bool = False
-    output_dir: str | None = None
-    max_news_records: int = Field(default=20, ge=1, le=200)
-    max_return_records: int = Field(default=20, ge=1, le=200)
-    sector_top_n: int = Field(default=20, ge=1, le=100)
-
-    @field_validator("ticker")
-    @classmethod
-    def _validate_ticker(cls, v: str) -> str:
-        if not v:
-            return v
-        if not re.match(r"^\d{6}\.(SH|SZ|BJ)$", v, re.IGNORECASE):
-            raise ValueError(f"Invalid ticker format: {v!r}. Expected pattern: 000001.SZ")
-        return v.upper()
-
-    @field_validator("trade_date", "start_date", "end_date")
-    @classmethod
-    def _validate_date(cls, v: str | None) -> str | None:
-        if v is None:
-            return v
-        clean = v.replace("-", "")
-        if not re.match(r"^\d{8}$", clean):
-            raise ValueError(f"Invalid date format: {v!r}. Expected YYYY-MM-DD or YYYYMMDD")
-        return v
-
-    def normalized_trade_date(self) -> str:
-        return self.trade_date or date.today().isoformat()
-
-    def normalized_end_date(self) -> str | None:
-        if self.end_date:
-            return self.end_date
-        if self.trade_date:
-            return self.trade_date.replace("-", "")
-        return None
-
-
-@dataclass(frozen=True)
-class StockProfile:
-    """Resolved stock identity used to drive purposeful data collection."""
-
-    ticker: str
-    company_name: str | None = None
-    sector_keyword: str | None = None
-    sector_name: str | None = None
-    aliases: list[str] = field(default_factory=list)
-    source: str = "unknown"
-    confidence: float = 0.0
-
-
-class StockProfileResolver:
-    """Best-effort A-share profile resolver with deterministic local fallbacks."""
-
-    _STATIC_PROFILES: dict[str, StockProfile] = {
-        "000001.SZ": StockProfile(
-            ticker="000001.SZ",
-            company_name="平安银行",
-            sector_keyword="银行",
-            sector_name="银行",
-            aliases=["平安银行", "平安银行股份有限公司", "000001", "000001.SZ"],
-            source="built_in_a_share_profile",
-            confidence=0.95,
-        ),
-        "000001.SH": StockProfile(
-            ticker="000001.SH",
-            company_name="上证指数",
-            sector_keyword=None,
-            sector_name=None,
-            aliases=["上证指数", "上证综指", "000001", "000001.SH"],
-            source="built_in_a_share_profile",
-            confidence=0.95,
-        ),
-    }
-
-    _SECTOR_HINTS: tuple[tuple[tuple[str, ...], str], ...] = (
-        (("银行",), "银行"),
-        (("证券", "券商"), "证券"),
-        (("保险",), "保险"),
-        (("煤炭",), "煤炭"),
-        (("钢铁",), "钢铁"),
-        (("医药", "生物"), "医药"),
-        (("电力",), "电力"),
-        (("汽车",), "汽车"),
-        (("地产", "房地产"), "房地产"),
-        (("白酒", "酒"), "酿酒"),
-    )
-
-    def resolve(self, ticker: str) -> StockProfile:
-        normalized = self._normalize_ticker(ticker)
-        if normalized in self._STATIC_PROFILES:
-            return self._STATIC_PROFILES[normalized]
-        akshare_profile = self._resolve_from_akshare(normalized)
-        if akshare_profile.company_name:
-            return akshare_profile
-        return StockProfile(
-            ticker=normalized or ticker,
-            aliases=[item for item in {ticker, normalized, self._ticker_digits(normalized)} if item],
-            source="ticker_only",
-            confidence=0.2,
-        )
-
-    @classmethod
-    def _resolve_from_akshare(cls, ticker: str) -> StockProfile:
-        code = cls._ticker_digits(ticker)
-        if not code:
-            return StockProfile(ticker=ticker, source="akshare_code_name_unavailable", confidence=0.0)
-        try:
-            import akshare as ak
-
-            frame = ak.stock_info_a_code_name()
-        except Exception:
-            return StockProfile(ticker=ticker, source="akshare_code_name_unavailable", confidence=0.0)
-        if not isinstance(frame, pd.DataFrame) or frame.empty:
-            return StockProfile(ticker=ticker, source="akshare_code_name_empty", confidence=0.0)
-
-        code_column = cls._first_existing_column(frame, ("code", "代码", "证券代码"))
-        name_column = cls._first_existing_column(frame, ("name", "名称", "证券简称"))
-        if not code_column or not name_column:
-            return StockProfile(ticker=ticker, source="akshare_code_name_schema_mismatch", confidence=0.0)
-
-        matched = frame[frame[code_column].astype(str).str.zfill(6) == code]
-        if matched.empty:
-            return StockProfile(ticker=ticker, source="akshare_code_name_not_found", confidence=0.0)
-
-        company_name = str(matched.iloc[0][name_column]).strip() or None
-        sector_keyword = cls._infer_sector_keyword(company_name)
-        aliases = [item for item in {company_name, ticker, code} if item]
-        return StockProfile(
-            ticker=ticker,
-            company_name=company_name,
-            sector_keyword=sector_keyword,
-            sector_name=sector_keyword,
-            aliases=aliases,
-            source="akshare_code_name",
-            confidence=0.75 if company_name else 0.0,
-        )
-
-    @classmethod
-    def _infer_sector_keyword(cls, company_name: str | None) -> str | None:
-        text = str(company_name or "")
-        for needles, sector in cls._SECTOR_HINTS:
-            if any(needle in text for needle in needles):
-                return sector
-        return None
-
-    @staticmethod
-    def _first_existing_column(frame: pd.DataFrame, candidates: tuple[str, ...]) -> str | None:
-        for column in candidates:
-            if column in frame.columns:
-                return column
-        return None
-
-    @staticmethod
-    def _normalize_ticker(ticker: str) -> str:
-        value = str(ticker or "").strip().upper()
-        if not value:
-            return value
-        match = re.match(r"^(SZ|SH)(\d{6})$", value)
-        if match:
-            return f"{match.group(2)}.{match.group(1)}"
-        return value
-
-    @staticmethod
-    def _ticker_digits(ticker: str) -> str:
-        match = re.search(r"(\d{6})", str(ticker or ""))
-        return match.group(1) if match else ""
-
-
 @dataclass
 class DataAgentArtifact:
     """One persisted step in the data-agent trace."""
@@ -328,6 +145,50 @@ class DataAgent:
         self._planner = planner or DataAgentPlanner()
         self._llm_client = llm_client
         self._profile_resolver = profile_resolver or StockProfileResolver()
+
+    @classmethod
+    def from_bundle(
+        cls,
+        bundle: ScanBundle,
+        ticker: str,
+        trade_date: str | None = None,
+        *,
+        news_keyword: str | None = None,
+        sector_keyword: str | None = None,
+        results_dir: str | None = None,
+        llm_client: Any | None = None,
+        **request_kwargs: Any,
+    ) -> DataAgentRun:
+        """Run the full data pipeline for one ticker from a pre-collected *bundle*.
+
+        Uses shared data (market index, sector context, risk lists) and
+        per-ticker data (daily OHLCV, capital flow, news) already fetched
+        by ``MarketScanner.scan_and_collect()``, eliminating redundant vendor calls.
+
+        Example::
+
+            bundle = MarketScanner().scan_and_collect()
+            run = DataAgent.from_bundle(bundle, "000001.SZ")
+        """
+        ticker_raw = bundle.ticker_data.get(ticker, {})
+        raw_data: dict[str, Any] = {
+            **bundle.shared_raw,
+            **ticker_raw,
+            "route_trace": list(bundle.route_trace),
+        }
+
+        effective_trade_date = trade_date or bundle.trade_date
+        request = DataAgentRequest(
+            ticker=ticker,
+            trade_date=effective_trade_date,
+            use_react_planner=False,
+            news_keyword=news_keyword,
+            sector_keyword=sector_keyword,
+            **request_kwargs,
+        )
+
+        agent = cls(results_dir=results_dir, llm_client=llm_client)
+        return agent.run(request, raw_data=raw_data)
 
     def run(self, request: DataAgentRequest, raw_data: dict[str, Any] | None = None) -> DataAgentRun:
         # Ensure the free vendor adapters are available when DataAgent is used standalone.
@@ -679,20 +540,12 @@ class DataAgent:
     ) -> Any:
         vendor_chain = get_vendor_chain(method)
         try:
-            route_kwargs = dict(kwargs)
-            if route_trace is not None and self._route_fn is route_to_vendor:
-                route_kwargs["_route_trace"] = route_trace
-            start = time.perf_counter()
-            result = self._route_fn(method, **route_kwargs)
-            elapsed_ms = (time.perf_counter() - start) * 1000
-            if route_trace is not None and self._route_fn is not route_to_vendor:
-                route_trace.append({
-                    "method": method,
-                    "vendor": "custom_route_fn",
-                    "status": "success",
-                    "elapsed_ms": round(elapsed_ms, 3),
-                    "record_count": len(result) if isinstance(result, list) else None,
-                })
+            result, _elapsed_ms = timed_vendor_call(
+                method,
+                route_trace=route_trace,
+                route_fn=self._route_fn,
+                **kwargs,
+            )
             is_no_data = isinstance(result, str) and result.startswith("NO_DATA_AVAILABLE")
             count = len(result) if isinstance(result, list) else None
             manifest.add_field(
@@ -706,13 +559,6 @@ class DataAgent:
             )
             return result
         except Exception as exc:
-            if route_trace is not None and self._route_fn is not route_to_vendor:
-                route_trace.append({
-                    "method": method,
-                    "vendor": "custom_route_fn",
-                    "status": "error",
-                    "error": str(exc),
-                })
             manifest.add_field(
                 field_name,
                 available=False,

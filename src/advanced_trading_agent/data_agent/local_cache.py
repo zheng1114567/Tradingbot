@@ -20,6 +20,7 @@ import pandas as pd
 
 from ..config import config
 from ..core.atomic_write import atomic_write_text
+from .cache_manifest import CacheManifest
 
 logger = logging.getLogger(__name__)
 
@@ -71,18 +72,195 @@ class LocalCache:
     def ensure_daily_data(
         self, ticker: str, start_date: str | None = None, end_date: str | None = None,
     ) -> list[dict[str, Any]]:
-        """Get daily OHLCV data from local cache, downloading if needed."""
-        td = end_date or date.today().isoformat()
+        """Get daily OHLCV data, incrementally repairing local parquet gaps.
+
+        The local cache is still preferred. If the requested date range is not
+        covered, only that requested range is fetched from BaoStock and merged
+        into the existing parquet file. When online repair fails, existing
+        cached rows are returned with ``_cache_status=stale_cache_used``.
+        """
+        end = _normalize_date(end_date or date.today().isoformat())
+        start = _normalize_date(start_date or (date.fromisoformat(end) - timedelta(days=self.days_back)).isoformat())
         cache_path = self.cache_dir / "daily" / f"{ticker.replace('.', '_')}.parquet"
+        manifest = CacheManifest(self.cache_dir)
 
+        existing = pd.DataFrame()
         if cache_path.exists():
-            df = pd.read_parquet(cache_path)
-            if "trade_date" in df.columns:
-                df["trade_date"] = pd.to_datetime(df["trade_date"])
-            return df.to_dict("records")
+            existing = self._read_daily_cache(cache_path)
+            if self._covers_range(existing, start, end):
+                self._update_daily_manifest(manifest, ticker, cache_path, existing, status="cache_hit")
+                return self._records_with_cache_status(
+                    self._filter_daily_frame(existing, start, end),
+                    "cache_hit",
+                )
 
-        # For now, return empty — full download requires iteration
-        return []
+        try:
+            fetched = self._fetch_daily_baostock(ticker, start, end)
+        except Exception as exc:
+            logger.warning("Daily cache repair failed for %s: %s", ticker, exc)
+            if not existing.empty:
+                self._update_daily_manifest(
+                    manifest,
+                    ticker,
+                    cache_path,
+                    existing,
+                    status="stale_cache_used",
+                    notes=[str(exc)],
+                )
+                return self._records_with_cache_status(
+                    self._filter_daily_frame(existing, start, end),
+                    "stale_cache_used",
+                )
+            return []
+
+        if fetched.empty:
+            if not existing.empty:
+                self._update_daily_manifest(
+                    manifest,
+                    ticker,
+                    cache_path,
+                    existing,
+                    status="cache_partial",
+                    notes=["vendor_fetch_returned_empty"],
+                )
+                return self._records_with_cache_status(
+                    self._filter_daily_frame(existing, start, end),
+                    "cache_partial",
+                )
+            return []
+
+        merged = self._merge_daily_frames(existing, fetched)
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        merged.to_parquet(cache_path, index=False)
+        self._update_daily_manifest(manifest, ticker, cache_path, merged, status="vendor_fetch")
+        return self._records_with_cache_status(
+            self._filter_daily_frame(merged, start, end),
+            "vendor_fetch",
+        )
+
+    def _read_daily_cache(self, cache_path: Path) -> pd.DataFrame:
+        df = pd.read_parquet(cache_path)
+        date_col = _daily_date_column(df)
+        if date_col:
+            df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
+        return df
+
+    def _fetch_daily_baostock(self, ticker: str, start_date: str, end_date: str) -> pd.DataFrame:
+        try:
+            import baostock as bs
+        except ImportError as exc:
+            raise RuntimeError("baostock not installed") from exc
+
+        login_result = bs.login()
+        if getattr(login_result, "error_code", "0") != "0":
+            raise RuntimeError(getattr(login_result, "error_msg", "baostock login failed"))
+        try:
+            rs = bs.query_history_k_data_plus(
+                self._to_baostock_code(ticker),
+                "date,code,open,high,low,close,preclose,volume,amount,pctChg,turn",
+                start_date=start_date,
+                end_date=end_date,
+                frequency="d",
+                adjustflag="2",
+            )
+            rows: list[dict[str, Any]] = []
+            while getattr(rs, "error_code", "0") == "0" and rs.next():
+                row = dict(zip(rs.fields, rs.get_row_data()))
+                row["data_source"] = "baostock"
+                row["code"] = ticker
+                rows.append(row)
+            return pd.DataFrame(rows)
+        finally:
+            try:
+                bs.logout()
+            except Exception:
+                pass
+
+    def _merge_daily_frames(self, existing: pd.DataFrame, fetched: pd.DataFrame) -> pd.DataFrame:
+        frames = [df for df in (existing, fetched) if df is not None and not df.empty]
+        if not frames:
+            return pd.DataFrame()
+        merged = pd.concat(frames, ignore_index=True, sort=False)
+        date_col = _daily_date_column(merged)
+        if date_col:
+            merged[date_col] = pd.to_datetime(merged[date_col], errors="coerce")
+            dedupe_cols = [date_col]
+            if "code" in merged.columns:
+                dedupe_cols.insert(0, "code")
+            merged = merged.dropna(subset=[date_col]).drop_duplicates(subset=dedupe_cols, keep="last")
+            merged = merged.sort_values(date_col)
+        return merged
+
+    def _filter_daily_frame(self, df: pd.DataFrame, start_date: str, end_date: str) -> pd.DataFrame:
+        if df.empty:
+            return df
+        frame = df.copy()
+        date_col = _daily_date_column(frame)
+        if not date_col:
+            return frame
+        frame[date_col] = pd.to_datetime(frame[date_col], errors="coerce")
+        dates = frame[date_col].dt.date
+        start = pd.to_datetime(start_date).date()
+        end = pd.to_datetime(end_date).date()
+        return frame[(dates >= start) & (dates <= end)]
+
+    def _covers_range(self, df: pd.DataFrame, start_date: str, end_date: str) -> bool:
+        bounds = self._daily_bounds(df)
+        if not bounds:
+            return False
+        observed_start, observed_end = bounds
+        return observed_start <= pd.to_datetime(start_date).date() and observed_end >= pd.to_datetime(end_date).date()
+
+    def _daily_bounds(self, df: pd.DataFrame) -> tuple[date, date] | None:
+        if df.empty:
+            return None
+        date_col = _daily_date_column(df)
+        if not date_col:
+            return None
+        dates = pd.to_datetime(df[date_col], errors="coerce").dropna().dt.date
+        if dates.empty:
+            return None
+        return dates.min(), dates.max()
+
+    def _update_daily_manifest(
+        self,
+        manifest: CacheManifest,
+        ticker: str,
+        cache_path: Path,
+        df: pd.DataFrame,
+        *,
+        status: str,
+        notes: list[str] | None = None,
+    ) -> None:
+        bounds = self._daily_bounds(df)
+        source = self._source_from_frame(df)
+        manifest.update_daily(
+            ticker=ticker,
+            path=cache_path,
+            start_date=str(bounds[0]) if bounds else None,
+            end_date=str(bounds[1]) if bounds else None,
+            source=source,
+            row_count=int(len(df)),
+            status=status,
+            notes=notes,
+        )
+
+    @staticmethod
+    def _source_from_frame(df: pd.DataFrame) -> str:
+        if "data_source" not in df.columns:
+            return "local_cache"
+        sources = sorted({str(value) for value in df["data_source"].dropna().unique() if str(value)})
+        return ",".join(sources) if sources else "local_cache"
+
+    @staticmethod
+    def _records_with_cache_status(df: pd.DataFrame, status: str) -> list[dict[str, Any]]:
+        if df.empty:
+            return []
+        records = df.to_dict("records")
+        for record in records:
+            record.setdefault("data_source", "local_cache")
+            record["_cache_status"] = status
+        return records
 
     def build_full_cache(self, trade_date: str | None = None) -> str:
         """Build complete local cache: industry index + sector rankings.
@@ -345,26 +523,12 @@ def get_cached_sector_constituents(
 
 def get_cached_daily(ticker: str, start_date: str | None = None,
                      end_date: str | None = None) -> list[dict[str, Any]]:
-    """Convenience: get daily data from local parquet cache."""
+    """Convenience: get daily data from local parquet cache.
+
+    Uses ``LocalCache.ensure_daily_data`` so callers get incremental cache
+    repair and manifest updates instead of a raw parquet read.
+    """
     cache = LocalCache()
-    cache_path = cache.cache_dir / "daily" / f"{ticker.replace('.', '_')}.parquet"
-    if cache_path.exists():
-        df = pd.read_parquet(cache_path)
-        if "trade_date" in df.columns:
-            df["trade_date"] = pd.to_datetime(df["trade_date"])
-        if start_date or end_date:
-            date_col = _daily_date_column(df)
-            if date_col:
-                df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
-                date_values = df[date_col].dt.date
-                if start_date:
-                    start = pd.to_datetime(_normalize_date(start_date)).date()
-                    df = df[date_values >= start]
-                    date_values = df[date_col].dt.date
-                if end_date:
-                    end = pd.to_datetime(_normalize_date(end_date)).date()
-                    df = df[date_values <= end]
-        return df.to_dict("records")
     return cache.ensure_daily_data(ticker, start_date, end_date)
 
 

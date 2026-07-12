@@ -2,7 +2,9 @@
 数据 Service 初始化
 """
 from .cleaner import DataCleaner
+from .cache_manifest import CacheManifest, CacheManifestEntry
 from .data_agent import DataAgent, DataAgentRequest, DataAgentRun, run_data_agent
+from .data_health import build_daily_health_report
 from .factors import FactorCalculator
 from .manifest import DataFieldStatus, DataManifest
 from .planner import DataAgentPlan, DataAgentPlanner
@@ -11,6 +13,8 @@ from .vendor_router import DataVendor, route_to_vendor
 
 __all__ = [
     "DataCleaner",
+    "CacheManifest",
+    "CacheManifestEntry",
     "DataAgent",
     "DataAgentPlan",
     "DataAgentPlanner",
@@ -19,6 +23,7 @@ __all__ = [
     "DataFieldStatus",
     "DataManifest",
     "FactorCalculator",
+    "build_daily_health_report",
     "DataVendor",
     "ShortTermSignalEngine",
     "ShortTermSignal",

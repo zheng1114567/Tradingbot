@@ -28,6 +28,8 @@ from ..core.atomic_write import atomic_write_json, atomic_write_text
 from ..core.audit import audit_event, build_data_collection_summary
 from ..core.vendor import timed_vendor_call
 from .cleaner import DataCleaner
+from .cache_manifest import CacheManifest
+from .data_health import build_daily_health_report
 from .factors import FactorCalculator
 from .manifest import DataManifest
 from .planner import DataAgentPlan, DataAgentPlanner
@@ -729,7 +731,13 @@ class DataAgent:
             "daily_consistency": self._build_daily_consistency_report(
                 daily_records,
                 route_trace or [],
-            )
+            ),
+            "daily_health": build_daily_health_report(
+                daily_records,
+                start_date=request.start_date,
+                end_date=request.normalized_end_date(),
+                cache_entry=self._daily_cache_manifest_entry(request.ticker),
+            ),
         }
         risk_summary = self._summarize_risk(
             cleaned_payload.get("risk", {}),
@@ -1187,6 +1195,17 @@ class DataAgent:
             for attempt in route_trace
             if attempt.get("method") == method and attempt.get("status") == "success"
         )
+
+    @staticmethod
+    def _daily_cache_manifest_entry(ticker: str) -> dict[str, Any]:
+        try:
+            from .local_cache import LocalCache
+
+            manifest = CacheManifest(LocalCache().cache_dir)
+            entry = manifest.get_daily(ticker)
+            return asdict(entry) if entry is not None else {}
+        except Exception:
+            return {}
 
     @classmethod
     def _clean_news(cls, records: list[dict[str, Any]]) -> list[dict[str, Any]]:

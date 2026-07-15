@@ -132,8 +132,8 @@ class Config:
             ),
             # LLM
             "llm_provider": "deepseek",
-            "deep_think_llm": "deepseek-v4-flash",
-            "quick_think_llm": "deepseek-v4-flash",
+            "deep_think_llm": "deepseek-chat",
+            "quick_think_llm": "deepseek-chat",
             "temperature": 0.1,
             # 运行时
             "max_debate_rounds": 2,

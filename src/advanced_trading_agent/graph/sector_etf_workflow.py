@@ -7,6 +7,7 @@ store conversation memory, then render an auditable report.
 
 from __future__ import annotations
 
+import time
 from datetime import date
 from typing import Any, Callable, TypedDict
 
@@ -39,6 +40,7 @@ class SectorETFState(TypedDict, total=False):
     sector_evidence: dict[str, Any]
     roundtable_result: dict[str, Any]
     final_report: str
+    timings: dict[str, float]
     errors: list[str]
 
 
@@ -52,6 +54,7 @@ class SectorETFWatchlistState(TypedDict, total=False):
     selection: dict[str, Any]
     watchlist_report: dict[str, Any]
     final_report: str
+    timings: dict[str, float]
     errors: list[str]
 
 
@@ -217,14 +220,20 @@ def create_sector_etf_watchlist_workflow(
     memory_store = memory_store or ConversationMemoryStore()
 
     def select_batch_node(state: SectorETFWatchlistState) -> dict[str, Any]:
+        started = time.perf_counter()
         trade_date = state.get("trade_date") or date.today().isoformat()
         selection = selector.select_with_exclusions(
             trade_date,
             max_roundtable_sectors=state.get("max_roundtable_sectors", limits.max_roundtable_sectors),
         )
-        return {"selection": selection.to_dict()}
+        timings = dict(state.get("timings", {}) or {})
+        timings["select_and_process_seconds"] = round(time.perf_counter() - started, 3)
+        selection_payload = selection.to_dict()
+        selection_payload["timings"] = timings
+        return {"selection": selection_payload, "timings": timings}
 
     def roundtable_json_node(state: SectorETFWatchlistState) -> dict[str, Any]:
+        started = time.perf_counter()
         selection_raw = state.get("selection", {}) or {}
         from ..data_agent.etf_watchlist import ExcludedSectorCandidate, SectorCandidatePayload
 
@@ -244,7 +253,12 @@ def create_sector_etf_watchlist_workflow(
             excluded=excluded,
             limits=limits,
         )
-        return {"watchlist_report": report.model_dump(mode="json")}
+        timings = dict(selection_raw.get("timings", {}) or state.get("timings", {}) or {})
+        timings["fast_roundtable_seconds"] = round(time.perf_counter() - started, 3)
+        timings["total_pre_render_seconds"] = round(sum(timings.values()), 3)
+        payload = report.model_dump(mode="json")
+        payload["roundtable_summary"]["timings"] = timings
+        return {"watchlist_report": payload, "timings": timings}
 
     def store_memory_node(state: SectorETFWatchlistState) -> dict[str, Any]:
         if not state.get("store_memory", True):
@@ -316,6 +330,7 @@ class SectorETFWatchlistSystem:
             "trade_date": td,
             "max_roundtable_sectors": max_roundtable_sectors or self.limits.max_roundtable_sectors,
             "store_memory": store_memory,
+            "timings": {},
             "errors": [],
         }
         final_state = self.workflow.invoke(init_state)

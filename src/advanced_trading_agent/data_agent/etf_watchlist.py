@@ -22,8 +22,9 @@ class ETFWatchlistLimits(BaseModel):
     """Portfolio and report limits for the ETF observation pool."""
 
     max_roundtable_sectors: int = 8
+    max_final_decisions: int = 3
     max_final_etfs_per_sector: int = 3
-    max_active_sectors: int = 4
+    max_active_sectors: int = 3
     max_total_active_weight: float = 0.60
     max_single_sector_weight: float = 0.15
     default_active_weight: float = 0.10
@@ -113,6 +114,17 @@ class DailyETFWatchlistReport(BaseModel):
     })
 
 
+class RoundtableAgentOutput(BaseModel):
+    """One fast roundtable participant's structured opinion."""
+
+    agent: Literal["Market", "Event", "Analysis", "Risk"]
+    sector: str
+    stance: Literal["support", "caution", "block"]
+    summary: str
+    evidence: list[str] = Field(default_factory=list)
+    objections: list[str] = Field(default_factory=list)
+
+
 def build_watchlist_report(
     *,
     trade_date: str,
@@ -128,9 +140,14 @@ def build_watchlist_report(
     and weight hints, without requiring live LLM/AutoGen calls in tests.
     """
     limits = limits or ETFWatchlistLimits()
+    roundtable_outputs = [
+        output
+        for candidate in candidates[: limits.max_roundtable_sectors]
+        for output in _fast_roundtable_outputs(candidate)
+    ]
     decisions = [_decision_from_candidate(c, limits) for c in candidates[: limits.max_roundtable_sectors]]
     decisions.sort(key=lambda item: item.roundtable_score, reverse=True)
-    decisions = _enforce_active_limits(decisions, limits)
+    decisions = _enforce_active_limits(decisions[: limits.max_final_decisions], limits)
     return DailyETFWatchlistReport(
         trade_date=trade_date,
         run_id=f"etf_watchlist_{trade_date}_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
@@ -140,14 +157,20 @@ def build_watchlist_report(
         data_quality={
             "candidate_count": len(candidates),
             "excluded_count": len(excluded),
+            "final_decision_count": len(decisions),
             "all_final_decisions_have_primary_etf": all(bool(d.primary_etf.code) for d in decisions),
         },
         roundtable_summary={
             "provider": provider,
+            "mode": "fast_json_roundtable",
+            "backtest_used": False,
+            "agent_outputs": [output.model_dump(mode="json") for output in roundtable_outputs],
             "input_sector_count": len(candidates),
+            "roundtable_candidate_count": min(len(candidates), limits.max_roundtable_sectors),
             "decision_count": len(decisions),
+            "max_final_decisions": limits.max_final_decisions,
             "max_active_sectors": limits.max_active_sectors,
-            "note": "Deterministic JSON fallback; AutoGen can replace this adapter without changing the report contract.",
+            "note": "Cache-first fast roundtable; no backtest and no long-running LLM calls on the default path.",
         },
     )
 
@@ -179,6 +202,13 @@ def render_watchlist_markdown(report: DailyETFWatchlistReport) -> str:
             "",
             "**支持理由**:",
             *[f"- {reason}" for reason in decision.support_reasons],
+            "",
+            "**圆桌输出**:",
+            *[
+                f"- {item.get('agent')}: {item.get('stance')} - {item.get('summary')}"
+                for item in report.roundtable_summary.get("agent_outputs", [])
+                if item.get("sector") == decision.sector
+            ],
             "",
             "**反对理由**:",
             *[f"- {reason}" for reason in (decision.objections or ["暂无重大反对意见"])],
@@ -257,6 +287,58 @@ def _decision_from_candidate(
         confidence=confidence,
         roundtable_score=round(score, 2),
     )
+
+
+def _fast_roundtable_outputs(candidate: SectorCandidatePayload) -> list[RoundtableAgentOutput]:
+    """Produce fast deterministic agent opinions from collected/processed data."""
+    best_etf = max(candidate.raw_etf_candidates, key=lambda item: item.total_score)
+    market_stance: Literal["support", "caution", "block"] = (
+        "support" if candidate.momentum_score >= 5 and candidate.breadth_score >= 1 else "caution"
+    )
+    event_stance: Literal["support", "caution", "block"] = (
+        "support" if candidate.event_score >= 2 else "caution"
+    )
+    analysis_stance: Literal["support", "caution", "block"] = (
+        "support" if best_etf.total_score >= 7 and best_etf.tradable else "block"
+    )
+    risk_stance: Literal["support", "caution", "block"] = (
+        "block" if candidate.risk_flags and any("未匹配" in item or "流动性" in item for item in candidate.risk_flags)
+        else "caution" if candidate.risk_flags
+        else "support"
+    )
+    return [
+        RoundtableAgentOutput(
+            agent="Market",
+            sector=candidate.sector_name,
+            stance=market_stance,
+            summary=f"板块动量 {candidate.momentum_score:.1f}，宽度 {candidate.breadth_score:.1f}",
+            evidence=candidate.evidence.get("momentum", []) + candidate.evidence.get("breadth", []),
+        ),
+        RoundtableAgentOutput(
+            agent="Event",
+            sector=candidate.sector_name,
+            stance=event_stance,
+            summary=f"事件/新闻评分 {candidate.event_score:.1f}",
+            evidence=candidate.evidence.get("events", []),
+            objections=[] if event_stance == "support" else ["事件催化不足，状态不应仅靠动量上调"],
+        ),
+        RoundtableAgentOutput(
+            agent="Analysis",
+            sector=candidate.sector_name,
+            stance=analysis_stance,
+            summary=f"ETF 候选 {len(candidate.raw_etf_candidates)} 个，首选候选综合分 {best_etf.total_score:.1f}",
+            evidence=[best_etf.reason],
+            objections=best_etf.blocked_reasons,
+        ),
+        RoundtableAgentOutput(
+            agent="Risk",
+            sector=candidate.sector_name,
+            stance=risk_stance,
+            summary="默认不使用回测；只检查 ETF 可交易性、流动性和组合上限",
+            evidence=[f"primary_candidate={best_etf.code}", f"liquidity_score={best_etf.liquidity_score:.1f}"],
+            objections=candidate.risk_flags,
+        ),
+    ]
 
 
 def _support_reasons(candidate: SectorCandidatePayload, primary: WatchlistETFCandidate) -> list[str]:

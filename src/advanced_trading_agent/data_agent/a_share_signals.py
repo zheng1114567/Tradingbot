@@ -205,47 +205,9 @@ class AShareSignalBuilder:
 
     @classmethod
     def _build_policy(cls, tier2: dict[str, Any]) -> dict[str, Any]:
-        """Scan news events for policy-related keywords."""
-        events = tier2.get("events", [])
-        if not isinstance(events, list):
-            events = []
-
-        matched: list[dict[str, Any]] = []
-        for ev in events:
-            if not isinstance(ev, dict):
-                continue
-            text = f"{ev.get('summary', '')} {ev.get('evidence_text', '')}"
-            for kw in cls._POLICY_KEYWORDS:
-                if kw in text:
-                    matched.append({
-                        "keyword": kw,
-                        "summary": str(ev.get("summary", ""))[:120],
-                        "direction": ev.get("direction", "neutral"),
-                    })
-                    break
-
-        if not matched:
-            return {
-                "signal": "absent",
-                "strength": 0.0,
-                "policy_level": "none",
-                "matched_events": [],
-                "evidence": ["未发现明确的政策事件信号"],
-                "data_status": "available",
-            }
-
-        # Score: each match adds 20, capped at 80
-        strength = min(len(matched) * 20.0, 80.0)
-        level = "high" if strength >= 60 else "medium" if strength >= 30 else "low"
-
-        return {
-            "signal": "confirmed" if strength >= 30 else "weak",
-            "strength": strength,
-            "policy_level": level,
-            "matched_events": matched[:5],
-            "evidence": [f"匹配 {len(matched)} 条政策关键词: {', '.join(m['keyword'] for m in matched[:5])}"],
-            "data_status": "available",
-        }
+        """Policy signal remains a safe placeholder in Phase 0.5."""
+        del tier2
+        return _insufficient("policy", "政策信号暂未接入结构化数据源")
 
     # ── Unlock (限售解禁) ──────────────────────────────────────────
 

@@ -73,7 +73,7 @@ python -m advanced_trading_agent.main --sector-etf-scan --date 2026-07-15 --scan
 python -m advanced_trading_agent.main --sector-etf-scan --sector 半导体 --date 2026-07-15
 ```
 
-生成每日板块 ETF 观察池（最多 8 个板块进入 JSON 圆桌；每个板块最终只保留 1 个首选 ETF + 2 个备选 ETF）:
+生成每日板块 ETF 观察池（最多 8 个板块进入 JSON 圆桌；最终报告只保留 Top 3 个板块决策，每个板块落到 1 个首选 ETF + 最多 2 个备选 ETF）:
 
 ```bash
 python -m advanced_trading_agent.main --sector-etf-analyze --date 2026-07-15

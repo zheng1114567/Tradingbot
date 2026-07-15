@@ -52,6 +52,7 @@ _PATH_KEYS = frozenset({
     "data_cache_dir",
     "memory_log_path",
     "memory_index_path",
+    "conversation_memory_path",
     "strategy_audit_queue_path",
 })
 
@@ -121,14 +122,18 @@ class Config:
             "data_cache_dir": os.getenv("ATA_DATA_CACHE_DIR", str(_ATA_HOME / "cache")),
             "memory_log_path": os.getenv("ATA_MEMORY_LOG_PATH", str(_ATA_HOME / "memory" / "trading_memory.md")),
             "memory_index_path": os.getenv("ATA_MEMORY_INDEX_PATH", str(_ATA_HOME / "memory" / "trading_memory.jsonl")),
+            "conversation_memory_path": os.getenv(
+                "ATA_CONVERSATION_MEMORY_PATH",
+                str(_ATA_HOME / "memory" / "conversation_memory.jsonl"),
+            ),
             "strategy_audit_queue_path": os.getenv(
                 "ATA_STRATEGY_AUDIT_QUEUE_PATH",
                 str(_ATA_HOME / "memory" / "strategy_audit_queue.jsonl"),
             ),
             # LLM
             "llm_provider": "deepseek",
-            "deep_think_llm": "deepseek-chat",
-            "quick_think_llm": "deepseek-chat",
+            "deep_think_llm": "deepseek-v4-flash",
+            "quick_think_llm": "deepseek-v4-flash",
             "temperature": 0.1,
             # 运行时
             "max_debate_rounds": 2,
@@ -136,11 +141,12 @@ class Config:
             "output_language": "Chinese",
             # 数据
             "data_vendors": {
-                "market_data": "local_cache,mootdx,baostock",  # 本地缓存优先，在线源只做补缺
+                "market_data": "local_cache,akshare,mootdx,baostock",  # 本地缓存优先，akshare 作为显式在线源
                 "fundamental_data": "local_cache,baostock",  # 季度财务快照，命中缓存优先
-                "news_data": "local_cache,sina,cls",
+                "news_data": "local_cache,eastmoney_global,akshare,eastmoney,sina,cls",  # 支持板块关键词与个股新闻 fallback
                 "capital_flow": "local_cache",
-                "a_share_specific": "local_cache,efinance,eastmoney",
+                "a_share_specific": "local_cache,akshare,efinance,eastmoney",
+                "etf_data": "local_cache,akshare,sina,eastmoney",
                 "analysis": "baostock",
                 "risk_data": "local_cache,baostock",
             },

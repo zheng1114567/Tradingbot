@@ -23,6 +23,9 @@ _AGENT_TO_KEY = {
     "Event": "event",
     "Analysis": "analysis",
     "Backtest": "backtest",
+    "HotMoney": "hot_money",
+    "Policy": "policy",
+    "Unlock": "unlock",
 }
 
 
@@ -54,7 +57,7 @@ class AutoGenRoundtable:
     ):
         cfg = config.get_all()
         self.provider = provider or cfg.get("llm_provider", "deepseek")
-        self.model = model or cfg.get("deep_think_llm", "deepseek-chat")
+        self.model = model or cfg.get("deep_think_llm", "deepseek-v4-flash")
         self.harness = harness or RoundtableHarness()
 
     def run(self, state: dict[str, Any]) -> RoundtableResult:
@@ -71,6 +74,12 @@ class AutoGenRoundtable:
         from autogen_core.tools import FunctionTool
         from autogen_ext.models.openai import OpenAIChatCompletionClient
 
+        # The project root logger runs at INFO for auditability. AutoGen emits
+        # very large internal event payloads at INFO, which can drown CLI output.
+        logging.getLogger("autogen_core").setLevel(logging.WARNING)
+        logging.getLogger("autogen_core.events").setLevel(logging.WARNING)
+        logging.getLogger("autogen_agentchat").setLevel(logging.WARNING)
+
         round2 = state.get("round2_state", {})
         contradiction_records = list(round2.get("contradiction_records", []))
         contradictions = [
@@ -84,7 +93,7 @@ class AutoGenRoundtable:
         model_client = self._create_model_client(OpenAIChatCompletionClient)
         try:
             agents = []
-            for agent_name in _AGENT_ORDER:
+            for agent_name in context.agent_order:
                 agent_context = context.agent_contexts[agent_name]
                 tools = self._build_autogen_tools(
                     agent_key=_AGENT_TO_KEY[agent_name],

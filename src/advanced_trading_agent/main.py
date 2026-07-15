@@ -12,9 +12,9 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import sys
-from datetime import date, datetime
+from datetime import date
 from pathlib import Path
+from typing import Any
 
 import pandas as pd
 
@@ -205,6 +205,117 @@ def list_strategy_audit_queue() -> str:
     return json.dumps(load_strategy_proposals(), ensure_ascii=False, indent=2)
 
 
+def refresh_local_cache(
+    trade_date: str | None = None,
+    *,
+    output_dir: str | None = None,
+    force_news: bool = False,
+) -> str:
+    """Refresh the daily cache without running the full agent workflow."""
+    from .data_agent.build_cache import build as build_local_cache
+
+    cache_dir = build_local_cache(
+        trade_date=trade_date,
+        output_dir=output_dir,
+        compute_signals=True,
+        refresh_news=True,
+        force_news=force_news,
+    )
+    payload = {
+        "trade_date": trade_date or str(date.today()),
+        "cache_dir": str(cache_dir),
+        "force_news": force_news,
+    }
+    return json.dumps(payload, ensure_ascii=False, indent=2)
+
+
+def refresh_etf_data_cache(
+    trade_date: str | None = None,
+    *,
+    etf_codes: list[str] | None = None,
+    daily_limit: int = 20,
+) -> str:
+    """Refresh ETF spot/daily caches without running any agent workflow."""
+    from .data_agent.data_health import refresh_etf_cache
+
+    payload = refresh_etf_cache(
+        trade_date=trade_date,
+        etf_codes=etf_codes,
+        daily_limit=daily_limit,
+    )
+    return json.dumps(payload, ensure_ascii=False, indent=2, default=str)
+
+
+def data_source_health_report(trade_date: str | None = None) -> str:
+    """Probe required data sources and return an auditable JSON health report."""
+    from .data_agent.data_health import run_data_source_health
+
+    payload = run_data_source_health(trade_date=trade_date)
+    return json.dumps(payload, ensure_ascii=False, indent=2, default=str)
+
+
+def scan_sector_etfs(
+    trade_date: str | None = None,
+    *,
+    sector: str | None = None,
+    top_n: int = 8,
+    force: bool = False,
+) -> str:
+    """Scan sectors first and return ETF candidates instead of stock picks."""
+    from .data_agent.sector_etf import SectorETFSelector, sector_candidates_to_json
+
+    trade_date = trade_date or str(date.today())
+    results_dir = Path(config.get("results_dir"))
+    results_dir.mkdir(parents=True, exist_ok=True)
+    suffix = sector.replace("/", "_") if sector else "all"
+    report_path = results_dir / f"sector_etf_report_{trade_date}_{suffix}.md"
+    json_path = results_dir / f"sector_etf_report_{trade_date}_{suffix}.json"
+
+    if report_path.exists() and json_path.exists() and not force:
+        return report_path.read_text(encoding="utf-8")
+
+    selector = SectorETFSelector(top_sectors=top_n)
+    candidates = selector.select(trade_date, sector_query=sector)
+    markdown = "\n".join([
+        "# 板块ETF扫描报告",
+        "",
+        f"**交易日期**: {trade_date}",
+        f"**范围**: {sector or '全市场热点板块'}",
+        "",
+        selector.format_markdown(candidates),
+        "",
+        "## 执行口径",
+        "",
+        "- 策略主线是先选板块，再选择可映射ETF；个股只作为板块宽度和热度证据。",
+        "- 若没有匹配ETF、流动性不足、事件催化缺失或板块内强势样本过少，则降级为暂不适合。",
+    ])
+    atomic_write_text(report_path, markdown)
+    atomic_write_text(json_path, sector_candidates_to_json(candidates))
+    return markdown
+
+
+def analyze_sector_etf(
+    sector: str,
+    trade_date: str | None = None,
+    *,
+    question: str | None = None,
+    use_autogen: bool = True,
+    store_memory: bool = True,
+) -> str:
+    """Run the full LangGraph sector ETF pipeline."""
+    from .graph.sector_etf_workflow import SectorETFTradingSystem
+
+    trade_date = trade_date or str(date.today())
+    _state, report = SectorETFTradingSystem().analyze(
+        sector,
+        question=question,
+        trade_date=trade_date,
+        use_autogen=use_autogen,
+        store_memory=store_memory,
+    )
+    return report
+
+
 def audit_strategy_proposal(
     proposal_id: str,
     *,
@@ -224,7 +335,7 @@ def audit_strategy_proposal(
 
 def scan_and_analyze(top_n: int = 10, trade_date: str | None = None,
                     debug: bool = False, skip_backtest: bool = False,
-                    force: bool = False) -> str:
+                    force: bool = False, refresh_cache: bool = True) -> str:
     """Scan for hot stocks, collect data during scan, then analyze top candidates.
 
     Uses the combined scan+collect flow: MarketScanner.scan_and_collect()
@@ -247,7 +358,7 @@ def scan_and_analyze(top_n: int = 10, trade_date: str | None = None,
         logger.info("Scan report already exists for %s, returning cached. Use --force to re-scan.", trade_date)
         return scan_path.read_text(encoding="utf-8")
 
-    scanner = MarketScanner(top_sectors=5, top_n=top_n)
+    scanner = MarketScanner(top_sectors=5, top_n=top_n, auto_refresh_cache=refresh_cache)
     bundle = scanner.scan_and_collect(trade_date, top_n=top_n)
 
     if not bundle.results:
@@ -308,25 +419,11 @@ def _analyze_from_bundle(
 ) -> str:
     """Run DataAgent with pre-collected data, then feed tier1/tier2 to TradingSystem.
 
-    Assembles the raw_data payload from the ScanBundle's shared and
-    per-ticker portions so DataAgent skips _collect_raw entirely.
+    Passes the scan-owned raw+clean package from ScanBundle into DataAgent,
+    so DataAgent only performs structured processing.
     """
     from .data_agent.data_agent import DataAgent, DataAgentRequest
 
-    shared = bundle.shared_raw
-    ticker_raw = bundle.ticker_data.get(ticker, {})
-
-    raw_data = {
-        "daily": ticker_raw.get("daily", []),
-        "market": shared.get("market", []),
-        "sector_context": shared.get("sector_context", []),
-        "limit_up_summary": shared.get("limit_up_summary", {}),
-        "dragon_tiger": shared.get("dragon_tiger", []),
-        "capital_flow": ticker_raw.get("capital_flow", []),
-        "news": ticker_raw.get("news", []),
-        "risk": shared.get("risk", {}),
-        "route_trace": bundle.route_trace,
-    }
 
     da_result = DataAgent().run(
         DataAgentRequest(
@@ -341,7 +438,8 @@ def _analyze_from_bundle(
             include_risk=True,
             use_react_planner=False,
         ),
-        raw_data=raw_data,
+        scan_package=bundle.package_for_ticker(ticker),
+
     )
 
     payload = da_result.final_data.get("analysis", {}).get("agent_payload", {})
@@ -359,7 +457,14 @@ def _analyze_from_bundle(
     return report
 
 
-def ask_llm(question: str, trade_date: str | None = None, debug: bool = False) -> str:
+def ask_llm(
+    question: str,
+    trade_date: str | None = None,
+    debug: bool = False,
+    *,
+    use_autogen: bool = True,
+    store_memory: bool = True,
+) -> str:
     """自然语言问答：根据问题自动分析对应标的或板块并回答。
 
     1. LLM 解析问题 → 提取 ticker/板块/意图
@@ -367,29 +472,39 @@ def ask_llm(question: str, trade_date: str | None = None, debug: bool = False) -
     3. 把 tier1/tier2 + 问题发给 LLM → 生成分析回答
     """
     trade_date = trade_date or str(date.today())
+    from .agents.conversation_memory import ConversationEntry, ConversationMemoryStore
     from .data_agent.scanner import MarketScanner
+    from .graph.sector_etf_workflow import SectorETFTradingSystem
 
-    # Step 1: LLM 解析问题，提取目标
-    llm = _get_llm()
-    parse_prompt = (
-        f"你是一个量化交易系统的意图识别器。根据用户的提问，判断目标对象。"
-        f"只返回 JSON，格式: {{'type': 'ticker'|'sector'|'market'|'unknown', "
-        f"'target': '股票代码或板块名称或null', 'reason': '简短判断理由'}}\n"
-        f"如果提到具体公司名（如'茅台'），转换为 ticker（如 '600519.SH'）。"
-        f"如果提到板块（如'新能源车'、'白酒'），type 为 sector，target 为板块名。\n"
-        f"问题: {question}"
-    )
-    try:
-        parse_result = json.loads(str(llm.chat([("system", "只返回JSON，不要解释"), ("human", parse_prompt)], temperature=0, max_tokens=500)))
-        target_type = parse_result.get("type", "unknown")
-        target = parse_result.get("target", "")
-    except Exception as exc:
-        logger.warning("LLM question parsing failed: %s", exc)
-        target_type = "unknown"
-        target = ""
+    # Step 1: 先做确定性意图识别，板块问答不需要先消耗 LLM。
+    inferred_sector = _infer_sector_from_question(question)
+    if inferred_sector:
+        target_type = "sector"
+        target = inferred_sector
+        llm = None
+    else:
+        llm = _get_llm()
+        parse_prompt = (
+            f"你是一个量化交易系统的意图识别器。根据用户的提问，判断目标对象。"
+            f"只返回 JSON，格式: {{'type': 'ticker'|'sector'|'market'|'unknown', "
+            f"'target': '股票代码或板块名称或null', 'reason': '简短判断理由'}}\n"
+            f"如果提到具体公司名（如'茅台'），转换为 ticker（如 '600519.SH'）。"
+            f"如果提到板块（如'新能源车'、'白酒'），type 为 sector，target 为板块名。\n"
+            f"问题: {question}"
+        )
+        try:
+            parse_result = json.loads(str(llm.chat([("system", "只返回JSON，不要解释"), ("human", parse_prompt)], temperature=0, max_tokens=500)))
+            target_type = parse_result.get("type", "unknown")
+            target = parse_result.get("target", "")
+        except Exception as exc:
+            logger.warning("LLM question parsing failed: %s", exc)
+            target_type = "unknown"
+            target = ""
 
     if debug:
         print(f"[Ask] Parsed: type={target_type}, target={target}")
+
+    memory_store = ConversationMemoryStore()
 
     # Step 2: 采集数据
     tier1_data: dict[str, Any] = {}
@@ -399,7 +514,7 @@ def ask_llm(question: str, trade_date: str | None = None, debug: bool = False) -
     if target_type == "ticker" and target:
         # 单个标的分析
         try:
-            scanner = MarketScanner(top_sectors=5, top_n=10)
+            scanner = MarketScanner(top_sectors=5, top_n=10, auto_refresh_cache=True)
             bundle = scanner.scan_and_collect(trade_date, top_n=10)
             run = DataAgent().run(
                 DataAgentRequest(
@@ -414,17 +529,8 @@ def ask_llm(question: str, trade_date: str | None = None, debug: bool = False) -
                     use_llm_news_filter=True,
                     fetch_news_full_text=False,
                 ),
-                raw_data={
-                    "daily": bundle.ticker_data.get(target, {}).get("daily", []),
-                    "market": bundle.shared_raw.get("market", []),
-                    "sector_context": bundle.shared_raw.get("sector_context", []),
-                    "limit_up_summary": bundle.shared_raw.get("limit_up_summary", {}),
-                    "dragon_tiger": bundle.shared_raw.get("dragon_tiger", []),
-                    "capital_flow": bundle.ticker_data.get(target, {}).get("capital_flow", []),
-                    "news": bundle.ticker_data.get(target, {}).get("news", []),
-                    "risk": bundle.shared_raw.get("risk", {}),
-                    "route_trace": bundle.route_trace,
-                },
+                scan_package=bundle.package_for_ticker(target),
+
             )
             ap = run.final_data.get("analysis", {}).get("agent_payload", {})
             tier1_data = ap.get("tier1_data", {})
@@ -435,27 +541,19 @@ def ask_llm(question: str, trade_date: str | None = None, debug: bool = False) -
             collected_context = f"数据采集失败: {exc}"
 
     elif target_type == "sector" and target:
-        # 板块分析
-        try:
-            scanner = MarketScanner(top_sectors=10, top_n=20)
-            results = scanner.scan(trade_date)
-            # 用板块名过滤候选
-            sector_results = [r for r in results if target.lower() in (r.sector or "").lower()]
-            top_sectors = scanner._last_scan_context.get("hot_sectors", [])
-            sector_info = [s for s in top_sectors if target.lower() in (s.get("sector_name", "") or "").lower()]
-            collected_context = json.dumps({
-                "matched_sectors": sector_info[:5],
-                "sector_candidates": [(r.ticker, r.name, r.sector, r.score) for r in sector_results[:10]],
-                "market_sentiment": scanner._last_scan_context.get("limit_up_summary", {}),
-            }, ensure_ascii=False)
-        except Exception as exc:
-            logger.error("Sector scan failed for %s: %s", target, exc)
-            collected_context = f"板块扫描失败: {exc}"
+        _state, report = SectorETFTradingSystem(memory_store=memory_store).analyze(
+            target,
+            question=question,
+            trade_date=trade_date,
+            use_autogen=use_autogen,
+            store_memory=store_memory,
+        )
+        return report
 
     else:
         # 市场全局或未知 → 扫描大盘
         try:
-            scanner = MarketScanner(top_sectors=5, top_n=5)
+            scanner = MarketScanner(top_sectors=5, top_n=5, auto_refresh_cache=True)
             results = scanner.scan(trade_date)
             collected_context = json.dumps({
                 "top_sectors": [(s.get("sector_name"), s.get("change_pct")) for s in scanner._last_scan_context.get("hot_sectors", [])[:8]],
@@ -467,6 +565,8 @@ def ask_llm(question: str, trade_date: str | None = None, debug: bool = False) -
             collected_context = f"市场扫描失败: {exc}"
 
     # Step 3: LLM 综合分析
+    if llm is None:
+        llm = _get_llm()
     answer_prompt = (
         f"你是一个A股量化交易分析师。用户提问: {question}\n\n"
         f"以下是系统采集到的结构化数据，请根据这些数据给出分析回答:\n\n"
@@ -476,7 +576,7 @@ def ask_llm(question: str, trade_date: str | None = None, debug: bool = False) -
     if tier1_data:
         answer_prompt += f"## Tier 1 (市场摘要)\n{json.dumps(tier1_data, ensure_ascii=False, indent=2)}\n\n"
     if tier2_data:
-        answer_prompt += f"## Tier 2 (详细数据)\n"
+        answer_prompt += "## Tier 2 (详细数据)\n"
         answer_prompt += f"- 日线记录: {len(tier2_data.get('price_data', []))} 条\n"
         answer_prompt += f"- 因子记录: {len(tier2_data.get('factors', []))} 条\n"
         answer_prompt += f"- 事件记录: {len(tier2_data.get('events', []))} 条\n"
@@ -499,7 +599,30 @@ def ask_llm(question: str, trade_date: str | None = None, debug: bool = False) -
     except Exception as exc:
         answer = f"⚠️ 分析生成失败: {exc}"
 
+    if store_memory:
+        memory_store.append(ConversationEntry(
+            question=question,
+            answer=answer,
+            trade_date=trade_date,
+            target_type=str(target_type),
+            target=str(target),
+            evidence={"context": collected_context[:4000]},
+        ))
+
     return f"# 智能问答\n\n**问题**: {question}\n\n---\n\n{answer}\n"
+
+
+def _infer_sector_from_question(question: str) -> str:
+    """Best-effort non-LLM sector extraction for CLI robustness."""
+    text = question.strip()
+    for marker in ("板块", "行业", "赛道"):
+        if marker in text:
+            before = text.split(marker, 1)[0]
+            token = before.split()[-1] if before.split() else before
+            token = token.strip("，。！？? 为什么为啥是否看好不好能买吗买不买")
+            if token:
+                return token.removesuffix(marker)
+    return ""
 
 
 def _get_llm():
@@ -518,6 +641,17 @@ def main():
     parser.add_argument("--batch", "-b", help="批量分析文件路径")
     parser.add_argument("--review", action="store_true", help="运行复盘汇总")
     parser.add_argument("--daily-review", action="store_true", help="运行每日复盘任务")
+    parser.add_argument("--refresh-cache", action="store_true", help="只刷新当日本地数据缓存，不跑扫描/圆桌")
+    parser.add_argument("--refresh-etf-cache", action="store_true", help="只刷新 ETF 现货/日线缓存，不跑扫描/圆桌")
+    parser.add_argument("--data-health", action="store_true", help="检查行情、板块、涨停、ETF 数据源可用性")
+    parser.add_argument("--sector-etf-scan", action="store_true", help="扫描板块并映射相关ETF，不输出个股买入列表")
+    parser.add_argument("--sector-etf-analyze", action="store_true", help="运行板块ETF LangGraph 决策流水线（含圆桌和对话记忆）")
+    parser.add_argument("--sector", help="指定板块名称，如 半导体、机器人、创新药")
+    parser.add_argument("--no-autogen", action="store_true", help="板块ETF分析/问答不调用 AutoGen，仅用确定性 fallback")
+    parser.add_argument("--no-conversation-memory", action="store_true", help="板块ETF分析/问答不写入对话记忆")
+    parser.add_argument("--etf-code", action="append", default=[], help="刷新指定 ETF 代码，可重复传入，如 --etf-code 512480.SH")
+    parser.add_argument("--etf-daily-limit", type=int, default=20, help="未指定 ETF 时，按现货成交额刷新前 N 只 ETF 日线")
+    parser.add_argument("--force-news", action="store_true", help="刷新缓存时强制重拉当天新闻")
     parser.add_argument("--portfolio-backtest", action="store_true", help="运行观察池组合回测")
     parser.add_argument("--data-agent", action="store_true", help="单独运行 DataAgent 并分层保存数据")
     parser.add_argument("--react-planner", action="store_true", help="DataAgent 运行前启用 ReAct Planner")
@@ -540,13 +674,21 @@ def main():
     parser.add_argument("--json", action="store_true", help="JSON 输出")
     parser.add_argument("--scan", action="store_true", help="扫描热点板块和强势股，自动分析 Top-N")
     parser.add_argument("--scan-top-n", type=int, default=10, help="扫描后分析 Top N 只股票 (默认 10)")
+    parser.add_argument("--no-refresh-cache", action="store_true", help="兼容旧参数：不刷新扫描缓存")
+    parser.add_argument("--refresh-scan-cache", action="store_true", help="扫描前刷新行情缓存；新闻建议单独用 --refresh-cache 预缓存")
     parser.add_argument("--force", "-f", action="store_true", help="强制重新扫描，忽略缓存")
     parser.add_argument("--ask", "-a", help="自然语言提问，如 '新能源汽车板块怎么样' 或 '贵州茅台能买吗'")
 
     args = parser.parse_args()
 
     if args.ask:
-        print(report)
+        print(ask_llm(
+            args.ask,
+            trade_date=args.date,
+            debug=args.debug,
+            use_autogen=not args.no_autogen,
+            store_memory=not args.no_conversation_memory,
+        ))
         return
 
     if args.review:
@@ -556,6 +698,43 @@ def main():
     if args.daily_review:
         result = run_daily_review(price_file=args.price_file, as_of=args.date)
         print(result.report)
+        return
+
+    if args.data_health:
+        print(data_source_health_report(args.date))
+        return
+
+    if args.sector_etf_scan:
+        print(scan_sector_etfs(
+            args.date,
+            sector=args.sector,
+            top_n=args.scan_top_n,
+            force=args.force,
+        ))
+        return
+
+    if args.sector_etf_analyze:
+        if not args.sector:
+            parser.error("--sector-etf-analyze requires --sector")
+        print(analyze_sector_etf(
+            args.sector,
+            args.date,
+            question=f"{args.sector}板块是否适合买ETF？",
+            use_autogen=not args.no_autogen,
+            store_memory=not args.no_conversation_memory,
+        ))
+        return
+
+    if args.refresh_cache:
+        print(refresh_local_cache(args.date, output_dir=args.output_dir, force_news=args.force_news))
+        return
+
+    if args.refresh_etf_cache:
+        print(refresh_etf_data_cache(
+            args.date,
+            etf_codes=args.etf_code or None,
+            daily_limit=args.etf_daily_limit,
+        ))
         return
 
     if args.portfolio_backtest:
@@ -601,6 +780,7 @@ def main():
             debug=args.debug,
             skip_backtest=args.skip_backtest,
             force=args.force,
+            refresh_cache=args.refresh_scan_cache and not args.no_refresh_cache,
         ))
         return
 
@@ -622,6 +802,7 @@ def main():
             debug=args.debug,
             skip_backtest=args.skip_backtest,
             force=args.force,
+            refresh_cache=args.refresh_scan_cache and not args.no_refresh_cache,
         ))
         return
 

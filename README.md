@@ -11,17 +11,18 @@ pip install -e .
 
 复制 `.env.example` 为 `.env`, 填入:
 - LLM API Key (DeepSeek)
-- 如只测试 DataAgent，不需要行情 API Key；默认走 AkShare/BaoStock/Sina/Eastmoney 这些 A 股免费数据源
+- 如只测试 Scan/DataAgent，不需要行情 API Key；默认走本地缓存 + mootdx/BaoStock/东方财富/财联社/新浪这些 A 股免费数据源
 
-### DataAgent 需要接入的 API
+### Scan 需要接入的 API
 
-- `akshare`: 默认免费主数据源，无需 API Key。主要用于 A 股行情、新闻、板块、涨停梯队和部分资金流数据。
-  - 文档: `https://akshare.akfamily.xyz/`
+- `local_cache`: 默认第一数据源。每日通过 `build-cache` / `--refresh-cache` 从免费直连源刷新，再供 Scan/DataAgent 离线优先读取。
+- `mootdx`: 通达信 TCP 日线行情，无需 API Key，优先用于补日线缓存。
+- `cls`: 财联社快讯，无需 API Key。新闻预缓存优先走这个快接口，再降级新浪个股新闻页。
 - `eastmoney`: 免费东方财富板块榜单兜底，无需 API Key。主要用于 `sector_context`。
-- `sina`: 免费新浪个股新闻兜底，无需 API Key。主要用于 AkShare 新闻为空时补 `news.events`。
+- `sina`: 免费新浪个股新闻兜底，无需 API Key。主要用于财联社快讯为空时补 `news.events`。
 - `baostock`: 免费 A 股历史行情和停牌状态兜底，无需 API Key。
   - 文档: `http://baostock.com/baostock/index.php/Python_API%E6%96%87%E6%A1%A3`
-- `DEEPSEEK_API_KEY`: 完整多 Agent 分析默认 LLM key；单独测试 DataAgent 不需要。
+- `DEEPSEEK_API_KEY`: 完整多 Agent 分析默认 LLM key；单独测试 Scan/DataAgent 数据流水线不需要。
   - API Key: `https://platform.deepseek.com/api_keys`
   - 文档: `https://api-docs.deepseek.com/`
 - 可选 LLM 供应商:
@@ -29,6 +30,92 @@ pip install -e .
   - `ANTHROPIC_API_KEY`: `https://console.anthropic.com/settings/keys`
 
 ### 单独测试 DataAgent
+
+建议把行情缓存和新闻缓存分开刷新。默认 `scan` 只读取已有本地行情缓存，缺数据时跳过对应信号，不因新闻缺失而阻塞；使用 `--refresh-scan-cache` 可在扫描前补行情，使用 `--refresh-cache` 可单独批量预缓存新闻。`--force-news` 会重拉当天已有新闻文件。
+
+如需手动预热缓存:
+
+```bash
+build-cache --date 2026-07-10 --force-news
+# 或通过主入口只刷新缓存
+python -m advanced_trading_agent.main --refresh-cache --date 2026-07-10 --force-news
+```
+
+### 板块 → ETF 策略主线
+
+当前策略改造方向是“先选板块，再买相关 ETF”。个股不再作为最终买入对象，只作为板块宽度、热度和事件传导的证据来源。核心 seam 是 `SectorETFSelector`:
+
+```text
+板块排名 / 新闻事件 / 热点成分股宽度 / ETF 现货流动性
+        ↓
+SectorETFSelector
+        ↓
+SectorCandidate + ETFCandidate
+        ↓
+LangGraph / AutoGen 圆桌 / 对话问答
+```
+
+手动刷新 ETF 缓存:
+
+```bash
+python -m advanced_trading_agent.main --refresh-etf-cache --date 2026-07-15
+```
+
+扫描全市场板块并映射 ETF:
+
+```bash
+python -m advanced_trading_agent.main --sector-etf-scan --date 2026-07-15 --scan-top-n 8
+```
+
+只分析一个指定板块:
+
+```bash
+python -m advanced_trading_agent.main --sector-etf-scan --sector 半导体 --date 2026-07-15
+```
+
+运行完整 LangGraph 板块 ETF 决策流水线（选择板块/ETF → 召回对话记忆 → AutoGen 圆桌 → 写入对话记忆 → 报告）:
+
+```bash
+python -m advanced_trading_agent.main --sector-etf-analyze --sector 半导体 --date 2026-07-15
+```
+
+调试时可以关闭 AutoGen 和对话记忆写入:
+
+```bash
+python -m advanced_trading_agent.main --sector-etf-analyze --sector 半导体 --date 2026-07-15 --no-autogen --no-conversation-memory
+```
+
+对话问答会优先把“xx 板块为什么不好/能不能买”路由到同一条板块 ETF LangGraph 流水线。圆桌优先使用 AutoGen；如果 AutoGen 依赖或 LLM Key 不可用，会返回确定性 fallback，并明确说明是 fallback。对话记忆只保存问答上下文，不参与回测复盘:
+
+```bash
+python -m advanced_trading_agent.main --ask "半导体板块为什么不好" --date 2026-07-15
+```
+
+问答也支持同样的调试开关:
+
+```bash
+python -m advanced_trading_agent.main --ask "半导体板块为什么不好" --date 2026-07-15 --no-autogen --no-conversation-memory
+```
+
+消息队列/中间件暂不实现到运行时，但设计 seam 已明确：后续只需要把 LangGraph 节点之间的状态转移事件发布出去，不改变节点内部业务逻辑。
+
+```text
+SectorETFTradingSystem
+  Select Sector ETF
+    -> publish sector.selected
+  Recall Conversation Memory
+    -> publish memory.recalled
+  AutoGen Roundtable
+    -> publish roundtable.completed
+  Store Conversation Memory
+    -> publish memory.stored
+  Report
+    -> publish report.created
+```
+
+推荐先用本地进程内 event bus 做开发版中间件，接口保持 `publish(topic, payload)` / `subscribe(topic, handler)`；如果后面需要多进程或任务队列，再把 adapter 换成 Redis Streams、RabbitMQ 或 Kafka。核心约束是：消息队列只承载观测、异步通知和后续扩展，不参与交易裁定，裁定仍由 LangGraph state 和报告留痕负责。
+
+热点扫描默认只读 `local_cache`。新闻仍然有必要，但只作为候选增强信号：优先读取本地批量缓存，Top 候选无缓存时才按需走财联社/新浪兜底；正文抓取默认关闭，需要时再显式开启。
 
 ```bash
 dataagent --ticker 000001.SZ --date 2026-07-10 --start-date 20260101 --end-date 20260710 --output-dir ./data/results
@@ -46,7 +133,7 @@ python -m advanced_trading_agent.data_agent.cli --ticker 000001.SZ --date 2026-0
 dataagent --react-planner --ticker 000001.SZ --date 2026-07-10 --start-date 20260101 --output-dir ./data/results
 ```
 
-默认情况下，DataAgent 会先根据 `ticker` 自动解析股票画像，再把公司名用于新闻采集，把行业关键词用于板块匹配。比如 `000001.SZ` 会自动补成 `news_keyword=平安银行`、`sector_keyword=银行`，这些结果会写入 `01_input/request.json` 的 `stock_profile` 留痕。
+默认情况下，DataAgent 会先根据 `ticker` 自动解析股票画像，再把公司名传给 Scan 做新闻采集，把行业关键词用于板块匹配。比如 `000001.SZ` 会自动补成 `news_keyword=平安银行`、`sector_keyword=银行`，这些结果会写入 `01_input/request.json` 的 `stock_profile` 留痕。
 
 如果你要覆盖自动识别结果，也可以显式给新闻采集加关键词过滤:
 
@@ -72,21 +159,21 @@ dataagent --ticker 000001.SZ --date 2026-07-10 --no-sector-context
 dataagent --ticker 000001.SZ --date 2026-07-10 --no-llm-news-filter
 ```
 
-默认还会尝试访问新闻 URL 抽取正文，去除广告/编辑/版权等噪声并去重段落，把清洗后的正文片段保存为 `evidence_text`，供后续 Event / Analysis / System Agent 直接读取。如果正文抓取失败，会保留摘要并标记 `content_status=summary_only`；正文清洗过程会记录在 `content_cleaning` 里。调试时也可以关闭正文抓取:
+默认由 Scan 访问新闻 URL 抽取正文，去除广告/编辑/版权等噪声并去重段落，把清洗后的正文片段保存为 `evidence_text`，供后续 Event / Analysis / System Agent 直接读取。如果正文抓取失败，会保留摘要并标记 `content_status=summary_only`；正文清洗过程会记录在 `content_cleaning` 里。`MarketScanner.scan_and_collect()` 和 DataAgent 单独运行时都会通过 Scan 层完成正文抽取，并打上 `full_text_source=scanner` / `full_text_attempted=true`；DataAgent 只接收 Scan 产出的 raw/cleaned payload，不重复访问同一 URL。调试时也可以关闭正文抓取:
 
 ```bash
 dataagent --ticker 000001.SZ --date 2026-07-10 --no-news-full-text
 ```
 
-DataAgent 会按步骤留痕并分层保存:
+DataAgent 会按步骤留痕并分层保存。职责边界是：Scan 负责数据抓取和清洗，DataAgent 负责结构化处理和 Agent Payload，圆桌会议负责交易分析和辩论:
 
 ```text
 data/results/data_agent_runs/<date>_<ticker>_<timestamp>/
 ├── 00_planner/plan.json           # ReAct Planner 计划和 trace；仅 --react-planner 开启
 ├── 01_input/request.json          # 输入参数、供应商链
-├── 02_raw/raw_data.json           # 原始供应商数据，新闻含 raw_full_text/full_text/content_cleaning/evidence_text
-├── 03_cleaned/cleaned_data.json   # 标准化、清洗后的数据
-├── 04_analysis/analysis_data.json # 因子、摘要和分析数据
+├── 02_raw/raw_data.json           # Scan 抓取的原始供应商数据，新闻含 raw_full_text/full_text/content_cleaning/evidence_text
+├── 03_cleaned/cleaned_data.json   # Scan 标准化、清洗后的数据
+├── 04_analysis/analysis_data.json # DataAgent 结构化处理结果：因子、摘要、事件、Payload 输入
 ├── 04_analysis/news_events.json   # 新闻筛选、LLM 判断、事件化结果的独立留痕
 ├── 05_agent_payload/agent_payload.json # 给后续 Agent 消费的 Tier 1 / Tier 2 数据
 └── 06_final/response.json         # 汇总返回: input/raw/cleaned/analysis/agent_payload/manifest
@@ -121,9 +208,10 @@ src/advanced_trading_agent/
 ├── data_agent/            # DataAgent 数据层
 │   ├── schema.py          # Tier 1/Tier 2 Schema (Pydantic)
 │   ├── vendor_router.py   # 多供应商路由 + 降级
-│   ├── collector.py       # 数据采集 (akshare/baostock/sina/eastmoney)
-│   ├── data_agent.py      # 独立 DataAgent: 输入→原始→清洗→分析→最终返回
-│   ├── cleaner.py         # 数据清洗
+│   ├── scanner.py         # Scan: 扫描、数据抓取、正文抽取、清洗入口
+│   ├── collector.py       # Scan 使用的数据采集适配器 (akshare/baostock/sina/eastmoney)
+│   ├── data_agent.py      # DataAgent: 输入→接收 Scan raw/cleaned→结构化处理→最终返回
+│   ├── cleaner.py         # Scan 使用的确定性数据清洗规则
 │   └── factors.py         # 因子计算
 ├── agents/                # Agent 层
 │   ├── schemas.py         # Agent 输出 Schema (Pydantic)

@@ -80,6 +80,9 @@ def test_watchlist_report_requires_primary_etf_and_limits_active_count():
     assert report.roundtable_summary["backtest_used"] is False
     agents = {item["agent"] for item in report.roundtable_summary["agent_outputs"]}
     assert agents == {"Market", "Event", "Analysis", "Risk"}
+    assert report.roundtable_summary["dialogue_records"][0]["speaker"] == "Moderator"
+    assert any(turn["speaker"] == "Risk" for turn in report.roundtable_summary["dialogue_records"])
+    assert report.roundtable_summary["round_history"][0]["turn_count"] >= 6
 
 
 def test_watchlist_report_keeps_only_top_three_final_decisions():
@@ -95,6 +98,8 @@ def test_watchlist_report_keeps_only_top_three_final_decisions():
     assert report.roundtable_summary["decision_count"] == 3
     assert report.roundtable_summary["max_final_decisions"] == 3
     assert len(report.roundtable_summary["agent_outputs"]) == 24
+    assert len(report.roundtable_summary["round_history"]) == 6
+    assert all("turns" in item for item in report.roundtable_summary["round_history"])
 
 
 def test_batch_watchlist_workflow_outputs_json_contract(tmp_path):
@@ -133,8 +138,11 @@ def test_batch_watchlist_workflow_outputs_json_contract(tmp_path):
     assert report["decisions"][0]["primary_etf"]["code"] == "512480.SH"
     assert "支持理由" in markdown
     assert "圆桌输出" in markdown
+    assert "圆桌对话记录" in markdown
     assert report["roundtable_summary"]["backtest_used"] is False
     assert len(report["roundtable_summary"]["agent_outputs"]) == 4
+    assert len(report["roundtable_summary"]["dialogue_records"]) >= 6
+    assert report["roundtable_summary"]["round_history"][0]["sector"] == "半导体"
     assert report["roundtable_summary"]["timings"]["fast_roundtable_seconds"] >= 0
 
 

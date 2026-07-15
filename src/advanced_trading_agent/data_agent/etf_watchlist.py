@@ -125,6 +125,16 @@ class RoundtableAgentOutput(BaseModel):
     objections: list[str] = Field(default_factory=list)
 
 
+class RoundtableDialogueTurn(BaseModel):
+    """One auditable dialogue turn in the fast JSON roundtable."""
+
+    round: int
+    sector: str
+    speaker: Literal["Moderator", "Market", "Event", "Analysis", "Risk"]
+    message: str
+    references: list[str] = Field(default_factory=list)
+
+
 def build_watchlist_report(
     *,
     trade_date: str,
@@ -145,6 +155,7 @@ def build_watchlist_report(
         for candidate in candidates[: limits.max_roundtable_sectors]
         for output in _fast_roundtable_outputs(candidate)
     ]
+    dialogue_records = _fast_roundtable_dialogue(candidates[: limits.max_roundtable_sectors], roundtable_outputs)
     decisions = [_decision_from_candidate(c, limits) for c in candidates[: limits.max_roundtable_sectors]]
     decisions.sort(key=lambda item: item.roundtable_score, reverse=True)
     decisions = _enforce_active_limits(decisions[: limits.max_final_decisions], limits)
@@ -165,6 +176,8 @@ def build_watchlist_report(
             "mode": "fast_json_roundtable",
             "backtest_used": False,
             "agent_outputs": [output.model_dump(mode="json") for output in roundtable_outputs],
+            "dialogue_records": [turn.model_dump(mode="json") for turn in dialogue_records],
+            "round_history": _round_history_from_dialogue(dialogue_records),
             "input_sector_count": len(candidates),
             "roundtable_candidate_count": min(len(candidates), limits.max_roundtable_sectors),
             "decision_count": len(decisions),
@@ -208,6 +221,13 @@ def render_watchlist_markdown(report: DailyETFWatchlistReport) -> str:
                 f"- {item.get('agent')}: {item.get('stance')} - {item.get('summary')}"
                 for item in report.roundtable_summary.get("agent_outputs", [])
                 if item.get("sector") == decision.sector
+            ],
+            "",
+            "**圆桌对话记录**:",
+            *[
+                f"- R{turn.get('round')} {turn.get('speaker')}: {turn.get('message')}"
+                for turn in report.roundtable_summary.get("dialogue_records", [])
+                if turn.get("sector") == decision.sector
             ],
             "",
             "**反对理由**:",
@@ -338,6 +358,85 @@ def _fast_roundtable_outputs(candidate: SectorCandidatePayload) -> list[Roundtab
             evidence=[f"primary_candidate={best_etf.code}", f"liquidity_score={best_etf.liquidity_score:.1f}"],
             objections=candidate.risk_flags,
         ),
+    ]
+
+
+def _fast_roundtable_dialogue(
+    candidates: list[SectorCandidatePayload],
+    outputs: list[RoundtableAgentOutput],
+) -> list[RoundtableDialogueTurn]:
+    """Build deterministic dialogue records without slow LLM calls."""
+    outputs_by_sector: dict[str, list[RoundtableAgentOutput]] = {}
+    for output in outputs:
+        outputs_by_sector.setdefault(output.sector, []).append(output)
+
+    turns: list[RoundtableDialogueTurn] = []
+    for round_idx, candidate in enumerate(candidates, start=1):
+        sector = candidate.sector_name
+        best_etf = max(candidate.raw_etf_candidates, key=lambda item: item.total_score)
+        turns.append(
+            RoundtableDialogueTurn(
+                round=round_idx,
+                sector=sector,
+                speaker="Moderator",
+                message=(
+                    f"讨论 {sector}：先按板块强度、事件、ETF 可交易性和风险约束判断，"
+                    f"必须落到首选 ETF {best_etf.code}。"
+                ),
+                references=["sector_score", "etf_candidates"],
+            )
+        )
+        for output in outputs_by_sector.get(sector, []):
+            refs = [f"{output.agent.lower()}_evidence"]
+            if output.evidence:
+                refs.extend(output.evidence[:2])
+            turns.append(
+                RoundtableDialogueTurn(
+                    round=round_idx,
+                    sector=sector,
+                    speaker=output.agent,
+                    message=f"{output.stance}: {output.summary}",
+                    references=refs,
+                )
+            )
+            for objection in output.objections[:2]:
+                turns.append(
+                    RoundtableDialogueTurn(
+                        round=round_idx,
+                        sector=sector,
+                        speaker=output.agent,
+                        message=f"反对意见：{objection}",
+                        references=[f"{output.agent.lower()}_objection"],
+                    )
+                )
+        turns.append(
+            RoundtableDialogueTurn(
+                round=round_idx,
+                sector=sector,
+                speaker="Moderator",
+                message=(
+                    f"小结：保留 {sector} 入最终排序，首选 ETF 为 {best_etf.code} {best_etf.name}；"
+                    "执行仍需人工审批。"
+                ),
+                references=["primary_etf", "approval_required"],
+            )
+        )
+    return turns
+
+
+def _round_history_from_dialogue(dialogue_records: list[RoundtableDialogueTurn]) -> list[dict[str, Any]]:
+    """Group dialogue turns into a compact round_history for audit consumers."""
+    grouped: dict[int, list[RoundtableDialogueTurn]] = {}
+    for turn in dialogue_records:
+        grouped.setdefault(turn.round, []).append(turn)
+    return [
+        {
+            "round": round_number,
+            "sector": turns[0].sector if turns else "",
+            "turn_count": len(turns),
+            "turns": [turn.model_dump(mode="json") for turn in turns],
+        }
+        for round_number, turns in sorted(grouped.items())
     ]
 
 

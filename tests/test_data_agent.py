@@ -4,6 +4,7 @@ import json
 
 from advanced_trading_agent.data_agent.data_agent import DataAgent, DataAgentRequest
 from advanced_trading_agent.data_agent.planner import DataAgentPlanner
+from advanced_trading_agent.data_agent.scanner import MarketScanner, ScanDataPackage
 
 
 class FakeLLM:
@@ -107,6 +108,79 @@ def test_data_agent_persists_layered_trace(tmp_path):
     assert final_payload["manifest"]["fields"]["stock.daily"]["available"] is True
     assert result.artifacts["agent_payload"].path.endswith("05_agent_payload\\agent_payload.json") or result.artifacts["agent_payload"].path.endswith("05_agent_payload/agent_payload.json")
     assert result.artifacts["news_events"].path.endswith("04_analysis\\news_events.json") or result.artifacts["news_events"].path.endswith("04_analysis/news_events.json")
+
+
+def test_data_agent_consumes_scan_package_without_fetching(tmp_path):
+    def fail_route(method, **kwargs):
+        raise AssertionError(f"DataAgent should not fetch via route_fn when scan_package is provided: {method}")
+
+    raw_payload = {
+        "daily": [{
+            "ts_code": "000001.SZ",
+            "trade_date": "20260710",
+            "open": 10.0,
+            "high": 10.5,
+            "low": 9.9,
+            "close": 10.2,
+            "pre_close": 10.0,
+            "pct_chg": 2.0,
+            "vol": 1000,
+            "amount": 10200,
+        }],
+        "market": [],
+        "sector_context": [],
+        "capital_flow": [],
+        "news": [{"title": "Ping An Bank operating update", "summary": "Retail stable", "source": "scan"}],
+        "risk": {"st_status": [], "suspended": [], "delisting": []},
+        "route_trace": [{"method": "get_daily", "vendor": "scan_cache", "status": "success"}],
+    }
+    package = ScanDataPackage(
+        raw_payload=raw_payload,
+        cleaned_payload=MarketScanner.clean_data_agent_raw(raw_payload),
+        route_trace=raw_payload["route_trace"],
+    )
+
+    result = DataAgent(route_fn=fail_route, results_dir=str(tmp_path)).run(
+        DataAgentRequest(
+            ticker="000001.SZ",
+            trade_date="2026-07-10",
+            include_factors=False,
+            include_market=False,
+            include_capital_flow=False,
+            include_risk=False,
+            use_llm_news_filter=False,
+            news_keyword="Ping An",
+        ),
+        scan_package=package,
+    )
+
+    final_payload = result.final_data
+    assert final_payload["raw"]["source_stage"] == "scan"
+    assert final_payload["cleaned"]["daily"]["record_count"] == 1
+    assert final_payload["agent_payload"]["tier2_data"]["price_data"]
+    assert final_payload["vendor_health"]["vendors"]["scan_cache"]["success_count"] == 1
+    assert final_payload["manifest"]["fields"]["stock.daily"]["source"] == "scan"
+
+
+def test_data_agent_default_collection_uses_startup_refreshing_scan(tmp_path):
+    agent = DataAgent(results_dir=str(tmp_path))
+
+    scanner = agent._scanner_for_collection()
+
+    assert scanner._auto_refresh_cache is True
+    assert scanner._cache_only is True
+
+
+def test_data_agent_custom_route_does_not_startup_refresh_cache(tmp_path):
+    def fake_route(method, **kwargs):
+        return []
+
+    agent = DataAgent(route_fn=fake_route, results_dir=str(tmp_path))
+
+    scanner = agent._scanner_for_collection()
+
+    assert scanner._auto_refresh_cache is False
+    assert scanner._cache_only is False
 
 
 def test_data_agent_auto_resolves_stock_profile_keywords(tmp_path):
@@ -491,7 +565,7 @@ def test_data_agent_fetches_full_news_text(tmp_path, monkeypatch):
         assert url == "https://example.test/news"
         return FakeResponse()
 
-    monkeypatch.setattr("advanced_trading_agent.data_agent.data_agent.requests.get", fake_get)
+    monkeypatch.setattr("advanced_trading_agent.data_agent.news_text.requests.get", fake_get)
 
     def fake_route(method, **kwargs):
         if method == "get_daily":
@@ -531,3 +605,45 @@ def test_data_agent_fetches_full_news_text(tmp_path, monkeypatch):
     assert event["content_status"] == "full_text"
     assert event["content_cleaning"]["status"] == "cleaned"
     assert "downstream trading agents" in event["evidence_text"]
+
+
+def test_data_agent_does_not_refetch_scanner_attempted_news(tmp_path, monkeypatch):
+    def fail_get(*args, **kwargs):
+        raise AssertionError("DataAgent should not refetch scanner-enriched news")
+
+    monkeypatch.setattr("advanced_trading_agent.data_agent.news_text.requests.get", fail_get)
+
+    result = DataAgent(results_dir=str(tmp_path)).run(
+        DataAgentRequest(
+            ticker="000001.SZ",
+            trade_date="2026-07-10",
+            news_keyword="Ping An",
+            include_factors=False,
+            use_llm_news_filter=False,
+        ),
+        raw_data={
+            "daily": [],
+            "market": [],
+            "sector_context": [],
+            "capital_flow": [],
+            "news": [{
+                "title": "Ping An Bank operating update",
+                "summary": "Ping An Bank summary from scanner cache",
+                "url": "https://example.test/news",
+                "full_text": "",
+                "full_text_attempted": True,
+                "full_text_source": "scanner",
+                "content_status": "summary_only",
+                "content_error": "extract_empty",
+            }],
+            "risk": {"st_status": [], "suspended": [], "delisting": []},
+            "route_trace": [],
+        },
+    )
+
+    raw_news = result.final_data["raw"]["news"][0]
+    event = result.final_data["agent_payload"]["tier2_data"]["events"][0]
+    assert raw_news["full_text_source"] == "scanner"
+    assert raw_news["full_text_attempted"] is True
+    assert raw_news["content_status"] == "summary_only"
+    assert event["evidence_text"] == "Ping An Bank summary from scanner cache"

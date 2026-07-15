@@ -100,7 +100,8 @@ class ShortTermSignalEngine:
     """短线信号引擎 — 从本地缓存批量读取数据，批量计算信号"""
 
     def __init__(self, cache_dir: str | Path | None = None):
-        self.cache_dir = Path(cache_dir or config.get("results_dir")) / "local_cache"
+        base = Path(cache_dir or config.get("results_dir"))
+        self.cache_dir = base if base.name == "local_cache" else base / "local_cache"
         self._daily_cache: dict[str, pd.DataFrame] = {}
         self._sector_ranking: list[dict[str, Any]] = []
         self._board_index: dict[str, list[dict[str, Any]]] = {}

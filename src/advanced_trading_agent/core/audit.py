@@ -70,7 +70,19 @@ def build_data_collection_summary(
     }
 
     for key, label in category_map.items():
-        data = raw_payload.get(key)
+        if key == "sector":
+            data = raw_payload.get("sector_context")
+        elif key == "factors":
+            data = raw_payload.get("factors")
+            if data is None:
+                categories[key] = {"label": label, "status": "computed", "count": 0, "vendor": "FactorCalculator"}
+                continue
+        elif key.startswith("risk_"):
+            risk = raw_payload.get("risk", {})
+            sub_key = {"risk_st": "st_status", "risk_suspended": "suspended", "risk_delisting": "delisting"}.get(key, key)
+            data = risk.get(sub_key) if isinstance(risk, dict) else None
+        else:
+            data = raw_payload.get(key)
         if data is None:
             categories[key] = {"label": label, "status": "not_requested", "count": 0, "vendor": None}
             continue
@@ -89,11 +101,15 @@ def build_data_collection_summary(
         vendor = _find_vendor_for_method(route_trace, key)
         categories[key] = {"label": label, "status": "ok" if count > 0 else "empty", "count": count, "vendor": vendor}
 
+    with_data = sum(1 for c in categories.values() if c["status"] == "ok")
+    computed = sum(1 for c in categories.values() if c["status"] == "computed")
+
     return {
         "categories": categories,
         "vendor_health": vendor_health,
         "total_categories": len(categories),
-        "categories_with_data": sum(1 for c in categories.values() if c["status"] == "ok"),
+        "categories_with_data": with_data,
+        "categories_computed": computed,
         "categories_failed": sum(1 for c in categories.values() if c["status"] == "error"),
         "categories_empty": sum(1 for c in categories.values() if c["status"] == "empty"),
     }
@@ -112,7 +128,7 @@ def format_data_collection_summary(summary: dict[str, Any]) -> str:
         "|----------|--------|---------|--------|",
     ]
     for key, cat in summary.get("categories", {}).items():
-        status_icon = {"ok": "OK", "empty": "EMPTY", "error": "ERROR", "not_requested": "SKIPPED"}.get(cat["status"], "?")
+        status_icon = {"ok": "OK", "empty": "EMPTY", "error": "ERROR", "not_requested": "SKIPPED", "computed": "COMPUTED"}.get(cat["status"], "?")
         vendor = cat.get("vendor") or "-"
         lines.append(f"| {cat['label']} | {status_icon} | {cat['count']} | {vendor} |")
 

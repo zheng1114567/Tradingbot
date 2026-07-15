@@ -96,8 +96,8 @@ class DebateEngine:
         # Get latest positions from previous round as initial (will overwrite)
         agent_positions.update(prev_positions)
 
-        # Each agent speaks
-        for agent_name in _AGENT_ORDER:
+        # Each agent speaks (order from harness context)
+        for agent_name in context.agent_order:
             if agent_name not in context.agent_contexts:
                 continue  # skip agents with no context
             turn = self._agent_speak(
@@ -159,7 +159,7 @@ class DebateEngine:
         return {
             # Old fields (backward compatible)
             "round_count": round_number + 1,
-            "current_speaker": "Moderator" if converged else _AGENT_ORDER[-1],
+            "current_speaker": "Moderator" if converged else (context.agent_order[-1] if context.agent_order else ""),
             "completed": converged,
             "summary": summary,
             "final_pressure": final_pressure_str,

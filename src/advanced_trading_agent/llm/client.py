@@ -39,7 +39,7 @@ class LLMClient:
                  temperature: float | None = None):
         cfg = config.get_all()
         self.provider = provider or cfg.get("llm_provider", "deepseek")
-        self.model = model or cfg.get("deep_think_llm", "deepseek-chat")
+        self.model = model or cfg.get("deep_think_llm", "deepseek-v4-flash")
         self.temperature = temperature if temperature is not None else cfg.get("temperature", 0.1)
         self._client = None
 

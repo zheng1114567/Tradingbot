@@ -17,6 +17,7 @@ from typing import Any
 from langchain_core.tools import tool
 
 from ..core.cache_manager import CacheManager
+from ..data_agent.vendor_throttle import call_with_vendor_guard
 
 logger = logging.getLogger(__name__)
 
@@ -60,9 +61,9 @@ class EventTools:
                 logger.info("akshare global news function unavailable")
                 return []
             try:
-                df = fn()
+                df = call_with_vendor_guard("akshare", fn)
             except TypeError:
-                df = fn(symbol="全部")
+                df = call_with_vendor_guard("akshare", lambda: fn(symbol="全部"))
             if df is not None and not df.empty:
                 records = df.to_dict("records")
                 # 关键词过滤
@@ -107,11 +108,11 @@ class EventTools:
                 logger.info("akshare announcement function unavailable")
                 return []
             if getattr(fn, "__name__", "") == "stock_individual_notice_report":
-                df = fn(security=code, symbol="全部")
+                df = call_with_vendor_guard("akshare", lambda: fn(security=code, symbol="全部"))
             elif getattr(fn, "__name__", "") == "stock_notice_report":
-                df = fn(symbol="全部")
+                df = call_with_vendor_guard("akshare", lambda: fn(symbol="全部"))
             else:
-                df = fn(code=code)
+                df = call_with_vendor_guard("akshare", lambda: fn(code=code))
             if df is not None and not df.empty:
                 result = df.head(20).to_dict("records")
                 self.cache.set(cache_key, result)
@@ -146,9 +147,9 @@ class EventTools:
                 logger.info("akshare calendar news function unavailable")
                 return []
             try:
-                df = fn()
+                df = call_with_vendor_guard("akshare", fn)
             except TypeError:
-                df = fn(symbol="全部")
+                df = call_with_vendor_guard("akshare", lambda: fn(symbol="全部"))
             if df is not None and not df.empty:
                 result = df.head(20).to_dict("records")
                 self.cache.set(cache_key, result)

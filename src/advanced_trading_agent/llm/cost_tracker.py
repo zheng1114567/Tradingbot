@@ -44,12 +44,12 @@ class CostTracker:
     """
 
     PRICES = {
-        "deepseek-chat": {"input_per_m": 1.0, "output_per_m": 2.0},
+        "deepseek-v4-flash": {"input_per_m": 1.0, "output_per_m": 2.0},
         "deepseek-reasoner": {"input_per_m": 4.0, "output_per_m": 16.0},
         "gpt-4o": {"input_per_m": 15.0, "output_per_m": 60.0},
     }
 
-    def __init__(self, model: str = "deepseek-chat"):
+    def __init__(self, model: str = "deepseek-v4-flash"):
         self.model = model
         self.records: list[CostRecord] = []
         self.warning_threshold = 5.0  # ¥5 警告

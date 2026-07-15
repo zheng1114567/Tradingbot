@@ -2,15 +2,13 @@
 import pytest
 import pandas as pd
 from advanced_trading_agent.data_agent.schema import (
-    MarketSchema, SentimentSchema, CapitalSchema,
-    FactorSchema, EventSchema, PointInTime,
-    DecisionType, MarketSentiment, CapitalConfirmation,
+    MarketSchema, EventSchema, PointInTime,
 )
 from advanced_trading_agent.data_agent.cleaner import DataCleaner
 from advanced_trading_agent.data_agent.factors import FactorCalculator
 from advanced_trading_agent.data_agent.vendor_router import (
-    DataVendor, route_to_vendor, register_vendor_impl,
-    VendorRateLimitError, VendorNotConfiguredError,
+    route_to_vendor, register_vendor_impl,
+    VendorRateLimitError,
 )
 from datetime import date
 
@@ -95,6 +93,58 @@ class TestCleaner:
 
         assert list(result.columns).count("volume") == 1
         assert result.iloc[0]["volume"] == 1000
+    def test_clean_daily_keeps_rows_when_vendor_pct_chg_is_missing(self):
+        data = [
+            {
+                "trade_date": "2026-07-08T15:00:00",
+                "code": "300015.SZ",
+                "open": 8.26,
+                "high": 8.29,
+                "low": 8.15,
+                "close": 8.19,
+                "vol": 660052,
+                "amount": 541559872,
+                "pctChg": float("nan"),
+                "preclose": float("nan"),
+            },
+            {
+                "trade_date": "2026-07-09T15:00:00",
+                "code": "300015.SZ",
+                "open": 8.14,
+                "high": 8.3,
+                "low": 8.09,
+                "close": 8.18,
+                "vol": 645478,
+                "amount": 527968288,
+                "pctChg": float("nan"),
+                "preclose": float("nan"),
+            },
+        ]
+
+        result = DataCleaner.clean_daily(data)
+
+        assert len(result) == 2
+        assert result.iloc[1]["pre_close"] == pytest.approx(8.19)
+        assert result.iloc[1]["pct_chg"] == pytest.approx((8.18 - 8.19) / 8.19 * 100)
+    def test_clean_daily_uses_datetime_as_trade_date(self):
+        data = [
+            {
+                "datetime": "2026-07-10T15:00:00.000",
+                "code": "600196.SH",
+                "open": 22.88,
+                "high": 23.74,
+                "low": 22.47,
+                "close": 23.45,
+                "preclose": 22.95,
+                "vol": 377606,
+                "amount": 878157120,
+            }
+        ]
+
+        result = DataCleaner.clean_daily(data)
+
+        assert "trade_date" in result.columns
+        assert result.iloc[0]["trade_date"] == pd.Timestamp("2026-07-10T15:00:00")
 
 
 class TestFactors:
@@ -143,7 +193,6 @@ class TestVendorRouter:
         register_vendor_impl("test_fallback", "a", vendor_a)
         register_vendor_impl("test_fallback", "b", vendor_b)
         # 手动测试
-        from advanced_trading_agent.data_agent.vendor_router import get_vendor_chain
         from advanced_trading_agent.data_agent.vendor_router import _VENDOR_IMPLEMENTATIONS
         impls = _VENDOR_IMPLEMENTATIONS.get("test_fallback", {})
         assert "a" in impls

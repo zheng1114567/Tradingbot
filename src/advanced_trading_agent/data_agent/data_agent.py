@@ -1,19 +1,17 @@
-"""Standalone auditable data agent.
+"""Standalone auditable data processor.
 
 The agent records each stage of a data run:
 1. input request
-2. raw vendor data
-3. cleaned data
-4. analysis data
+2. scan-collected raw data
+3. scan-cleaned data
+4. structured data processing
 5. final layered response
 """
 from __future__ import annotations
 
 import logging
 import json
-import os
 import re
-from html import unescape
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -21,21 +19,31 @@ from typing import Any, Callable
 
 import numpy as np
 import pandas as pd
-import requests
 
 from ..config import config
-from ..core.atomic_write import atomic_write_json, atomic_write_text
+from ..core.atomic_write import atomic_write_json
 from ..core.audit import audit_event, build_data_collection_summary
-from ..core.vendor import timed_vendor_call
-from .cleaner import DataCleaner
+from .a_share_signals import AShareSignalBuilder
+from .agent_payload import build_agent_payload
 from .cache_manifest import CacheManifest
 from .data_health import build_daily_health_report
 from .factors import FactorCalculator
 from .manifest import DataManifest
-from .planner import DataAgentPlan, DataAgentPlanner
+from .news_filter import (
+    NewsFilter,
+    ask_llm_to_filter_news,
+    bounded_float,
+    build_event_records,
+    filter_news_deterministically,
+)
+from .news_text import select_evidence_text
+from .planner import DataAgentPlanner
+from .raw_collection import RawDataAdopter
 from .request import DataAgentRequest
-from .scanner import ScanBundle
-from .stock_profile import StockProfile, StockProfileResolver
+from .scan_cleaning import clean_news, first_present
+from .scanner import MarketScanner, ScanBundle, ScanDataPackage
+from .sector_context import clean_sector_context, summarize_sector_context
+from .stock_profile import StockProfileResolver
 from .vendor_router import get_vendor_chain, route_to_vendor
 
 logger = logging.getLogger(__name__)
@@ -45,31 +53,6 @@ RouteFn = Callable[..., Any]
 
 
 _SAFE_PATH_PART = re.compile(r"[^A-Za-z0-9_.-]+")
-_SCRIPT_STYLE_RE = re.compile(r"<(script|style)[^>]*>.*?</\1>", re.IGNORECASE | re.DOTALL)
-_HTML_TAG_RE = re.compile(r"<[^>]+>")
-_WHITESPACE_RE = re.compile(r"\s+")
-_NEWS_NOISE_PATTERNS = (
-    re.compile(r"^原标题[:：]"),
-    re.compile(r"^来源[:：]"),
-    re.compile(r"^文章来源[:：]"),
-    re.compile(r"^责任编辑[:：]"),
-    re.compile(r"^编辑[:：]"),
-    re.compile(r"^校对[:：]"),
-    re.compile(r"^作者[:：]\s*$"),
-    re.compile(r"^免责声明[:：]"),
-    re.compile(r"^风险提示[:：]"),
-    re.compile(r"^广告$"),
-    re.compile(r"^更多精彩.*"),
-    re.compile(r"^下载.*APP.*"),
-    re.compile(r"^打开.*APP.*"),
-    re.compile(r"^微信扫一扫.*"),
-    re.compile(r"^海量资讯.*"),
-    re.compile(r"^本文源自[:：]"),
-    re.compile(r"^本文来自.*"),
-    re.compile(r"^股市有风险.*"),
-    re.compile(r"^投资需谨慎.*"),
-    re.compile(r"^Copyright\b", re.IGNORECASE),
-)
 
 
 def _utc_now() -> str:
@@ -79,6 +62,21 @@ def _utc_now() -> str:
 def _safe_path_part(value: str, fallback: str) -> str:
     safe = _SAFE_PATH_PART.sub("_", value).strip("._")
     return safe or fallback
+
+
+def _parse_financial_value(value: Any) -> float | None:
+    """Parse baostock financial values which may be strings with commas."""
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value) if value != 0 else None
+    text = str(value).strip().replace(",", "").replace(" ", "")
+    if not text or text in ("0", "0.0", "None", "nan"):
+        return None
+    try:
+        return float(text)
+    except (TypeError, ValueError):
+        return None
 
 
 def _records_from_frame(df: pd.DataFrame, limit: int | None = None) -> list[dict[str, Any]]:
@@ -134,7 +132,7 @@ class DataAgentRun:
 
 
 class DataAgent:
-    """Collect, clean, analyze, and persist market data in auditable layers."""
+    """Process scan-owned market data into auditable downstream payloads."""
 
     def __init__(
         self,
@@ -175,13 +173,6 @@ class DataAgent:
             bundle = MarketScanner().scan_and_collect()
             run = DataAgent.from_bundle(bundle, "000001.SZ")
         """
-        ticker_raw = bundle.ticker_data.get(ticker, {})
-        raw_data: dict[str, Any] = {
-            **bundle.shared_raw,
-            **ticker_raw,
-            "route_trace": list(bundle.route_trace),
-        }
-
         effective_trade_date = trade_date or bundle.trade_date
         request = DataAgentRequest(
             ticker=ticker,
@@ -193,9 +184,15 @@ class DataAgent:
         )
 
         agent = cls(results_dir=results_dir, llm_client=llm_client)
-        return agent.run(request, raw_data=raw_data)
+        return agent.run(request, scan_package=bundle.package_for_ticker(ticker))
 
-    def run(self, request: DataAgentRequest, raw_data: dict[str, Any] | None = None) -> DataAgentRun:
+    def run(
+        self,
+        request: DataAgentRequest,
+        raw_data: dict[str, Any] | None = None,
+        *,
+        scan_package: ScanDataPackage | None = None,
+    ) -> DataAgentRun:
         # Ensure the free vendor adapters are available when DataAgent is used standalone.
         from .collector import register_all_vendors
 
@@ -246,18 +243,24 @@ class DataAgent:
         }
         artifacts["input"] = self._write_json(run_dir / "01_input" / "request.json", input_payload)
 
-        # --- Raw collection with error recovery ---
+        # --- Scan-owned collection and cleaning with error recovery ---
         try:
-            if raw_data is not None:
-                raw_payload = self._adopt_raw(raw_data, request, manifest, route_trace)
+            if scan_package is not None:
+                scan_package = self._adopt_scan_package(scan_package, request, manifest, route_trace)
+            elif raw_data is not None:
+                scan_package = self._package_from_scan_raw(raw_data, request, manifest, route_trace)
             else:
-                raw_payload = self._collect_raw(request, manifest, route_trace)
+                scan_package = self._collect_scan_package(request, manifest, route_trace)
+            raw_payload = scan_package.raw_payload
+            cleaned_payload = scan_package.cleaned_payload
             artifacts["raw"] = self._write_json(run_dir / "02_raw" / "raw_data.json", raw_payload)
+            artifacts["cleaned"] = self._write_json(run_dir / "03_cleaned" / "cleaned_data.json", cleaned_payload)
         except Exception as exc:
-            logger.error("Raw data collection failed: %s", exc)
-            audit_trail.append(audit_event("data", f"数据收集失败: {exc}", level="error", detail={"stage": "raw_collection"}))
-            errors.append({"stage": "raw_collection", "error": str(exc)})
+            logger.error("Scan input preparation failed: %s", exc)
+            audit_trail.append(audit_event("data", f"Scan 数据准备失败: {exc}", level="error", detail={"stage": "scan_input"}))
+            errors.append({"stage": "scan_input", "error": str(exc)})
             raw_payload = {"stage": "raw", "created_at": _utc_now(), "error": str(exc)}
+            cleaned_payload = {"stage": "cleaned", "created_at": _utc_now(), "error": str(exc)}
 
         # --- Build collection summary ---
         vendor_health = self._summarize_vendor_health(route_trace)
@@ -270,17 +273,7 @@ class DataAgent:
                 if cat["status"] == "error":
                     audit_trail.append(audit_event("data", f"{cat['label']} 获取失败: {cat.get('error', 'unknown')}", level="warning"))
 
-        # --- Clean with error recovery ---
-        try:
-            cleaned_payload = self._clean(raw_payload)
-            artifacts["cleaned"] = self._write_json(run_dir / "03_cleaned" / "cleaned_data.json", cleaned_payload)
-        except Exception as exc:
-            logger.error("Data cleaning failed: %s", exc)
-            audit_trail.append(audit_event("data", f"数据清洗失败: {exc}", level="error"))
-            errors.append({"stage": "cleaning", "error": str(exc)})
-            cleaned_payload = {"stage": "cleaned", "created_at": _utc_now(), "error": str(exc)}
-
-        # --- Analyze with error recovery ---
+        # --- Process with error recovery ---
         try:
             analysis_payload = self._analyze(cleaned_payload, request, route_trace=route_trace)
             artifacts["analysis"] = self._write_json(
@@ -379,6 +372,9 @@ class DataAgent:
         }
         return effective_request, profile_payload
 
+    def _raw_adopter(self) -> RawDataAdopter:
+        return RawDataAdopter(now_fn=_utc_now)
+
     def _adopt_raw(
         self,
         raw_data: dict[str, Any],
@@ -386,64 +382,58 @@ class DataAgent:
         manifest: DataManifest,
         route_trace: list[dict[str, Any]],
     ) -> dict[str, Any]:
-        """Normalize pre-collected raw data into the standard raw payload format.
+        return self._raw_adopter().adopt(raw_data, request, manifest, route_trace)
 
-        When data is collected by MarketScanner.scan_and_collect(), this
-        adapter merges the shared and per-ticker portions into a single
-        payload matching _collect_raw's return shape.
-        """
-        if "route_trace" in raw_data:
-            incoming = raw_data["route_trace"]
-            if isinstance(incoming, list):
-                route_trace.extend(incoming)
+    def _package_from_scan_raw(
+        self,
+        raw_data: dict[str, Any],
+        request: DataAgentRequest,
+        manifest: DataManifest,
+        route_trace: list[dict[str, Any]],
+    ) -> ScanDataPackage:
+        raw_payload = self._adopt_raw(raw_data, request, manifest, route_trace)
+        return ScanDataPackage(
+            raw_payload=raw_payload,
+            cleaned_payload=MarketScanner.clean_data_agent_raw(raw_payload),
+            route_trace=route_trace,
+        )
 
-        daily = raw_data.get("daily", [])
-        market = raw_data.get("market", [])
-        sector_context = raw_data.get("sector_context", [])
-        limit_up_summary = raw_data.get("limit_up_summary", {})
-        dragon_tiger = raw_data.get("dragon_tiger", [])
-        market_breadth = raw_data.get("market_breadth", {})
-        capital_flow = raw_data.get("capital_flow", [])
-        news = raw_data.get("news", [])
-        risk = raw_data.get("risk", {})
+    def _adopt_scan_package(
+        self,
+        scan_package: ScanDataPackage,
+        request: DataAgentRequest,
+        manifest: DataManifest,
+        route_trace: list[dict[str, Any]],
+    ) -> ScanDataPackage:
+        if scan_package.route_trace and scan_package.route_trace is not route_trace:
+            route_trace.extend(scan_package.route_trace)
+        raw_payload = self._adopt_raw(scan_package.raw_payload, request, manifest, route_trace)
+        return ScanDataPackage(
+            raw_payload=raw_payload,
+            cleaned_payload=scan_package.cleaned_payload,
+            route_trace=route_trace,
+        )
 
-        if request.fetch_news_full_text and isinstance(news, list) and news:
-            news = self._enrich_news_full_text(news)
+    def _collect_scan_package(
+        self,
+        request: DataAgentRequest,
+        manifest: DataManifest,
+        route_trace: list[dict[str, Any]],
+    ) -> ScanDataPackage:
+        scanner = self._scanner_for_collection()
+        scan_package = scanner.collect_data_agent_package(request, route_trace)
+        raw_payload = self._adopt_raw(scan_package.raw_payload, request, manifest, route_trace)
+        return ScanDataPackage(
+            raw_payload=raw_payload,
+            cleaned_payload=MarketScanner.clean_data_agent_raw(raw_payload),
+            route_trace=route_trace,
+        )
 
-        field_checks = [
-            ("stock.daily", daily),
-            ("market.daily", market),
-            ("sector.context", sector_context),
-            ("market.limit_up_summary", [limit_up_summary] if isinstance(limit_up_summary, dict) and limit_up_summary else []),
-            ("market.dragon_tiger", dragon_tiger),
-            ("market.breadth", [market_breadth] if isinstance(market_breadth, dict) and market_breadth else []),
-            ("stock.capital_flow", capital_flow),
-            ("news.events", news),
-        ]
-        for field_name, value in field_checks:
-            available = isinstance(value, list) and len(value) > 0
-            manifest.add_field(
-                field_name,
-                available=available,
-                source="scan_bundle",
-                vendor_chain=[],
-                record_count=len(value) if isinstance(value, list) else None,
-            )
-
-        return {
-            "stage": "raw",
-            "created_at": _utc_now(),
-            "daily": daily,
-            "market": market,
-            "sector_context": sector_context,
-            "limit_up_summary": limit_up_summary if isinstance(limit_up_summary, dict) else {},
-            "dragon_tiger": dragon_tiger if isinstance(dragon_tiger, list) else [],
-            "market_breadth": market_breadth if isinstance(market_breadth, dict) else {},
-            "capital_flow": capital_flow,
-            "news": news,
-            "risk": risk if isinstance(risk, dict) else {},
-            "route_trace": route_trace,
-        }
+    def _scanner_for_collection(self) -> MarketScanner:
+        """Build the Scan boundary used by standalone DataAgent runs."""
+        if self._route_fn is route_to_vendor:
+            return MarketScanner(auto_refresh_cache=True)
+        return MarketScanner(route_fn=self._route_fn, cache_only=False)
 
     def _collect_raw(
         self,
@@ -451,227 +441,12 @@ class DataAgent:
         manifest: DataManifest,
         route_trace: list[dict[str, Any]],
     ) -> dict[str, Any]:
-        daily = self._safe_route(
-            "get_daily",
-            manifest,
-            field_name="stock.daily",
-            route_trace=route_trace,
-            code=request.ticker,
-            start_date=request.start_date,
-            end_date=request.normalized_end_date(),
-        )
-        market = []
-        if request.include_market:
-            market = self._safe_route(
-                "get_daily",
-                manifest,
-                field_name="market.daily",
-                route_trace=route_trace,
-                code="000001.SH",
-                start_date=request.start_date or request.normalized_end_date(),
-                end_date=request.normalized_end_date(),
-            )
-        sector_context = []
-        if request.include_sector_context:
-            sector_context = self._safe_route(
-                "get_sector",
-                manifest,
-                field_name="sector.context",
-                route_trace=route_trace,
-                top_n=request.sector_top_n,
-                trade_date=request.normalized_trade_date(),
-            )
-        market_breadth = self._safe_route(
-            "get_market_breadth",
-            manifest,
-            field_name="market.breadth",
-            route_trace=route_trace,
-            trade_date=request.normalized_trade_date(),
-        )
-        limit_up_summary = self._safe_route(
-            "get_limit_up_tiers",
-            manifest,
-            field_name="market.limit_up_summary",
-            route_trace=route_trace,
-            trade_date=request.normalized_trade_date(),
-        )
-        dragon_tiger = self._safe_route(
-            "get_dragon_tiger",
-            manifest,
-            field_name="market.dragon_tiger",
-            route_trace=route_trace,
-            trade_date=request.normalized_trade_date(),
-        )
-        capital_flow = []
-        if request.include_capital_flow:
-            capital_flow = self._safe_route(
-                "get_capital_flow",
-                manifest,
-                field_name="stock.capital_flow",
-                route_trace=route_trace,
-                code=request.ticker,
-                start_date=request.start_date,
-                end_date=request.normalized_end_date(),
-            )
-        news = []
-        if request.include_news:
-            news = self._safe_route(
-                "get_news",
-                manifest,
-                field_name="news.events",
-                route_trace=route_trace,
-                code=request.ticker,
-                sector=request.sector_keyword,
-                keyword=request.news_keyword,
-                trade_date=request.normalized_trade_date(),
-            )
-            if request.fetch_news_full_text and isinstance(news, list):
-                news = self._enrich_news_full_text(news)
-        st_status: list[str] | dict[str, Any] = []
-        suspended: list[str] | dict[str, Any] = []
-        delisting: list[str] | dict[str, Any] = []
-        if request.include_risk:
-            st_status = self._safe_route(
-                "get_st_status",
-                manifest,
-                field_name="risk.st_status",
-                route_trace=route_trace,
-                trade_date=request.normalized_trade_date(),
-            )
-            suspended = self._safe_route(
-                "get_suspended",
-                manifest,
-                field_name="risk.suspended",
-                route_trace=route_trace,
-                trade_date=request.normalized_trade_date(),
-            )
-            delisting = self._safe_route(
-                "get_delisting",
-                manifest,
-                field_name="risk.delisting",
-                route_trace=route_trace,
-                trade_date=request.normalized_trade_date(),
-            )
-
-        return {
-            "stage": "raw",
-            "created_at": _utc_now(),
-            "daily": daily,
-            "market": market,
-            "sector_context": sector_context,
-            "limit_up_summary": limit_up_summary if isinstance(limit_up_summary, dict) else {},
-            "dragon_tiger": dragon_tiger if isinstance(dragon_tiger, list) else [],
-            "market_breadth": market_breadth if isinstance(market_breadth, dict) else {},
-            "capital_flow": capital_flow,
-            "news": news,
-            "risk": {
-                "st_status": st_status,
-                "suspended": suspended,
-                "delisting": delisting,
-            },
-            "route_trace": route_trace,
-        }
-
-    def _safe_route(
-        self,
-        method: str,
-        manifest: DataManifest,
-        *,
-        field_name: str,
-        route_trace: list[dict[str, Any]] | None = None,
-        **kwargs: Any,
-    ) -> Any:
-        vendor_chain = get_vendor_chain(method)
-        try:
-            result, _elapsed_ms = timed_vendor_call(
-                method,
-                route_trace=route_trace,
-                route_fn=self._route_fn,
-                **kwargs,
-            )
-            is_no_data = isinstance(result, str) and result.startswith("NO_DATA_AVAILABLE")
-            count = len(result) if isinstance(result, list) else None
-            manifest.add_field(
-                field_name,
-                available=not is_no_data,
-                source=f"vendor_router:{method}",
-                vendor_chain=vendor_chain,
-                fallback_used=len(vendor_chain) > 1,
-                error=result if is_no_data else None,
-                record_count=count,
-            )
-            return result
-        except Exception as exc:
-            manifest.add_field(
-                field_name,
-                available=False,
-                source=f"vendor_router:{method}",
-                vendor_chain=vendor_chain,
-                error=str(exc),
-            )
-            return {
-                "error": str(exc),
-                "method": method,
-                "vendor_chain": vendor_chain,
-            }
+        """Compatibility wrapper: raw fetching is delegated to scan."""
+        return self._collect_scan_package(request, manifest, route_trace).raw_payload
 
     def _clean(self, raw_payload: dict[str, Any]) -> dict[str, Any]:
-        daily_raw = raw_payload.get("daily")
-        if isinstance(daily_raw, list):
-            daily_df = DataCleaner.clean_daily(daily_raw)
-            daily_df = DataCleaner.detect_limit_up_down(daily_df)
-        else:
-            daily_df = pd.DataFrame()
-
-        capital_flow_raw = raw_payload.get("capital_flow")
-        capital_flow = capital_flow_raw if isinstance(capital_flow_raw, list) else []
-        news_raw = raw_payload.get("news")
-        news = news_raw if isinstance(news_raw, list) else []
-        market_raw = raw_payload.get("market")
-        if isinstance(market_raw, list):
-            market_df = DataCleaner.clean_daily(market_raw)
-        else:
-            market_df = pd.DataFrame()
-        limit_up_summary = raw_payload.get("limit_up_summary")
-        dragon_tiger_raw = raw_payload.get("dragon_tiger")
-        market_breadth = raw_payload.get("market_breadth")
-        sector_raw = raw_payload.get("sector_context")
-        sector_context = self._clean_sector_context(sector_raw if isinstance(sector_raw, list) else [])
-        risk_raw = raw_payload.get("risk", {})
-
-        return {
-            "stage": "cleaned",
-            "created_at": _utc_now(),
-            "market": {
-                "record_count": int(len(market_df)),
-                "columns": list(market_df.columns),
-                "records": _records_from_frame(market_df),
-            },
-            "daily": {
-                "record_count": int(len(daily_df)),
-                "columns": list(daily_df.columns),
-                "records": _records_from_frame(daily_df),
-            },
-            "sector_context": {
-                "record_count": len(sector_context),
-                "records": sector_context,
-            },
-            "limit_up_summary": limit_up_summary if isinstance(limit_up_summary, dict) else {},
-            "dragon_tiger": {
-                "record_count": len(dragon_tiger_raw) if isinstance(dragon_tiger_raw, list) else 0,
-                "records": dragon_tiger_raw if isinstance(dragon_tiger_raw, list) else [],
-            },
-            "market_breadth": market_breadth if isinstance(market_breadth, dict) else {},
-            "capital_flow": {
-                "record_count": len(capital_flow),
-                "records": capital_flow,
-            },
-            "news": {
-                "record_count": len(news),
-                "records": self._clean_news(news),
-            },
-            "risk": risk_raw if isinstance(risk_raw, dict) else {},
-        }
+        """Compatibility wrapper: cleaning is owned by scan."""
+        return MarketScanner.clean_data_agent_raw(raw_payload)
 
     def _analyze(
         self,
@@ -717,7 +492,7 @@ class DataAgent:
             )
 
         if request.include_factors and not daily_df.empty:
-            factor_df = FactorCalculator.run_all(daily_df.copy())
+            factor_df = FactorCalculator.run_all(self._enrich_daily_with_financials(daily_df.copy(), request.ticker))
             factor_records = _records_from_frame(factor_df, limit=request.max_return_records)
 
         market_summary = self._summarize_market(
@@ -756,6 +531,12 @@ class DataAgent:
             dragon_tiger_records=dragon_tiger_records if isinstance(dragon_tiger_records, list) else [],
             data_quality=data_quality,
         )
+        # Phase 0.5: inject A-share specialist signals into tier2
+        a_share_signals = AShareSignalBuilder.build(tier2)
+        tier2["a_share_signals"] = a_share_signals
+
+        # LLM data quality review
+        review = self._llm_review_data(tier1, tier2, request)
 
         return {
             "stage": "analysis",
@@ -783,7 +564,69 @@ class DataAgent:
                 "tier1_data": tier1,
                 "tier2_data": tier2,
             },
+            "llm_review": review,
         }
+
+    def _llm_review_data(
+        self,
+        tier1: dict[str, Any],
+        tier2: dict[str, Any],
+        request: DataAgentRequest,
+    ) -> dict[str, Any]:
+        """LLM sanity check on collected data quality."""
+        try:
+            from ..llm.client import create_llm
+
+            # Build a compact summary for the LLM
+            factors = tier2.get("factors", [])
+            latest_factor = factors[-1] if factors else {}
+            events = tier2.get("events", [])
+            sector = tier1.get("sector", {})
+            market = tier1.get("market", {})
+
+            summary = {
+                "ticker": request.ticker,
+                "trade_date": request.normalized_trade_date(),
+                "sector": sector.get("matched_sector"),
+                "sector_confidence": sector.get("match_confidence"),
+                "market_index": market.get("index_close"),
+                "market_change": market.get("index_change_pct"),
+                "events_count": len(events),
+                "factors": {
+                    k: latest_factor.get(k)
+                    for k in ["roe", "profit_growth", "revenue_growth", "pe",
+                              "momentum_20d", "composite_score"]
+                    if latest_factor.get(k) is not None
+                },
+                "event_directions": [e.get("direction") for e in events[:5]],
+                "signals": {
+                    k: tier2.get("a_share_signals", {}).get(k, {}).get("signal")
+                    for k in ["hot_money", "policy", "multifactor"]
+                },
+            }
+
+            llm = create_llm()
+            prompt = json.dumps(summary, ensure_ascii=False, indent=2)
+            response = llm.chat(
+                [
+                    ("system",
+                     "你是量化数据管道的质量审查员。检查以下数据摘要，找出异常或矛盾之处。"
+                     "关注：因子值是否在合理范围、板块匹配是否可信、事件方向是否一致。"
+                     "只返回 JSON：{\"ok\": true/false, \"issues\": [\"问题描述\"], \"confidence\": 0-1}。"
+                     "如果没有问题，ok=true, issues=[]。50字以内。"),
+                    ("human", prompt),
+                ],
+                temperature=0,
+                max_tokens=200,
+            )
+            result = json.loads(str(response))
+            return {
+                "ok": bool(result.get("ok", True)),
+                "issues": result.get("issues", []),
+                "confidence": float(result.get("confidence", 0.8)),
+            }
+        except Exception as e:
+            return {"ok": True, "issues": [], "confidence": 0.5, "error": str(e)[:100]}
 
     @classmethod
     def _summarize_market(
@@ -888,14 +731,14 @@ class DataAgent:
     def _summarize_risk(cls, risk_raw: dict[str, Any], *, latest: dict[str, Any]) -> dict[str, Any]:
         errors: list[str] = []
         lists: dict[str, list[Any]] = {}
-        for field in ["st_status", "suspended", "delisting"]:
-            value = risk_raw.get(field)
+        for risk_field in ["st_status", "suspended", "delisting"]:
+            value = risk_raw.get(risk_field)
             if isinstance(value, list):
-                lists[field] = value
+                lists[risk_field] = value
             else:
-                lists[field] = []
+                lists[risk_field] = []
                 if isinstance(value, dict) and value.get("error"):
-                    errors.append(f"{field}: {value['error']}")
+                    errors.append(f"{risk_field}: {value['error']}")
         return {
             "st_list": lists["st_status"],
             "suspended_list": lists["suspended"],
@@ -922,67 +765,102 @@ class DataAgent:
         dragon_tiger_records: list[dict[str, Any]],
         data_quality: dict[str, Any],
     ) -> tuple[dict[str, Any], dict[str, Any]]:
-        tier1 = {
-            "market": {
-                "index_close": market_summary.get("index_close", 0),
-                "index_change_pct": market_summary.get("index_change_pct", 0),
-                "advance_count": market_summary.get("advance_count", 0),
-                "decline_count": market_summary.get("decline_count", 0),
-                "limit_up_count": market_summary.get("limit_up_count", 0),
-                "limit_down_count": market_summary.get("limit_down_count", 0),
-                "limit_up_breakdown": market_summary.get("limit_up_breakdown", {}),
-                "dragon_tiger_count": market_summary.get("dragon_tiger_count", 0),
-                "breadth_sample_size": market_summary.get("breadth_sample_size", 0),
-                "breadth_coverage_note": market_summary.get("breadth_coverage_note", ""),
-            },
-            "sentiment": {
-                "sentiment": market_summary.get("sentiment", "未知"),
-                "sentiment_score": market_summary.get("sentiment_score", 50),
-            },
-            "capital": capital_summary,
-            "risk": risk_summary,
-            "sector": {
-                "status": sector_summary.get("status", "unavailable"),
-                "matched_sector": sector_summary.get("matched_sector"),
-                "match_confidence": sector_summary.get("match_confidence", 0),
-                "top_sectors": sector_summary.get("top_sectors", []),
-            },
-        }
-        tier2 = {
-            "price_data": daily_records,
-            "factors": factor_records,
-            "events": event_records,
-            "sector_context": sector_summary,
-            "limit_up_summary": market_summary.get("limit_up_breakdown", {}),
-            "dragon_tiger": dragon_tiger_records if isinstance(dragon_tiger_records, list) else [],
-            "backtest_samples": [],
-            "data_summary": summary,
-            "data_quality": data_quality,
-        }
-        return tier1, tier2
+        return build_agent_payload(
+            summary=summary,
+            market_summary=market_summary,
+            sector_summary=sector_summary,
+            capital_summary=capital_summary,
+            risk_summary=risk_summary,
+            daily_records=daily_records,
+            factor_records=factor_records,
+            event_records=event_records,
+            dragon_tiger_records=dragon_tiger_records,
+            data_quality=data_quality,
+        )
 
     @classmethod
     def _clean_sector_context(cls, records: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        cleaned: list[dict[str, Any]] = []
-        for idx, record in enumerate(records, start=1):
-            sector_name = cls._first_present(record, ["sector_name", "板块名称", "行业", "name", "名称"]) or ""
-            change_pct = cls._parse_number(cls._first_present(record, ["change_pct", "涨跌幅", "涨跌幅%", "change"])) or 0
-            strength_score = cls._parse_number(record.get("strength_score"))
-            if strength_score is None:
-                strength_score = change_pct
+        return clean_sector_context(records)
+
+    @staticmethod
+    def _enrich_daily_with_financials(daily_df: pd.DataFrame, ticker: str) -> pd.DataFrame:
+        """Merge latest quarterly financial data into OHLCV for FactorCalculator."""
+        try:
+            import baostock as bs
+            from datetime import date as dt_date
+
+            parts = ticker.split(".")
+            code = f"{parts[1].lower()}.{parts[0]}" if len(parts) == 2 else ticker
+            today = dt_date.today()
+            y, q = today.year, (today.month - 1) // 3 + 1
+
+            bs.login()
             try:
-                rank = int(record.get("rank", idx))
-            except (TypeError, ValueError):
-                rank = idx
-            cleaned.append({
-                "rank": rank,
-                "sector_name": str(sector_name),
-                "change_pct": change_pct,
-                "strength_score": strength_score,
-                "source": record.get("data_source", record.get("source", "")),
-                "raw": record,
-            })
-        return cleaned
+                # Try quarters from current back to find latest available
+                profit_rows, growth_rows = [], []
+                for _ in range(3):
+                    rs = bs.query_profit_data(code=code, year=y, quarter=q)
+                    while rs.error_code == "0" and rs.next():
+                        profit_rows.append(dict(zip(rs.fields, rs.get_row_data())))
+                    if profit_rows:
+                        break
+                    q -= 1
+                    if q == 0:
+                        y -= 1
+                        q = 4
+                # Fetch growth data for the same quarter we found profit data
+                if profit_rows:
+                    latest_q = profit_rows[0]
+                    stat_date = latest_q.get("statDate", "")
+                    if stat_date:
+                        sy, sq = int(stat_date[:4]), (int(stat_date[5:7]) - 1) // 3 + 1
+                    else:
+                        sy, sq = y, q
+                    rs2 = bs.query_growth_data(code=code, year=sy, quarter=sq)
+                    while rs2.error_code == "0" and rs2.next():
+                        growth_rows.append(dict(zip(rs2.fields, rs2.get_row_data())))
+            finally:
+                bs.logout()
+
+            if not profit_rows:
+                return daily_df
+
+            latest = profit_rows[0]
+            growth = growth_rows[0] if growth_rows else {}
+
+            def _g(key: str) -> float | None:
+                return _parse_financial_value(growth.get(key))
+
+            net_profit = _parse_financial_value(latest.get("netProfit"))
+            roe = _parse_financial_value(latest.get("roeAvg"))
+            eps = _parse_financial_value(latest.get("epsTTM"))
+            gp_margin = _parse_financial_value(latest.get("gpMargin"))
+            np_margin = _parse_financial_value(latest.get("npMargin"))
+            total_share = _parse_financial_value(latest.get("totalShare"))
+            revenue_raw = _parse_financial_value(latest.get("MBRevenue"))
+
+            if np_margin and np_margin > 0 and net_profit and not revenue_raw:
+                revenue_raw = net_profit / np_margin
+
+            if net_profit is not None: daily_df["net_profit"] = net_profit
+            if roe is not None:        daily_df["roe"] = roe
+            if revenue_raw is not None: daily_df["revenue"] = revenue_raw
+            if eps is not None:        daily_df["eps"] = eps
+            if total_share is not None: daily_df["total_share"] = total_share
+            if gp_margin is not None:  daily_df["gross_margin"] = gp_margin
+            if np_margin is not None:  daily_df["net_margin"] = np_margin
+            if eps and eps > 0 and "close" in daily_df.columns:
+                daily_df["pe"] = pd.to_numeric(daily_df["close"], errors="coerce") / eps
+
+            # Official YoY growth from baostock
+            yoy_ni = _parse_financial_value(growth.get("YOYNI")) if growth else None
+            if yoy_ni is not None:
+                daily_df["profit_growth"] = yoy_ni
+                daily_df["revenue_growth"] = yoy_ni  # proxy: no direct revenue growth in growth_data
+
+        except Exception:
+            pass
+        return daily_df
 
     @classmethod
     def _summarize_sector_context(
@@ -990,75 +868,24 @@ class DataAgent:
         records: list[dict[str, Any]],
         request: DataAgentRequest,
     ) -> dict[str, Any]:
-        if not records:
-            return {
-                "status": "unavailable",
-                "matched_sector": None,
-                "match_confidence": 0.0,
-                "match_strategy": "no_sector_records",
-                "direct_stock_sector_supported": False,
-                "top_sectors": [],
-                "records": [],
-                "reason": "No sector records were returned by the configured free data source.",
-            }
+        stock_boards: list[str] | None = None
+        try:
+            import efinance as ef
+            digits = request.ticker.split(".")[0]
+            df = ef.stock.get_belong_board(digits)
+            if df is not None and not df.empty:
+                stock_boards = [str(b) for b in df.get("板块名称", []) if b]
+        except Exception:
+            pass
 
-        ranked = sorted(
+        return summarize_sector_context(
             records,
-            key=lambda item: (
-                -float(item.get("strength_score") or 0),
-                int(item.get("rank") or 999999),
-            ),
+            sector_keyword=request.sector_keyword,
+            news_keyword=request.news_keyword,
+            ticker=request.ticker,
+            sector_top_n=request.sector_top_n,
+            stock_boards=stock_boards,
         )
-        top_sectors = [
-            {
-                "rank": item.get("rank"),
-                "sector_name": item.get("sector_name", ""),
-                "change_pct": item.get("change_pct", 0),
-                "strength_score": item.get("strength_score", 0),
-                "source": item.get("source", ""),
-            }
-            for item in ranked[:10]
-        ]
-        keywords = [
-            ("sector_keyword", request.sector_keyword),
-            ("news_keyword", request.news_keyword),
-            ("ticker", request.ticker),
-        ]
-        matched: dict[str, Any] | None = None
-        strategy = "top_rank_fallback"
-        confidence = 0.3
-        for label, value in keywords:
-            keyword = str(value or "").strip().lower()
-            if not keyword:
-                continue
-            for item in ranked:
-                sector_name = str(item.get("sector_name") or "").strip()
-                sector_lower = sector_name.lower()
-                if not sector_lower:
-                    continue
-                if keyword in sector_lower or sector_lower in keyword:
-                    matched = item
-                    strategy = f"{label}_match"
-                    confidence = 0.9 if label == "sector_keyword" else 0.75
-                    break
-            if matched is not None:
-                break
-        if matched is None:
-            matched = ranked[0]
-
-        return {
-            "status": "matched" if strategy != "top_rank_fallback" else "fallback_top_sector",
-            "matched_sector": matched.get("sector_name"),
-            "match_confidence": confidence,
-            "match_strategy": strategy,
-            "direct_stock_sector_supported": False,
-            "top_sectors": top_sectors,
-            "records": ranked[: request.sector_top_n],
-            "reason": (
-                "Sector context is built from market-wide sector rankings. "
-                "Without a paid/stock-membership endpoint, ticker-to-sector matching is heuristic."
-            ),
-        }
 
     @classmethod
     def _summarize_vendor_health(cls, route_trace: list[dict[str, Any]]) -> dict[str, Any]:
@@ -1209,207 +1036,15 @@ class DataAgent:
 
     @classmethod
     def _clean_news(cls, records: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        cleaned: list[dict[str, Any]] = []
-        for idx, record in enumerate(records, start=1):
-            title = cls._first_present(record, ["title", "标题", "新闻标题", "article_title", "name"]) or ""
-            summary = cls._first_present(record, ["summary", "摘要", "内容", "content", "article_content"]) or title
-            full_text = cls._first_present(record, ["full_text", "正文", "text", "article_text"])
-            evidence_text = cls._select_evidence_text(full_text, summary, title)
-            content_cleaning = record.get("content_cleaning")
-            source = cls._first_present(record, ["source", "来源", "data_source"]) or record.get("data_source", "")
-            event_time = cls._first_present(record, ["time", "时间", "datetime", "发布时间", "date", "日期"])
-            url = cls._first_present(record, ["url", "链接", "link"])
-            cleaned.append({
-                "event_id": str(record.get("event_id") or f"news_{idx:04d}"),
-                "event_type": str(record.get("event_type") or "新闻"),
-                "summary": str(summary)[:500],
-                "title": str(title or summary)[:200],
-                "full_text": str(full_text or "")[:8000],
-                "evidence_text": evidence_text,
-                "content_status": str(record.get("content_status") or ("full_text" if full_text else "summary_only")),
-                "content_cleaning": content_cleaning if isinstance(content_cleaning, dict) else {},
-                "content_error": record.get("content_error"),
-                "direction": str(record.get("direction") or "中性"),
-                "confidence": float(record.get("confidence") or 0.5),
-                "event_time": cls._json_safe_value(event_time),
-                "source": source,
-                "url": url,
-                "raw": record,
-            })
-        return cleaned
+        return clean_news(records)
 
     @classmethod
     def _select_evidence_text(cls, full_text: Any, summary: Any, title: Any) -> str:
-        text = str(full_text or "").strip()
-        if len(text) >= 80:
-            return text[:3000]
-        fallback = str(summary or title or "").strip()
-        return fallback[:1500]
-
-    @classmethod
-    def _enrich_news_full_text(cls, records: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        enriched: list[dict[str, Any]] = []
-        for record in records:
-            item = dict(record)
-            title = cls._first_present(item, ["title", "标题", "新闻标题", "article_title", "name"]) or ""
-            summary = cls._first_present(item, ["summary", "摘要", "内容", "content", "article_content"]) or title
-            existing_text = cls._first_present(item, ["full_text", "正文", "text", "article_text"])
-            url = cls._first_present(item, ["url", "链接", "link"])
-
-            if existing_text:
-                cleaned_text, cleaning_trace = cls._clean_article_text(str(existing_text))
-                item["raw_full_text"] = str(existing_text)[:12000]
-                item["full_text"] = cleaned_text[:8000]
-                item["content_status"] = item.get("content_status") or ("full_text" if cleaned_text else "summary_only")
-                item["content_cleaning"] = cleaning_trace
-                item["evidence_text"] = cls._select_evidence_text(item["full_text"], summary, title)
-                enriched.append(item)
-                continue
-
-            if not url:
-                item["full_text"] = ""
-                item["content_status"] = item.get("content_status") or "summary_only"
-                item["content_error"] = item.get("content_error") or "missing_url"
-                item["evidence_text"] = cls._select_evidence_text("", summary, title)
-                enriched.append(item)
-                continue
-
-            try:
-                full_text = cls._fetch_news_full_text(str(url))
-            except Exception as exc:
-                full_text = ""
-                item["content_error"] = f"{type(exc).__name__}: {str(exc)[:200]}"
-
-            if full_text:
-                cleaned_text, cleaning_trace = cls._clean_article_text(full_text)
-                item["raw_full_text"] = full_text[:12000]
-                item["full_text"] = cleaned_text[:8000]
-                item["content_status"] = "full_text" if cleaned_text else "summary_only"
-                item["content_cleaning"] = cleaning_trace
-                item["content_error"] = item.get("content_error")
-            else:
-                item["full_text"] = ""
-                item["content_status"] = "summary_only"
-                item["content_cleaning"] = {
-                    "status": "skipped",
-                    "raw_length": 0,
-                    "cleaned_length": 0,
-                    "removed_segments": 0,
-                    "deduplicated_segments": 0,
-                }
-                item["content_error"] = item.get("content_error") or "extract_empty"
-            item["evidence_text"] = cls._select_evidence_text(item.get("full_text"), summary, title)
-            enriched.append(item)
-        return enriched
-
-    @classmethod
-    def _fetch_news_full_text(cls, url: str) -> str:
-        response = requests.get(
-            url,
-            headers={
-                "User-Agent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
-                )
-            },
-            timeout=8,
-        )
-        response.raise_for_status()
-        response.encoding = response.apparent_encoding or response.encoding or "utf-8"
-        return cls._extract_article_text(response.text)
-
-    @classmethod
-    def _extract_article_text(cls, html: str) -> str:
-        text = _SCRIPT_STYLE_RE.sub(" ", html or "")
-        paragraphs = re.findall(r"<p[^>]*>(.*?)</p>", text, flags=re.IGNORECASE | re.DOTALL)
-        if paragraphs:
-            candidates = [_WHITESPACE_RE.sub(" ", _HTML_TAG_RE.sub(" ", p)).strip() for p in paragraphs]
-            body = "\n".join(p for p in candidates if len(p) >= 12)
-        else:
-            body = _HTML_TAG_RE.sub(" ", text)
-        body = unescape(body).replace("\u3000", " ").replace("\xa0", " ")
-        body = "\n".join(
-            _WHITESPACE_RE.sub(" ", line).strip()
-            for line in body.splitlines()
-            if line.strip()
-        )
-        if len(body) < 80:
-            return ""
-        return body[:12000]
-
-    @classmethod
-    def _clean_article_text(cls, text: str) -> tuple[str, dict[str, Any]]:
-        raw = unescape(text or "").replace("\u3000", " ").replace("\xa0", " ")
-        raw = raw.replace("\r\n", "\n").replace("\r", "\n")
-        raw_length = len(raw)
-
-        segments = [
-            _WHITESPACE_RE.sub(" ", segment).strip()
-            for segment in re.split(r"\n+|(?<=[。！？；])\s+", raw)
-        ]
-        cleaned_segments: list[str] = []
-        seen: set[str] = set()
-        removed = 0
-        deduped = 0
-        for segment in segments:
-            if not segment:
-                continue
-            segment = cls._strip_news_noise(segment)
-            if not segment:
-                removed += 1
-                continue
-            if cls._is_noise_segment(segment):
-                removed += 1
-                continue
-            normalized_key = re.sub(r"\W+", "", segment.lower())
-            if normalized_key and normalized_key in seen:
-                deduped += 1
-                continue
-            if normalized_key:
-                seen.add(normalized_key)
-            cleaned_segments.append(segment)
-
-        cleaned = "\n".join(cleaned_segments).strip()
-        if len(cleaned) < 80:
-            cleaned = _WHITESPACE_RE.sub(" ", raw).strip()
-            status = "raw_fallback" if cleaned else "empty"
-        else:
-            status = "cleaned"
-        cleaned = cleaned[:12000]
-        return cleaned, {
-            "status": status,
-            "raw_length": raw_length,
-            "cleaned_length": len(cleaned),
-            "removed_segments": removed,
-            "deduplicated_segments": deduped,
-        }
-
-    @classmethod
-    def _strip_news_noise(cls, text: str) -> str:
-        text = re.sub(r"https?://\S+", "", text).strip()
-        text = re.sub(r"（?文章来源[:：].*?）?$", "", text).strip()
-        text = re.sub(r"（?责任编辑[:：].*?）?$", "", text).strip()
-        text = re.sub(r"（?编辑[:：].*?）?$", "", text).strip()
-        text = re.sub(r"（?原标题[:：].*?）?$", "", text).strip()
-        return _WHITESPACE_RE.sub(" ", text).strip()
-
-    @classmethod
-    def _is_noise_segment(cls, text: str) -> bool:
-        if len(text) < 6:
-            return True
-        if any(pattern.search(text) for pattern in _NEWS_NOISE_PATTERNS):
-            return True
-        if text.count(" ") > 0 and len(text.split()) <= 2 and len(text) < 16:
-            return True
-        return False
+        return select_evidence_text(full_text, summary, title)
 
     @staticmethod
     def _first_present(record: dict[str, Any], keys: list[str]) -> Any:
-        for key in keys:
-            value = record.get(key)
-            if value not in (None, ""):
-                return value
-        return None
+        return first_present(record, keys)
 
     @classmethod
     def _build_event_records(
@@ -1417,150 +1052,20 @@ class DataAgent:
         news_records: list[dict[str, Any]],
         request: DataAgentRequest,
     ) -> list[dict[str, Any]]:
-        events = []
-        for record in news_records[: request.max_news_records]:
-            events.append({
-                "event_id": record.get("event_id"),
-                "event_type": record.get("event_type", "新闻"),
-                "summary": record.get("summary", ""),
-                "evidence_text": record.get("evidence_text") or record.get("summary", ""),
-                "content_status": record.get("content_status", "summary_only"),
-                "content_cleaning": record.get("content_cleaning", {}),
-                "content_error": record.get("content_error"),
-                "direction": record.get("direction", "中性"),
-                "confidence": record.get("confidence", 0.5),
-                "transmission_path": record.get("transmission_path", "新闻输入"),
-                "direct_beneficiaries": record.get("direct_beneficiaries") or [request.sector_keyword or request.ticker],
-                "evidence_level": "公开新闻",
-                "pricing_status": "未定价",
-                "chain_quality": record.get("chain_quality", "weak"),
-                "event_time": record.get("event_time"),
-                "source": record.get("source", ""),
-                "url": record.get("url"),
-                "news_scope": record.get("news_scope", "ticker"),
-                "sector_name": record.get("sector_name"),
-                "raw": record.get("raw", {}),
-            })
-        return events
+        return build_event_records(news_records, request)
 
     def _filter_news_with_llm(
         self,
         news_records: list[dict[str, Any]],
         request: DataAgentRequest,
     ) -> dict[str, Any]:
-        if not news_records:
-            return {
-                "records": [],
-                "trace": {
-                    "mode": "empty",
-                    "used_llm": False,
-                    "reason": "no news records",
-                    "input_count": 0,
-                    "output_count": 0,
-                },
-            }
-
-        if not request.use_llm_news_filter:
-            records = self._filter_news_deterministically(news_records, request)
-            return {
-                "records": records,
-                "trace": {
-                    "mode": "deterministic",
-                    "used_llm": False,
-                    "reason": "LLM news filter disabled",
-                    "input_count": len(news_records),
-                    "output_count": len(records),
-                },
-            }
-
-        try:
-            llm = self._get_news_filter_llm()
-            if not self._llm_news_filter_configured(llm):
-                raise RuntimeError(f"{getattr(llm, 'provider', 'llm')} API key is not configured")
-            decisions = self._ask_llm_to_filter_news(llm, news_records, request)
-            selected: list[dict[str, Any]] = []
-            decision_by_id = {str(item.get("event_id")): item for item in decisions}
-            decision_trace: list[dict[str, Any]] = []
-            for record in news_records:
-                decision = decision_by_id.get(str(record.get("event_id")), {})
-                try:
-                    relevance = float(decision.get("relevance", 0))
-                except (TypeError, ValueError):
-                    relevance = 0.0
-                keep = bool(decision.get("keep"))
-                decision_trace.append({
-                    "event_id": record.get("event_id"),
-                    "title": record.get("title"),
-                    "keep": keep,
-                    "relevance": relevance,
-                    "direction": decision.get("direction"),
-                    "confidence": self._bounded_float(decision.get("confidence"), default=0.0),
-                    "reason": str(decision.get("reason", ""))[:300],
-                })
-                if not keep or relevance < request.news_relevance_threshold:
-                    continue
-                selected.append({
-                    **record,
-                    "direction": decision.get("direction") or record.get("direction", "中性"),
-                    "confidence": self._bounded_float(decision.get("confidence"), default=0.5),
-                    "llm_relevance": relevance,
-                    "llm_reason": str(decision.get("reason", ""))[:300],
-                })
-            guardrail_records = []
-            if not selected:
-                guardrail_records = self._filter_news_deterministically(news_records, request)
-                for record in guardrail_records:
-                    selected.append({
-                        **record,
-                        "llm_relevance": max(float(record.get("llm_relevance", 0.5)), request.news_relevance_threshold),
-                        "llm_reason": "keyword guardrail after LLM filtered all candidates",
-                    })
-            return {
-                "records": selected[: request.max_news_records],
-                "trace": {
-                    "mode": "llm" if not guardrail_records else "llm_with_keyword_guardrail",
-                    "used_llm": True,
-                    "model": getattr(llm, "model", ""),
-                    "provider": getattr(llm, "provider", ""),
-                    "input_count": len(news_records),
-                    "output_count": len(selected[: request.max_news_records]),
-                    "threshold": request.news_relevance_threshold,
-                    "guardrail_added_count": len(guardrail_records),
-                    "decisions": decision_trace,
-                },
-            }
-        except Exception as exc:
-            records = self._filter_news_deterministically(news_records, request)
-            return {
-                "records": records,
-                "trace": {
-                    "mode": "fallback",
-                    "used_llm": False,
-                    "reason": f"{type(exc).__name__}: {exc}",
-                    "input_count": len(news_records),
-                    "output_count": len(records),
-                    "threshold": request.news_relevance_threshold,
-                },
-            }
+        return NewsFilter(llm_client=self._llm_client).filter(news_records, request)
 
     def _get_news_filter_llm(self) -> Any:
-        if self._llm_client is not None:
-            return self._llm_client
-        from ..llm.client import create_llm
-
-        return create_llm()
+        return NewsFilter(llm_client=self._llm_client).get_llm()
 
     def _llm_news_filter_configured(self, llm: Any) -> bool:
-        if self._llm_client is not None:
-            return True
-        provider = str(getattr(llm, "provider", "deepseek")).upper()
-        if provider == "DEEPSEEK":
-            return bool(os.environ.get("DEEPSEEK_API_KEY"))
-        if provider == "OPENAI":
-            return bool(os.environ.get("OPENAI_API_KEY"))
-        if provider == "ANTHROPIC":
-            return bool(os.environ.get("ANTHROPIC_API_KEY"))
-        return bool(os.environ.get(f"{provider}_API_KEY"))
+        return NewsFilter(llm_client=self._llm_client).llm_configured(llm)
 
     @classmethod
     def _ask_llm_to_filter_news(
@@ -1569,54 +1074,7 @@ class DataAgent:
         news_records: list[dict[str, Any]],
         request: DataAgentRequest,
     ) -> list[dict[str, Any]]:
-        candidates = [
-            {
-                "event_id": record.get("event_id"),
-                "title": record.get("title"),
-                "summary": record.get("summary"),
-                "evidence_text": str(record.get("evidence_text") or record.get("summary") or "")[:1200],
-                "content_status": record.get("content_status"),
-                "event_time": record.get("event_time"),
-                "source": record.get("source"),
-            }
-            for record in news_records[: max(request.max_news_records * 3, request.max_news_records)]
-        ]
-        prompt = {
-            "ticker": request.ticker,
-            "trade_date": request.normalized_trade_date(),
-            "news_keyword": request.news_keyword,
-            "sector_keyword": request.sector_keyword,
-            "task": (
-                "Select news relevant to this ticker, its company, its business, or its sector for downstream trading agents. "
-                "If sector_keyword is present, sector-level news is valid even when it does not mention the ticker directly. "
-                "If title or summary directly contains the ticker keyword, company name, sector keyword, or clearly describes this company or its board, keep it unless it is obviously unrelated. "
-                "Return one decision for every candidate in the same event_id space. "
-                "Return only JSON with key decisions: list of objects containing event_id, keep, "
-                "relevance from 0 to 1, direction in 正面/负面/中性, confidence from 0 to 1, and reason."
-            ),
-            "candidates": candidates,
-        }
-        response = llm.chat(
-            [
-                (
-                    "system",
-                    "你是量化交易数据管道里的新闻筛选器。只返回 JSON，不要输出解释文字。",
-                ),
-                ("human", json.dumps(prompt, ensure_ascii=False)),
-            ],
-            temperature=0,
-            max_tokens=1200,
-        )
-        payload = json.loads(str(response))
-        if isinstance(payload, list):
-            decisions = payload
-        elif isinstance(payload, dict):
-            decisions = payload.get("decisions", [])
-        else:
-            decisions = []
-        if not isinstance(decisions, list):
-            raise ValueError("LLM news filter response must contain a decisions list")
-        return [item for item in decisions if isinstance(item, dict)]
+        return ask_llm_to_filter_news(llm, news_records, request)
 
     @classmethod
     def _filter_news_deterministically(
@@ -1624,30 +1082,11 @@ class DataAgent:
         news_records: list[dict[str, Any]],
         request: DataAgentRequest,
     ) -> list[dict[str, Any]]:
-        keywords = [
-            str(request.sector_keyword or "").lower(),
-            str(request.news_keyword or "").lower(),
-            str(request.ticker or "").lower(),
-        ]
-        keywords = [keyword for keyword in keywords if keyword]
-        selected = []
-        for record in news_records:
-            haystack = json.dumps(record, ensure_ascii=False).lower()
-            if not keywords or any(keyword in haystack for keyword in keywords):
-                selected.append({
-                    **record,
-                    "llm_relevance": 0.5,
-                    "llm_reason": "deterministic keyword fallback",
-                })
-        return selected[: request.max_news_records]
+        return filter_news_deterministically(news_records, request)
 
     @staticmethod
     def _bounded_float(value: Any, *, default: float) -> float:
-        try:
-            parsed = float(value)
-        except (TypeError, ValueError):
-            return default
-        return max(0.0, min(1.0, parsed))
+        return bounded_float(value, default=default)
 
     def _write_json(self, path: Path, payload: dict[str, Any]) -> DataAgentArtifact:
         path.parent.mkdir(parents=True, exist_ok=True)

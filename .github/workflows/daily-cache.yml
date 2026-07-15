@@ -1,0 +1,61 @@
+name: Daily Cache Refresh
+
+on:
+  workflow_dispatch:
+    inputs:
+      trade_date:
+        description: "Trade date in YYYY-MM-DD; defaults to current UTC date"
+        required: false
+        type: string
+      force_news:
+        description: "Re-fetch existing news files for the day"
+        required: false
+        default: false
+        type: boolean
+  schedule:
+    - cron: "30 10 * * 1-5"
+
+jobs:
+  refresh-cache:
+    runs-on: ubuntu-latest
+    env:
+      ATA_RESULTS_DIR: ${{ github.workspace }}/.tmp_ata/results
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Project
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+
+      - name: Resolve Trade Date
+        id: resolve-date
+        shell: bash
+        run: |
+          if [ -n "${{ github.event.inputs.trade_date }}" ]; then
+            echo "trade_date=${{ github.event.inputs.trade_date }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "trade_date=$(date -u +%F)" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build Cache
+        shell: bash
+        run: |
+          FORCE_NEWS=""
+          if [ "${{ github.event.inputs.force_news }}" = "true" ]; then
+            FORCE_NEWS="--force-news"
+          fi
+          python -m advanced_trading_agent.data_agent.build_cache --date "${{ steps.resolve-date.outputs.trade_date }}" $FORCE_NEWS
+
+      - name: Upload Cache Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: local-cache-${{ steps.resolve-date.outputs.trade_date }}
+          path: .tmp_ata/results/local_cache
+          retention-days: 7

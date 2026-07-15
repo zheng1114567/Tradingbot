@@ -120,6 +120,206 @@ def build_daily_health_report(
     }
 
 
+def run_data_source_health(
+    trade_date: str | None = None,
+    *,
+    route_fn: Any | None = None,
+) -> dict[str, Any]:
+    """Probe the minimum data sources needed before running the strategy.
+
+    This is intentionally shallow: it verifies that the routing layer can get
+    representative A-share daily, sector, limit-up, and ETF spot data, and it
+    returns route traces so failures are attributable to a vendor.
+    """
+    from .vendor_router import route_to_vendor
+
+    td = trade_date or date.today().isoformat()
+    route = route_fn or route_to_vendor
+    probes = [
+        {
+            "name": "a_share_daily",
+            "method": "get_daily",
+            "kwargs": {"code": "000001.SZ", "start_date": td, "end_date": td},
+            "required": True,
+        },
+        {
+            "name": "sector_ranking",
+            "method": "get_sector",
+            "kwargs": {"top_n": 3, "trade_date": td},
+            "required": True,
+        },
+        {
+            "name": "limit_up_pool",
+            "method": "get_limit_up_tiers",
+            "kwargs": {"trade_date": td},
+            "required": False,
+        },
+        {
+            "name": "ticker_news",
+            "method": "get_news",
+            "kwargs": {"code": "000001.SZ", "keyword": "平安银行", "trade_date": td, "limit": 5},
+            "required": False,
+        },
+        {
+            "name": "sector_news",
+            "method": "get_news",
+            "kwargs": {"sector": "半导体", "keyword": "半导体", "trade_date": td, "limit": 5},
+            "required": False,
+        },
+        {
+            "name": "etf_spot",
+            "method": "get_etf_spot",
+            "kwargs": {"trade_date": td},
+            "required": True,
+        },
+    ]
+
+    results: dict[str, Any] = {}
+    for probe in probes:
+        trace: list[dict[str, Any]] = []
+        result: Any = None
+        error: str | None = None
+        try:
+            result = _call_route(route, probe["method"], trace, **probe["kwargs"])
+        except Exception as exc:
+            error = str(exc)
+        results[probe["name"]] = _summarize_probe_result(
+            result,
+            trace,
+            error=error,
+            required=bool(probe["required"]),
+        )
+
+    required = [item for item in results.values() if item["required"]]
+    if all(item["status"] == "ok" for item in required):
+        overall = "ok"
+    elif any(item["status"] == "ok" for item in required):
+        overall = "degraded"
+    else:
+        overall = "unavailable"
+    return {
+        "trade_date": td,
+        "overall_status": overall,
+        "probes": results,
+    }
+
+
+def refresh_etf_cache(
+    trade_date: str | None = None,
+    *,
+    etf_codes: list[str] | None = None,
+    daily_limit: int = 20,
+    route_fn: Any | None = None,
+) -> dict[str, Any]:
+    """Refresh ETF spot data and a small ETF daily cache slice.
+
+    If *etf_codes* is omitted, the function picks the most liquid ETF rows from
+    the fetched spot universe. The underlying akshare adapter writes through to
+    local cache on success.
+    """
+    from .vendor_router import route_to_vendor
+
+    td = trade_date or date.today().isoformat()
+    route = route_fn or route_to_vendor
+    trace: list[dict[str, Any]] = []
+    spot_error: str | None = None
+    spot_rows: list[dict[str, Any]] = []
+    try:
+        spot_result = _call_route(route, "get_etf_spot", trace, trade_date=td)
+        if isinstance(spot_result, list):
+            spot_rows = [row for row in spot_result if isinstance(row, dict)]
+        elif isinstance(spot_result, str):
+            spot_error = spot_result
+    except Exception as exc:
+        spot_error = str(exc)
+
+    selected_codes = list(dict.fromkeys(etf_codes or _select_liquid_etf_codes(spot_rows, daily_limit)))
+    daily_results: list[dict[str, Any]] = []
+    for code in selected_codes[:daily_limit]:
+        item_trace: list[dict[str, Any]] = []
+        try:
+            rows = _call_route(
+                route,
+                "get_etf_daily",
+                item_trace,
+                code=code,
+                start_date=td,
+                end_date=td,
+            )
+            row_count = len(rows) if isinstance(rows, list) else 0
+            daily_results.append({
+                "code": code,
+                "status": "ok" if row_count else "unavailable",
+                "row_count": row_count,
+                "route_trace": item_trace,
+            })
+        except Exception as exc:
+            daily_results.append({
+                "code": code,
+                "status": "error",
+                "error": str(exc),
+                "route_trace": item_trace,
+            })
+
+    return {
+        "trade_date": td,
+        "spot": {
+            "status": "ok" if spot_rows else "unavailable",
+            "row_count": len(spot_rows),
+            "error": spot_error,
+        },
+        "daily": {
+            "requested": len(selected_codes[:daily_limit]),
+            "success_count": sum(1 for item in daily_results if item["status"] == "ok"),
+            "results": daily_results,
+        },
+        "route_trace": trace,
+    }
+
+
+def _call_route(route_fn: Any, method: str, route_trace: list[dict[str, Any]], **kwargs: Any) -> Any:
+    try:
+        return route_fn(method, _route_trace=route_trace, **kwargs)
+    except TypeError:
+        return route_fn(method, **kwargs)
+
+
+def _summarize_probe_result(
+    result: Any,
+    route_trace: list[dict[str, Any]],
+    *,
+    error: str | None,
+    required: bool,
+) -> dict[str, Any]:
+    row_count = len(result) if isinstance(result, list) else len(result) if isinstance(result, dict) else 0
+    is_sentinel = isinstance(result, str) and result.startswith("NO_DATA_AVAILABLE")
+    status = "ok" if row_count > 0 and not is_sentinel and not error else "unavailable"
+    successful = [attempt for attempt in route_trace if attempt.get("status") == "success"]
+    failed_before_success = bool(successful and route_trace and route_trace[0] is not successful[0])
+    return {
+        "status": status,
+        "required": required,
+        "row_count": row_count,
+        "fallback_used": failed_before_success,
+        "success_vendor": successful[-1].get("vendor") if successful else None,
+        "error": error or result if is_sentinel else error,
+        "route_trace": route_trace,
+    }
+
+
+def _select_liquid_etf_codes(rows: list[dict[str, Any]], limit: int) -> list[str]:
+    def amount(row: dict[str, Any]) -> float:
+        value = row.get("amount")
+        try:
+            return float(value or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    sorted_rows = sorted(rows, key=amount, reverse=True)
+    codes = [str(row.get("code") or row.get("raw_code") or "") for row in sorted_rows]
+    return [code for code in codes if code][:limit]
+
+
 def _date_column(frame: pd.DataFrame) -> str | None:
     for candidate in ("trade_date", "datetime", "date"):
         if candidate in frame.columns:

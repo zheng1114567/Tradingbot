@@ -21,11 +21,21 @@ from datetime import date, datetime, timezone
 from typing import Any, Callable, TypedDict
 
 from ..core.vendor import timed_vendor_call
+from .build_cache import ensure_scan_cache
 from .scan_cleaning import clean_data_agent_raw as clean_raw_payload
 from .news_text import enrich_news_full_text
-from .vendor_router import route_to_vendor
+from .vendor_router import ensure_default_vendor_registration, get_vendor_impl, route_to_vendor
 
 logger = logging.getLogger(__name__)
+
+
+def route_to_local_cache_only(method: str, **kwargs: Any) -> Any:
+    """Resolve scan requests strictly from local cache implementations."""
+    ensure_default_vendor_registration()
+    impl = get_vendor_impl(method, "local_cache")
+    if impl is None:
+        raise RuntimeError(f"No local_cache implementation for {method}")
+    return impl(**kwargs)
 
 
 @dataclass
@@ -143,18 +153,25 @@ class MarketScanner:
         base_candidates: int | None = None,
         per_sector_cap: int | None = None,
         *,
-        route_fn: Callable[..., Any] = route_to_vendor,
+        route_fn: Callable[..., Any] | None = None,
+        cache_only: bool = True,
+        auto_refresh_cache: bool = False,
+        live_news_fallback: bool = False,
     ):
         self.top_sectors = top_sectors
         self.top_n = top_n
         self.base_candidates = min(base_candidates or 12, top_n)
         self.per_sector_cap = per_sector_cap or max(2, math.ceil(top_n / 3))
-        self._route_fn = route_fn
+        self._cache_only = cache_only
+        self._auto_refresh_cache = auto_refresh_cache
+        self._live_news_fallback = live_news_fallback
+        self._route_fn = route_fn or (route_to_local_cache_only if cache_only else route_to_vendor)
         self._last_scan_context: dict[str, Any] = {}
 
     def scan(self, trade_date: str | None = None) -> list[ScanResult]:
         """Run full market scan and return ranked results."""
         td = trade_date or date.today().isoformat()
+        self._ensure_cache_ready(td)
         scorer: dict[str, _ScorerEntry] = {}  # ticker -> accumulated evidence
         ctx: dict[str, Any] = {"trade_date": td}
 
@@ -171,7 +188,7 @@ class MarketScanner:
         self._scan_dragon_tiger(td, scorer)
 
         # Channel 5: Short-term technical signals (from local cache, no API)
-        self._scan_short_term_signals(td, scorer)
+        self._scan_short_term_signals(td, scorer, ctx)
 
         self._last_scan_context = ctx
 
@@ -272,18 +289,11 @@ class MarketScanner:
             if not code or not code[0].isdigit():
                 continue
             ticker = self._normalize_ticker(code)
+            if ticker not in scorer:
+                continue  # only bonus hot-sector stocks
             board = int(stock.get("board_count", 1))
             score = min(board * 1.5, 5.0)
 
-            if ticker not in scorer:
-                scorer[ticker] = {
-                    "name": str(stock.get("name", "")),
-                    "score": 0.0,
-                    "sectors": [],
-                    "sources": [],
-                    "board_count": 0,
-                    "reasons": [],
-                }
             scorer[ticker]["score"] += score
             scorer[ticker]["board_count"] = max(scorer[ticker]["board_count"], board)
             if "limit_up" not in scorer[ticker]["sources"]:
@@ -321,18 +331,11 @@ class MarketScanner:
             if not code or not code[0].isdigit():
                 continue
             ticker = self._normalize_ticker(code)
+            if ticker not in scorer:
+                continue  # only bonus hot-sector stocks
             net_buy = float(stock.get("net_buy", 0) or 0)
             score = 2.0 if net_buy > 0 else 1.0
 
-            if ticker not in scorer:
-                scorer[ticker] = {
-                    "name": str(stock.get("name", "")),
-                    "score": 0.0,
-                    "sectors": [],
-                    "sources": [],
-                    "board_count": 0,
-                    "reasons": [],
-                }
             scorer[ticker]["score"] += score
             if "northbound" not in scorer[ticker]["sources"]:
                 scorer[ticker]["sources"].append("northbound")
@@ -355,22 +358,15 @@ class MarketScanner:
             if not code or not code[0].isdigit():
                 continue
             ticker = self._normalize_ticker(code)
+            if ticker not in scorer:
+                continue  # only bonus hot-sector stocks
             score = 1.0  # supplementary signal only
 
-            if ticker not in scorer:
-                scorer[ticker] = {
-                    "name": str(stock.get("名称", stock.get("name", ""))),
-                    "score": 0.0,
-                    "sectors": [],
-                    "sources": [],
-                    "board_count": 0,
-                    "reasons": [],
-                }
             scorer[ticker]["score"] += score
             if "dragon_tiger" not in scorer[ticker]["sources"]:
                 scorer[ticker]["sources"].append("dragon_tiger")
 
-    def _scan_short_term_signals(self, td: str, scorer: dict[str, _ScorerEntry]) -> None:
+    def _scan_short_term_signals(self, td: str, scorer: dict[str, _ScorerEntry], ctx: dict[str, Any]) -> None:
         """Score stocks using cached short-term technical signals.
 
         Reads from short_term_signals_{date}.json (computed by build_cache
@@ -432,6 +428,7 @@ class MarketScanner:
                 )
 
         self._last_scan_context["short_term_signals"] = ctx_signals
+        ctx["short_term_signals"] = ctx_signals
         logger.debug("Short-term signal scan: scored %d tickers from cache", scored)
 
     # ------------------------------------------------------------------
@@ -485,6 +482,7 @@ class MarketScanner:
         - concentrated tape -> shrink candidate pool
         - broad tape -> widen candidate pool
         - always enforce a per-sector cap to avoid one-theme domination
+        - penalize stocks with no daily cache data (BJ/unlisted)
         """
         if not ranked:
             return []
@@ -498,7 +496,14 @@ class MarketScanner:
                 normalized = self._normalize_ticker(r.ticker)
                 if normalized == r.ticker:
                     continue  # still has no suffix, skip
+            # Penalize stocks without daily data: -4 points
+            if not self._has_daily_cache(r.ticker):
+                r.score = max(0, r.score - 4)
+                r.reason = f"[无日线数据] {r.reason}"
             filtered.append(r)
+
+        # Re-sort after penalty
+        filtered.sort(key=lambda r: r.score, reverse=True)
 
         dynamic_limit = self._dynamic_candidate_limit(filtered, ctx)
         selected: list[ScanResult] = []
@@ -552,6 +557,16 @@ class MarketScanner:
         if code.startswith(("8", "4", "920")):
             return f"{code}.BJ"
         return code
+
+    @staticmethod
+    def _has_daily_cache(ticker: str) -> bool:
+        """Check if daily parquet cache exists for this ticker."""
+        from pathlib import Path
+        from ..config import config
+
+        cache_dir = Path(config.get("results_dir")) / "local_cache" / "daily"
+        path = cache_dir / f"{ticker.replace('.', '_')}.parquet"
+        return path.exists()
 
     def format_results(self, results: list[ScanResult]) -> str:
         """Render scan results as a readable table."""
@@ -859,6 +874,7 @@ class MarketScanner:
         include_capital_flow: bool = True,
         include_news: bool = True,
         prefer_cached_news: bool = True,
+        allow_live_news: bool | None = None,
     ) -> ScanTickerRaw:
         """Collect per-ticker raw data: daily, capital_flow, enriched news.
 
@@ -881,15 +897,23 @@ class MarketScanner:
         if include_news:
             if prefer_cached_news:
                 news = get_cached_news(ticker, trade_date=trade_date)
-            if not news:
-                news = self._safe_fetch(
-                    "get_news",
-                    trace,
-                    code=ticker,
-                    sector=sector_keyword,
-                    keyword=news_keyword,
-                    trade_date=trade_date,
-                )
+            if not news and (self._live_news_fallback if allow_live_news is None else allow_live_news):
+                from .vendor_router import route_to_vendor
+                news_route_fn = route_to_vendor if self._route_fn is route_to_local_cache_only else self._route_fn
+                try:
+                    news, _elapsed = timed_vendor_call(
+                        "get_news",
+                        code=ticker,
+                        sector=sector_keyword,
+                        keyword=news_keyword,
+                        trade_date=trade_date,
+                        route_fn=news_route_fn,
+                        route_trace=trace,
+                    )
+                except Exception:
+                    news = []
+                if isinstance(news, dict):
+                    news = []
             if not news and not prefer_cached_news:
                 news = get_cached_news(ticker, trade_date=trade_date)
             if news_keyword and not news:
@@ -914,6 +938,7 @@ class MarketScanner:
             trace = route_trace
 
         trade_date = request.normalized_trade_date()
+        self._ensure_cache_ready(trade_date)
         end_date = request.normalized_end_date() or trade_date
 
         shared: ScanSharedRaw = {}
@@ -972,6 +997,7 @@ class MarketScanner:
             include_capital_flow=request.include_capital_flow,
             include_news=request.include_news,
             prefer_cached_news=False,
+            allow_live_news=True,
         )
 
         return {
@@ -1021,7 +1047,8 @@ class MarketScanner:
         trade_date: str | None = None,
         top_n: int | None = None,
         news_keyword: str | None = None,
-        fetch_news_full_text: bool = True,
+        fetch_news_full_text: bool = False,
+        live_news: bool = True,
     ) -> ScanBundle:
         """Scan for hot stocks and collect raw data for top candidates in one pass.
 
@@ -1032,6 +1059,7 @@ class MarketScanner:
         Returns a ScanBundle ready to feed into DataAgent.run_with_raw().
         """
         td = trade_date or date.today().isoformat()
+        self._ensure_cache_ready(td)
         limit = top_n or self.top_n
         route_trace: list[dict[str, Any]] = []
 
@@ -1050,6 +1078,7 @@ class MarketScanner:
             logger.info("Collecting data for %s %s", r.ticker, r.name)
             ticker_data[r.ticker] = self.collect_ticker_data(
                 r.ticker, td, news_keyword, route_trace, fetch_news_full_text,
+                allow_live_news=live_news,
             )
 
         return ScanBundle(
@@ -1059,6 +1088,14 @@ class MarketScanner:
             ticker_data=ticker_data,
             route_trace=route_trace,
         )
+
+    def _ensure_cache_ready(self, trade_date: str) -> None:
+        if not self._cache_only or not self._auto_refresh_cache:
+            return
+        try:
+            ensure_scan_cache(trade_date, compute_signals=True)
+        except Exception as exc:
+            logger.warning("Startup cache refresh failed for %s; scan will use existing local cache only: %s", trade_date, exc)
 
     def _safe_fetch(
         self,

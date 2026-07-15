@@ -22,7 +22,7 @@ def write_scan_report(
     *,
     llm_summary: str = "",
     llm_review: str = "",
-    model: str = "deepseek-chat",
+    model: str = "deepseek-v4-flash",
 ) -> str:
     """Write a standalone scan report and return its Markdown."""
 
@@ -36,7 +36,7 @@ def write_dataagent_report(
     output_path: str | Path,
     *,
     bundle: ScanBundle | None = None,
-    model: str = "deepseek-chat",
+    model: str = "deepseek-v4-flash",
 ) -> str:
     """Write a standalone DataAgent layered report and return its Markdown."""
 
@@ -50,7 +50,7 @@ def format_scan_report(
     *,
     llm_summary: str = "",
     llm_review: str = "",
-    model: str = "deepseek-chat",
+    model: str = "deepseek-v4-flash",
 ) -> str:
     """Render scan results, collection readiness, and routing health."""
 
@@ -122,7 +122,7 @@ def format_dataagent_report(
     runs: list[DataAgentRun],
     *,
     bundle: ScanBundle | None = None,
-    model: str = "deepseek-chat",
+    model: str = "deepseek-v4-flash",
 ) -> str:
     """Render DataAgent outputs with explicit Tier 1 / Tier 2 layering."""
 

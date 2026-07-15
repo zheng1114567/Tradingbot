@@ -21,6 +21,7 @@ from enum import Enum
 from typing import Any, Callable
 
 from ..config import config
+from .vendor_throttle import VendorCoolingDownError, call_with_vendor_guard
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +67,7 @@ class VendorFatalError(VendorError):
 # ============================================================
 
 class DataVendor(str, Enum):
+    AKSHARE = "akshare"
     MOOTDX = "mootdx"
     BAOSTOCK = "baostock"
     EASTMONEY = "eastmoney"
@@ -103,6 +105,16 @@ TOOL_CATEGORIES = {
             "get_sector_constituents", # 板块成分股
             "get_dragon_tiger",        # 龙虎榜
             "get_margin",              # 融资融券
+        ],
+    },
+    "etf_data": {
+        "description": "ETF数据",
+        "tools": [
+            "get_etf_universe",
+            "get_etf_spot",
+            "get_etf_daily",
+            "get_etf_info",
+            "get_etf_premium_discount",
         ],
     },
     "risk_data": {
@@ -265,7 +277,7 @@ def route_to_vendor(method: str, *args, **kwargs) -> Any:
 
         try:
             start = time.perf_counter()
-            result = impl(*args, **kwargs)
+            result = call_with_vendor_guard(vendor, lambda: impl(*args, **kwargs))
             elapsed_ms = (time.perf_counter() - start) * 1000
             # Treat None and empty list/dict as "no data" → try next vendor
             is_empty = result is None or (isinstance(result, (list, dict)) and len(result) == 0)
@@ -297,6 +309,18 @@ def route_to_vendor(method: str, *args, **kwargs) -> Any:
             continue
         except VendorRateLimitError as e:
             logger.warning("Vendor %s rate-limited for %s; trying next", vendor, method)
+            _record_route_attempt(
+                route_trace,
+                method=method,
+                vendor=vendor,
+                status="rate_limited",
+                error=str(e),
+            )
+            if first_error is None:
+                first_error = e
+            continue
+        except VendorCoolingDownError as e:
+            logger.warning("Vendor %s is cooling down for %s; trying next", vendor, method)
             _record_route_attempt(
                 route_trace,
                 method=method,

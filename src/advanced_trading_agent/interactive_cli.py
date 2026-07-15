@@ -705,7 +705,7 @@ def _handle_scan(
         report = scan_and_analyze(top_n=top_n, force=force)
         return CommandResult(report)
 
-    scanner = MarketScanner(top_sectors=5, top_n=15)
+    scanner = MarketScanner(top_sectors=5, top_n=15, auto_refresh_cache=True)
     results = scanner.scan()
 
     if not results:

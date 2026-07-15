@@ -523,14 +523,32 @@ def get_cached_sector_constituents(
 
 
 def get_cached_daily(ticker: str, start_date: str | None = None,
-                     end_date: str | None = None) -> list[dict[str, Any]]:
+                     end_date: str | None = None,
+                     *, allow_online_repair: bool = True) -> list[dict[str, Any]]:
     """Convenience: get daily data from local parquet cache.
 
     Uses ``LocalCache.ensure_daily_data`` so callers get incremental cache
     repair and manifest updates instead of a raw parquet read.
     """
     cache = LocalCache()
-    return cache.ensure_daily_data(ticker, start_date, end_date)
+    if allow_online_repair:
+        return cache.ensure_daily_data(ticker, start_date, end_date)
+
+    cache_path = cache.cache_dir / "daily" / f"{ticker.replace('.', '_')}.parquet"
+    if not cache_path.exists():
+        return []
+    try:
+        frame = cache._read_daily_cache(cache_path)
+        if start_date and end_date:
+            frame = cache._filter_daily_frame(
+                frame,
+                _normalize_date(start_date),
+                _normalize_date(end_date),
+            )
+        return cache._records_with_cache_status(frame, "cache_only")
+    except Exception as exc:
+        logger.warning("Failed to read daily cache for %s: %s", ticker, exc)
+        return []
 
 
 def _nearest_cache_file(pattern: str, trade_date: str | None = None) -> Path | None:
@@ -667,6 +685,181 @@ def get_cached_news(ticker: str, trade_date: str | None = None) -> list[dict[str
         if isinstance(data, list):
             return [record for record in data if isinstance(record, dict) and not is_noise_news_record(record)]
     return []
+
+
+def save_cached_daily(ticker: str, records: list[dict[str, Any]]) -> str:
+    """Merge online daily records into the local parquet cache."""
+    cache = LocalCache()
+    cache_path = cache.cache_dir / "daily" / f"{ticker.replace('.', '_')}.parquet"
+    fetched = pd.DataFrame(records)
+    if fetched.empty:
+        return str(cache_path)
+    fetched["code"] = ticker
+
+    existing = pd.DataFrame()
+    if cache_path.exists():
+        try:
+            existing = cache._read_daily_cache(cache_path)
+        except Exception as exc:
+            logger.warning("Failed to read existing daily cache for %s: %s", ticker, exc)
+
+    merged = cache._merge_daily_frames(existing, fetched)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    merged.to_parquet(cache_path, index=False)
+    cache._update_daily_manifest(
+        CacheManifest(cache.cache_dir),
+        ticker,
+        cache_path,
+        merged,
+        status="write_through",
+    )
+    return str(cache_path)
+
+
+def save_cached_news(
+    ticker: str,
+    records: list[dict[str, Any]],
+    trade_date: str | None = None,
+) -> str:
+    """Merge online ticker news into the local date-partitioned cache."""
+    td = trade_date or date.today().isoformat()
+    cache = LocalCache()
+    path = cache.cache_dir / "news" / td / f"{ticker.replace('.', '_')}.json"
+    existing: list[dict[str, Any]] = []
+    if path.exists():
+        try:
+            data = json.loads(path.read_text("utf-8"))
+            if isinstance(data, list):
+                existing = [item for item in data if isinstance(item, dict)]
+        except Exception as exc:
+            logger.warning("Failed to read existing news cache for %s: %s", ticker, exc)
+
+    merged = _merge_news_records(existing, records)
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_text(path, json.dumps(merged, ensure_ascii=False, indent=2, default=str))
+    return str(path)
+
+
+def save_cached_sector_news(
+    sector_name: str,
+    records: list[dict[str, Any]],
+    trade_date: str | None = None,
+) -> str:
+    """Merge online sector news into the local date-partitioned cache."""
+    td = trade_date or date.today().isoformat()
+    cache = LocalCache()
+    path = cache.cache_dir / "sector_news" / td / f"{_safe_path_part(sector_name, 'sector')}.json"
+    existing: list[dict[str, Any]] = []
+    if path.exists():
+        try:
+            data = json.loads(path.read_text("utf-8"))
+            if isinstance(data, list):
+                existing = [item for item in data if isinstance(item, dict)]
+        except Exception as exc:
+            logger.warning("Failed to read existing sector news cache for %s: %s", sector_name, exc)
+
+    normalized: list[dict[str, Any]] = []
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        normalized.append({
+            **record,
+            "sector_name": record.get("sector_name") or sector_name,
+            "news_scope": record.get("news_scope") or "sector",
+            "direct_beneficiaries": record.get("direct_beneficiaries") or [sector_name],
+        })
+
+    merged = _merge_news_records(existing, normalized)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_text(path, json.dumps(merged, ensure_ascii=False, indent=2, default=str))
+    return str(path)
+
+
+def _merge_news_records(
+    existing: list[dict[str, Any]],
+    records: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    merged: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for record in [*existing, *records]:
+        if not isinstance(record, dict) or is_noise_news_record(record):
+            continue
+        key = str(record.get("url") or record.get("新闻链接") or record.get("title") or record.get("新闻标题") or "")
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        merged.append(record)
+    return merged
+
+
+def get_cached_etf_spot(trade_date: str | None = None) -> list[dict[str, Any]]:
+    """Read cached ETF spot rows for one trade date."""
+    td = trade_date or date.today().isoformat()
+    cache = LocalCache()
+    path = cache.cache_dir / "etf" / f"etf_spot_{td}.json"
+    if path.exists():
+        data = json.loads(path.read_text("utf-8"))
+        if isinstance(data, list):
+            return [record for record in data if isinstance(record, dict)]
+    return []
+
+
+def save_cached_etf_spot(records: list[dict[str, Any]], trade_date: str | None = None) -> str:
+    """Persist ETF spot rows into the local cache."""
+    td = trade_date or date.today().isoformat()
+    cache = LocalCache()
+    path = cache.cache_dir / "etf" / f"etf_spot_{td}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_text(path, json.dumps(records, ensure_ascii=False, indent=2, default=str))
+    return str(path)
+
+
+def get_cached_etf_daily(
+    etf_code: str,
+    start_date: str | None = None,
+    end_date: str | None = None,
+) -> list[dict[str, Any]]:
+    """Read cached ETF daily OHLCV rows from parquet."""
+    cache = LocalCache()
+    cache_path = cache.cache_dir / "etf" / "daily" / f"{etf_code.replace('.', '_')}.parquet"
+    if not cache_path.exists():
+        return []
+    try:
+        frame = pd.read_parquet(cache_path)
+        if not frame.empty and start_date and end_date:
+            date_col = _daily_date_column(frame)
+            if date_col:
+                frame[date_col] = pd.to_datetime(frame[date_col], errors="coerce")
+                start = pd.to_datetime(_normalize_date(start_date)).date()
+                end = pd.to_datetime(_normalize_date(end_date)).date()
+                dates = frame[date_col].dt.date
+                frame = frame[(dates >= start) & (dates <= end)]
+        return frame.to_dict("records") if not frame.empty else []
+    except Exception as exc:
+        logger.warning("Failed to read ETF daily cache for %s: %s", etf_code, exc)
+        return []
+
+
+def save_cached_etf_daily(etf_code: str, records: list[dict[str, Any]]) -> str:
+    """Merge online ETF daily rows into the local parquet cache."""
+    cache = LocalCache()
+    cache_path = cache.cache_dir / "etf" / "daily" / f"{etf_code.replace('.', '_')}.parquet"
+    fetched = pd.DataFrame(records)
+    if fetched.empty:
+        return str(cache_path)
+    fetched["code"] = etf_code
+    existing = pd.DataFrame()
+    if cache_path.exists():
+        try:
+            existing = pd.read_parquet(cache_path)
+        except Exception as exc:
+            logger.warning("Failed to read existing ETF daily cache for %s: %s", etf_code, exc)
+    merged = cache._merge_daily_frames(existing, fetched)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    merged.to_parquet(cache_path, index=False)
+    return str(cache_path)
+
 
 def get_cached_northbound_top10(trade_date: str | None = None) -> list[dict[str, Any]]:
     """Read cached northbound top-10 turnover data."""

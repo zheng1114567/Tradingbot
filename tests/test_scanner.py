@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
-from advanced_trading_agent.data_agent.scanner import MarketScanner, ScanBundle, ScanResult
+from advanced_trading_agent.data_agent.scanner import MarketScanner, ScanBundle, ScanDataPackage, ScanResult
 
 
 class TestScanResult:
@@ -103,6 +103,60 @@ class TestMarketScanner:
         scanner = MarketScanner(top_sectors=3, top_n=10)
         results = scanner.scan()
         assert isinstance(results, list)
+
+    def test_scan_auto_refreshes_cache_before_scanning(self, monkeypatch):
+        calls = []
+
+        def fake_ensure(trade_date, compute_signals=True):
+            calls.append((trade_date, compute_signals))
+
+        monkeypatch.setattr("advanced_trading_agent.data_agent.scanner.ensure_scan_cache", fake_ensure)
+
+        scanner = MarketScanner(auto_refresh_cache=True)
+        monkeypatch.setattr(scanner, "_scan_hot_sectors", lambda *args, **kwargs: None)
+        monkeypatch.setattr(scanner, "_scan_limit_up", lambda *args, **kwargs: None)
+        monkeypatch.setattr(scanner, "_scan_northbound", lambda *args, **kwargs: None)
+        monkeypatch.setattr(scanner, "_scan_dragon_tiger", lambda *args, **kwargs: None)
+        monkeypatch.setattr(scanner, "_scan_short_term_signals", lambda *args, **kwargs: None)
+
+        results = scanner.scan("2026-07-10")
+
+        assert results == []
+        assert calls == [("2026-07-10", True)]
+
+    def test_scan_without_auto_refresh_does_not_touch_network(self, monkeypatch):
+        scanner = MarketScanner(auto_refresh_cache=False)
+        refresh = MagicMock(side_effect=AssertionError("fast scan must not refresh cache"))
+        monkeypatch.setattr("advanced_trading_agent.data_agent.scanner.ensure_scan_cache", refresh)
+        monkeypatch.setattr(scanner, "_scan_hot_sectors", lambda *args, **kwargs: None)
+        monkeypatch.setattr(scanner, "_scan_limit_up", lambda *args, **kwargs: None)
+        monkeypatch.setattr(scanner, "_scan_northbound", lambda *args, **kwargs: None)
+        monkeypatch.setattr(scanner, "_scan_dragon_tiger", lambda *args, **kwargs: None)
+        monkeypatch.setattr(scanner, "_scan_short_term_signals", lambda *args, **kwargs: None)
+
+        assert scanner.scan("2026-07-10") == []
+        refresh.assert_not_called()
+
+    def test_default_route_reads_local_cache_only(self, monkeypatch):
+        calls = []
+
+        monkeypatch.setattr("advanced_trading_agent.data_agent.scanner.ensure_default_vendor_registration", lambda: None)
+
+        def fake_get_vendor_impl(method, vendor):
+            calls.append((method, vendor))
+
+            def impl(**kwargs):
+                return [{"source": vendor, "method": method, **kwargs}]
+
+            return impl
+
+        monkeypatch.setattr("advanced_trading_agent.data_agent.scanner.get_vendor_impl", fake_get_vendor_impl)
+
+        scanner = MarketScanner(auto_refresh_cache=False)
+        result = scanner._route_fn("get_sector", top_n=3, trade_date="2026-07-10")
+
+        assert calls == [("get_sector", "local_cache")]
+        assert result[0]["source"] == "local_cache"
 
     def test_select_candidates_enforces_sector_cap(self):
         scanner = MarketScanner(top_n=10, base_candidates=10, per_sector_cap=2)
@@ -288,6 +342,40 @@ class TestMarketScanner:
         assert payload["market_breadth"] == {"advance_count": 10}
         assert payload["news"] == [{"title": "news"}]
         assert payload["route_trace"] == bundle.route_trace
+
+    def test_scan_bundle_package_for_ticker_returns_raw_and_cleaned_payloads(self):
+        bundle = ScanBundle(
+            trade_date="2026-07-10",
+            results=[],
+            shared_raw={"market": [], "sector_context": [], "risk": {}},
+            ticker_data={
+                "000001.SZ": {
+                    "daily": [{
+                        "ts_code": "000001.SZ",
+                        "trade_date": "20260710",
+                        "open": 10.0,
+                        "high": 10.5,
+                        "low": 9.9,
+                        "close": 10.2,
+                        "pre_close": 10.0,
+                        "pct_chg": 2.0,
+                        "vol": 1000,
+                        "amount": 10200,
+                    }],
+                    "capital_flow": [],
+                    "news": [{"title": "news", "summary": "summary"}],
+                }
+            },
+            route_trace=[{"method": "get_daily", "status": "success"}],
+        )
+
+        package = bundle.package_for_ticker("000001.SZ")
+
+        assert isinstance(package, ScanDataPackage)
+        assert package.raw_payload["daily"][0]["close"] == 10.2
+        assert package.cleaned_payload["daily"]["record_count"] == 1
+        assert package.cleaned_payload["news"]["record_count"] == 1
+        assert package.route_trace == bundle.route_trace
 
     def test_scan_and_collect_empty_results(self):
         """When scan finds nothing, scan_and_collect returns empty bundle."""

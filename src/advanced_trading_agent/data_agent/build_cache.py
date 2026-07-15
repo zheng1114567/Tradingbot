@@ -24,19 +24,26 @@ from typing import Any
 
 from ..config import config
 from ..core.atomic_write import atomic_write_text
+from .news_text import is_noise_news_record
 from .vendor_router import ensure_default_vendor_registration, get_vendor_impl
 
 logger = logging.getLogger(__name__)
 _SAFE_PATH_PART = re.compile(r"[^A-Za-z0-9_.\-\u4e00-\u9fff]+")
 
 
-def _vendor_jitter(min_seconds: float = 0.1, max_seconds: float = 0.5) -> None:
+def _vendor_jitter(min_seconds: float = 0.8, max_seconds: float = 2.0) -> None:
     import random
     time.sleep(random.uniform(min_seconds, max_seconds))
 
 
-def build(trade_date: str | None = None, output_dir: str | None = None,
-          days_back: int = 60, compute_signals: bool = True) -> Path:
+def build(
+    trade_date: str | None = None,
+    output_dir: str | None = None,
+    days_back: int = 60,
+    compute_signals: bool = True,
+    refresh_news: bool = True,
+    force_news: bool = False,
+) -> Path:
     """Build complete local cache. Returns path to cache directory."""
     td = trade_date or date.today().isoformat()
     cache_dir = Path(output_dir or config.get("results_dir")) / "local_cache"
@@ -44,10 +51,13 @@ def build(trade_date: str | None = None, output_dir: str | None = None,
 
     if _cache_ready(cache_dir, td):
         logger.info("=== Local cache hit for %s → %s ===", td, cache_dir)
-        _print_cache_gaps(cache_dir, td)
-        _print_summary(cache_dir)
+        cache_risk_snapshot(td, output_dir=str(cache_dir.parent))
         if compute_signals:
             _run_signal_computation(cache_dir, td)
+        if refresh_news:
+            _cache_batch_news(cache_dir, td, force=force_news)
+        _print_cache_gaps(cache_dir, td)
+        _print_summary(cache_dir)
         return cache_dir
 
     logger.info("=== Building local cache for %s → %s ===", td, cache_dir)
@@ -82,15 +92,53 @@ def build(trade_date: str | None = None, output_dir: str | None = None,
     # 7. Risk snapshot. This is cheap and makes offline scans auditable.
     cache_risk_snapshot(td, output_dir=str(cache_dir.parent))
 
+    # 7.5 Northbound proxy from daily cache (top turnover stocks).
+    _cache_northbound_proxy(cache_dir, td)
+
     # 8. Compute short-term signals from cached data (batch mode)
     if compute_signals:
         _run_signal_computation(cache_dir, td)
+
+    # 9. Pre-cache news for top signal candidates + hot sectors
+    if refresh_news:
+        _cache_batch_news(cache_dir, td, force=force_news)
 
     logger.info("=== Cache complete: %s ===", cache_dir)
     _print_cache_gaps(cache_dir, td)
     _print_summary(cache_dir)
 
     return cache_dir
+
+
+def ensure_scan_cache(
+    trade_date: str | None = None,
+    *,
+    output_dir: str | None = None,
+    compute_signals: bool = True,
+    require_news: bool = False,
+    refresh_news: bool = False,
+    force_news: bool = False,
+) -> Path:
+    """Ensure the cache needed by scan exists for the requested trade date.
+
+    This is intended for startup-time lazy refresh:
+    - if today's scan cache is complete, do nothing
+    - if any required market/news cache is missing, refresh once on demand
+    """
+    td = trade_date or date.today().isoformat()
+    cache_dir = Path(output_dir or config.get("results_dir")) / "local_cache"
+    gaps = _cache_gaps(cache_dir, td, require_news=require_news)
+    if not gaps and not force_news:
+        logger.info("Scan cache ready for %s → %s", td, cache_dir)
+        return cache_dir
+    logger.info("Scan cache missing for %s (%s); refreshing on startup.", td, ", ".join(gaps) if gaps else "force_news")
+    return build(
+        trade_date=td,
+        output_dir=output_dir,
+        compute_signals=compute_signals,
+        refresh_news=refresh_news,
+        force_news=force_news,
+    )
 
 
 def cache_news_for_ticker(
@@ -100,6 +148,7 @@ def cache_news_for_ticker(
     output_dir: str | None = None,
     keyword: str | None = None,
     limit: int = 50,
+    force: bool = False,
 ) -> Path:
     """Download and cache news for one ticker using free sources."""
     td = trade_date or date.today().isoformat()
@@ -108,10 +157,10 @@ def cache_news_for_ticker(
     news_dir.mkdir(parents=True, exist_ok=True)
     path = news_dir / f"{ticker.replace('.', '_')}.json"
 
-    if path.exists():
+    if path.exists() and not force:
         return path
 
-    records = _fetch_news_records(ticker, keyword=keyword, limit=limit)
+    records = [record for record in _fetch_news_records(ticker, keyword=keyword, limit=limit) if not is_noise_news_record(record)]
     atomic_write_text(path, json.dumps(records, ensure_ascii=False, indent=2))
     logger.info("News cache saved: %s (%d records)", path, len(records))
     return path
@@ -125,6 +174,7 @@ def cache_news_for_sector(
     constituent_tickers: list[str] | None = None,
     constituent_limit: int = 5,
     per_ticker_limit: int = 12,
+    force: bool = False,
 ) -> Path:
     """Download and cache sector-related news by aggregating constituent ticker news."""
     td = trade_date or date.today().isoformat()
@@ -133,7 +183,13 @@ def cache_news_for_sector(
     news_dir.mkdir(parents=True, exist_ok=True)
     path = news_dir / f"{_safe_path_part(sector_name, 'sector')}.json"
 
-    if path.exists():
+    if path.exists() and not force:
+        return path
+
+    direct_records = _fetch_sector_news_records(sector_name, limit=max(20, per_ticker_limit))
+    if direct_records:
+        atomic_write_text(path, json.dumps(direct_records, ensure_ascii=False, indent=2))
+        logger.info("Sector news cache saved: %s (%d direct records)", path, len(direct_records))
         return path
 
     if constituent_tickers is None:
@@ -154,6 +210,8 @@ def cache_news_for_sector(
     for ticker in constituent_tickers:
         records = _fetch_news_records(ticker, keyword=None, limit=per_ticker_limit)
         for record in records:
+            if is_noise_news_record(record):
+                continue
             enriched = {
                 **record,
                 "sector_name": sector_name,
@@ -181,6 +239,199 @@ def cache_news_for_sector(
         len(constituent_tickers),
     )
     return path
+
+
+def _cache_batch_news(cache_dir: Path, trade_date: str, *, force: bool = False) -> int:
+    """Batch pre-cache news for top signal candidates + hot sectors.
+
+    Reads:
+      - short_term_signals_{date}.json  → top 20 tickers by composite score
+      - hot_sector_constituents_{date}.json → tickers in hot sectors
+
+    Caches ticker-level news + sector-level news so the scanner and
+    DataAgent can read from local cache instead of making live API calls.
+    """
+    td = trade_date
+    news_dir = cache_dir / "news" / td
+    news_dir.mkdir(parents=True, exist_ok=True)
+    sector_news_dir = cache_dir / "sector_news" / td
+    sector_news_dir.mkdir(parents=True, exist_ok=True)
+
+    # Collect tickers to cache news for
+    target_tickers: list[str] = []
+    hot_sector_names: list[str] = []
+
+    # 1. From signal ranking (top 30)
+    sig_path = cache_dir / f"short_term_signals_{td}.json"
+    if sig_path.exists():
+        try:
+            sig_data = json.loads(sig_path.read_text("utf-8"))
+            ranked = sig_data.get("ranked_tickers", [])
+            target_tickers.extend(ranked[:30])
+        except Exception as exc:
+            logger.debug("Failed to read signal ranking for news batch: %s", exc)
+
+    # 2. From hot sector constituents (pick up to 3 per sector)
+    hsc_path = cache_dir / f"hot_sector_constituents_{td}.json"
+    if hsc_path.exists():
+        try:
+            hsc_data = json.loads(hsc_path.read_text("utf-8"))
+            hot_sector_names = list(hsc_data.keys())
+            for sector_name, tickers in hsc_data.items():
+                target_tickers.extend(tickers[:3])  # top 3 per sector
+        except Exception as exc:
+            logger.debug("Failed to read hot sector constituents: %s", exc)
+
+    # Deduplicate
+    seen = set()
+    unique_tickers = []
+    for t in target_tickers:
+        if t not in seen:
+            seen.add(t)
+            unique_tickers.append(t)
+    target_tickers = unique_tickers[:10]
+    hot_sector_names = hot_sector_names[:10]
+
+    if not target_tickers and not hot_sector_names:
+        logger.debug("No targets for batch news caching")
+        _write_news_cache_status(
+            news_dir,
+            trade_date,
+            scope="ticker",
+            target_count=0,
+            cached_count=0,
+            force=force,
+        )
+        _write_news_cache_status(
+            sector_news_dir,
+            trade_date,
+            scope="sector",
+            target_count=0,
+            cached_count=0,
+            force=force,
+        )
+        return 0
+
+    logger.info("Batch news caching: %d tickers, %d sectors...",
+                len(target_tickers), len(hot_sector_names))
+
+    # 3. Cache per-ticker news
+    cached_count = 0
+    for ticker in target_tickers:
+        path = news_dir / f"{ticker.replace('.', '_')}.json"
+        if path.exists() and not force:
+            cached_count += 1
+            continue
+        try:
+            records = [record for record in _fetch_news_records(ticker, keyword=None, limit=10) if not is_noise_news_record(record)]
+            if records:
+                atomic_write_text(path, json.dumps(records, ensure_ascii=False, indent=2))
+                cached_count += 1
+        except Exception as exc:
+            logger.debug("News cache failed for %s: %s", ticker, exc)
+            continue
+        _vendor_jitter(0.1, 0.3)
+
+    # 4. Cache sector news (direct sector keyword first, constituent fallback second)
+    sector_cached = 0
+    for sector_name in hot_sector_names:
+        sec_path = sector_news_dir / f"{_safe_path_part(sector_name, 'sector')}.json"
+        if sec_path.exists() and not force:
+            sector_cached += 1
+            continue
+
+        direct_records = _fetch_sector_news_records(sector_name, limit=10)
+        if direct_records:
+            atomic_write_text(sec_path, json.dumps(direct_records, ensure_ascii=False, indent=2))
+            sector_cached += 1
+            continue
+
+        # Reuse the sector→ticker mapping from hot_sector_constituents
+        try:
+            hsc_data = json.loads((cache_dir / f"hot_sector_constituents_{td}.json").read_text("utf-8"))
+            tickers = hsc_data.get(sector_name, [])[:3]
+        except Exception:
+            continue
+        if not tickers:
+            continue
+
+        aggregated: list[dict[str, Any]] = []
+        seen_urls: set[str] = set()
+        for ticker in tickers:
+            ticker_path = news_dir / f"{ticker.replace('.', '_')}.json"
+            if ticker_path.exists() and not force:
+                try:
+                    records = json.loads(ticker_path.read_text("utf-8"))
+                except Exception:
+                    records = []
+            else:
+                records = [record for record in _fetch_news_records(ticker, keyword=None, limit=5) if not is_noise_news_record(record)]
+                if records:
+                    ticker_path.parent.mkdir(parents=True, exist_ok=True)
+                    atomic_write_text(ticker_path, json.dumps(records, ensure_ascii=False, indent=2))
+
+            for rec in records:
+                if is_noise_news_record(rec):
+                    continue
+                key = rec.get("url", "") or rec.get("title", "")
+                if not key or key in seen_urls:
+                    continue
+                seen_urls.add(key)
+                aggregated.append({
+                    **rec,
+                    "sector_name": sector_name,
+                    "related_ticker": ticker,
+                    "news_scope": "sector",
+                    "event_type": rec.get("event_type", "板块新闻"),
+                    "direct_beneficiaries": [sector_name],
+                })
+
+        if aggregated:
+            atomic_write_text(sec_path, json.dumps(aggregated, ensure_ascii=False, indent=2))
+            sector_cached += 1
+
+    _write_news_cache_status(
+        news_dir,
+        trade_date,
+        scope="ticker",
+        target_count=len(target_tickers),
+        cached_count=cached_count,
+        force=force,
+    )
+    _write_news_cache_status(
+        sector_news_dir,
+        trade_date,
+        scope="sector",
+        target_count=len(hot_sector_names),
+        cached_count=sector_cached,
+        force=force,
+    )
+
+    logger.info("Batch news cached: %d ticker news, %d sector news", cached_count, sector_cached)
+    return cached_count
+
+
+def _write_news_cache_status(
+    directory: Path,
+    trade_date: str,
+    *,
+    scope: str,
+    target_count: int,
+    cached_count: int,
+    force: bool,
+) -> None:
+    """Record that startup news caching was attempted for this date/scope."""
+    directory.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "trade_date": trade_date,
+        "scope": scope,
+        "target_count": target_count,
+        "cached_count": cached_count,
+        "force": force,
+        "status": "complete",
+        "created_at": date.today().isoformat(),
+    }
+    atomic_write_text(directory / "_cache_status.json", json.dumps(payload, ensure_ascii=False, indent=2))
 
 
 def cache_risk_snapshot(
@@ -475,29 +726,32 @@ def _cache_daily_snapshot(
     # Limit to 500 to control download time
     tickers = sorted(all_tickers)[:500]
 
-    # Try mootdx first (TCP, no DPI issues)
+    # For a specific historical trade date, baostock is more deterministic
+    # than mootdx. Use it first so existing stale parquet files are repaired
+    # quickly; keep mootdx as a fallback for environments without baostock.
+    cached = _cache_via_baostock(tickers, daily_dir, trade_date, days_back=days_back)
+    if cached > 0:
+        logger.info("Daily data (baostock): %d stocks cached", cached)
+        return cached
+
     try:
         from mootdx.quotes import Quotes
         client = Quotes.factory(market="std")
-        cached = _cache_via_mootdx(client, tickers, daily_dir)
+        cached = _cache_via_mootdx(client, tickers, daily_dir, trade_date)
         if cached > 0:
             logger.info("Daily data (mootdx): %d stocks cached", cached)
             return cached
     except ImportError:
-        logger.debug("mootdx not installed, trying baostock")
-
-    # Fallback to baostock
-    return _cache_via_baostock(tickers, daily_dir, trade_date, days_back=days_back)
+        logger.debug("mootdx not installed")
+    return 0
 
 
-def _cache_via_mootdx(client: Any, tickers: list[str], daily_dir: Path) -> int:
+def _cache_via_mootdx(client: Any, tickers: list[str], daily_dir: Path, trade_date: str) -> int:
     """Download daily data via mootdx TCP protocol."""
-    import pandas as pd
-
     cached = 0
     for ticker in tickers:
         cache_path = daily_dir / f"{ticker.replace('.', '_')}.parquet"
-        if cache_path.exists():
+        if _daily_file_covers(cache_path, trade_date):
             cached += 1
             continue
 
@@ -508,7 +762,8 @@ def _cache_via_mootdx(client: Any, tickers: list[str], daily_dir: Path) -> int:
                 df["code"] = ticker
                 df["data_source"] = "mootdx"
                 df.to_parquet(cache_path, index=False)
-                cached += 1
+                if _daily_file_covers(cache_path, trade_date):
+                    cached += 1
         except Exception:
             continue
         _vendor_jitter()
@@ -536,7 +791,7 @@ def _cache_via_baostock(
     try:
         for ticker in tickers:
             cache_path = daily_dir / f"{ticker.replace('.', '_')}.parquet"
-            if cache_path.exists():
+            if _daily_file_covers(cache_path, trade_date):
                 cached += 1
                 continue
 
@@ -705,14 +960,11 @@ def _cache_limit_up(cache_dir: Path, trade_date: str) -> dict[str, Any]:
 
 
 def _cache_hot_sector_constituents(cache_dir: Path, trade_date: str) -> dict[str, list[str]]:
-    """Build hot sector→tickers mapping from get_belong_board queries.
+    """Build hot sector→tickers mapping by querying constituents per sector.
 
-    Iterates through all daily cache tickers, queries get_belong_board
-    for each, and builds a reverse index of board_name → [tickers].
-    Only keeps top-10 hot sectors (matching sector_ranking).
-
-    This provides direct 同花顺命名体系 的板块→股票映射，
-    解决 industry_map（证监会行业）与 sector_ranking（概念板块）命名不匹配的问题。
+    Public A-share sources are slow and fragile when queried per stock. This
+    function therefore uses the hot sector ranking as the driver and fetches
+    constituents once per sector, with local board_index as a cheap fallback.
     """
     path = cache_dir / f"hot_sector_constituents_{trade_date}.json"
     if path.exists():
@@ -723,35 +975,13 @@ def _cache_hot_sector_constituents(cache_dir: Path, trade_date: str) -> dict[str
         except Exception:
             pass
 
-    try:
-        import efinance as ef
-    except ImportError:
-        logger.warning("efinance not installed, skipping hot sector constituents")
-        return {}
-
-    # 1. Collect all daily tickers from parquet files
-    daily_dir = cache_dir / "daily"
-    if not daily_dir.exists():
-        logger.warning("No daily cache dir, skipping hot sector constituents")
-        return {}
-
-    all_tickers: list[str] = []
-    for parquet_path in sorted(daily_dir.glob("*.parquet")):
-        ticker = parquet_path.stem.replace("_", ".")
-        parts = ticker.split(".")
-        if len(parts) == 2 and len(parts[0]) == 6 and parts[1] in ("SH", "SZ", "BJ"):
-            all_tickers.append(ticker)
-    all_tickers = sorted(set(all_tickers))
-    logger.info("Building hot sector map from %d daily tickers...", len(all_tickers))
-
-    # 2. Read sector ranking to know which sectors are "hot"
     ranking_path = cache_dir / f"sector_ranking_{trade_date}.json"
     if not ranking_path.exists():
         logger.warning("No sector ranking for %s", trade_date)
         return {}
     try:
         ranking = json.loads(ranking_path.read_text("utf-8"))
-        hot_sector_names = {s["sector_name"] for s in ranking[:10] if s.get("sector_name")}
+        hot_sector_names = [str(s.get("sector_name") or "") for s in ranking[:10] if s.get("sector_name")]
     except Exception as exc:
         logger.warning("Failed to parse sector ranking: %s", exc)
         return {}
@@ -759,36 +989,79 @@ def _cache_hot_sector_constituents(cache_dir: Path, trade_date: str) -> dict[str
     if not hot_sector_names:
         return {}
 
-    # 3. Build board_name → [tickers] mapping via get_belong_board
+    ensure_default_vendor_registration()
+    board_index = _read_board_index(cache_dir)
     reverse: dict[str, list[str]] = {}
-    processed = 0
-    for ticker in all_tickers:
-        digits = ticker.split(".")[0]
-        try:
-            df = ef.stock.get_belong_board(digits)
-            if df is None or df.empty:
-                continue
-            for _, row in df.iterrows():
-                bname = str(row.get("板块名称", ""))
-                if bname in hot_sector_names:
-                    if bname not in reverse:
-                        reverse[bname] = []
-                    reverse[bname].append(ticker)
-            processed += 1
-        except Exception:
-            continue
-        _vendor_jitter(0.02, 0.08)  # minimal jitter for local endpoint
 
-    # 4. Deduplicate
-    for bname in reverse:
-        reverse[bname] = sorted(set(reverse[bname]))
+    for sector_name in hot_sector_names:
+        tickers = _fetch_sector_constituent_tickers(sector_name, trade_date)
+        if not tickers:
+            tickers = _lookup_board_index_tickers(board_index, sector_name)
+        if tickers:
+            reverse[sector_name] = sorted(set(tickers))
+        _vendor_jitter(0.1, 0.3)
 
-    # 5. Save
     atomic_write_text(path, json.dumps(reverse, ensure_ascii=False, indent=2))
     total = sum(len(v) for v in reverse.values())
-    logger.info("Hot sector constituents saved: %d/%d sectors, %d total tickers (from %d queries)",
-                len(reverse), len(hot_sector_names), total, processed)
+    logger.info(
+        "Hot sector constituents saved: %d/%d sectors, %d total tickers",
+        len(reverse),
+        len(hot_sector_names),
+        total,
+    )
     return reverse
+
+
+def _fetch_sector_constituent_tickers(sector_name: str, trade_date: str) -> list[str]:
+    """Fetch constituent ticker codes for one sector from registered vendors."""
+    for vendor in ("akshare", "efinance", "local_cache"):
+        impl = get_vendor_impl("get_sector_constituents", vendor)
+        if impl is None:
+            continue
+        try:
+            records = impl(sector_name=sector_name, trade_date=trade_date)
+        except TypeError:
+            try:
+                records = impl(sector_name)
+            except Exception as exc:
+                logger.debug("constituent fetch failed for %s via %s: %s", sector_name, vendor, exc)
+                continue
+        except Exception as exc:
+            logger.debug("constituent fetch failed for %s via %s: %s", sector_name, vendor, exc)
+            continue
+        tickers = [
+            str(record.get("code") or record.get("股票代码") or "")
+            for record in records or []
+            if isinstance(record, dict) and (record.get("code") or record.get("股票代码"))
+        ]
+        if tickers:
+            return tickers
+    return []
+
+
+def _read_board_index(cache_dir: Path) -> dict[str, list[dict[str, Any]]]:
+    path = cache_dir / "board_index.json"
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text("utf-8"))
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _lookup_board_index_tickers(board_index: dict[str, list[dict[str, Any]]], sector_name: str) -> list[str]:
+    constituents = board_index.get(sector_name, [])
+    if not constituents:
+        for board_name, records in board_index.items():
+            if sector_name in str(board_name) or str(board_name) in sector_name:
+                constituents = records
+                break
+    return [
+        str(item.get("code") or item.get("股票代码") or "")
+        for item in constituents
+        if isinstance(item, dict) and (item.get("code") or item.get("股票代码"))
+    ]
 
 
 def _print_summary(cache_dir: Path) -> None:
@@ -803,7 +1076,79 @@ def _print_summary(cache_dir: Path) -> None:
             print(f"  {f.relative_to(cache_dir)} ({f.stat().st_size / 1024:.0f} KB)")
 
 
-def _cache_ready(cache_dir: Path, trade_date: str) -> bool:
+def _cache_northbound_proxy(cache_dir: Path, trade_date: str) -> None:
+    """Build northbound proxy from daily cache: top-20 by turnover (成交额).
+
+    Real northbound flow data requires akshare; this proxy uses the
+    highest-turnover stocks as a reasonable approximation for scan scoring.
+    """
+    path = cache_dir / f"northbound_top10_{trade_date}.json"
+    if path.exists():
+        logger.debug("Northbound proxy already cached for %s", trade_date)
+        return
+
+    daily_dir = cache_dir / "daily"
+    if not daily_dir.exists():
+        logger.debug("No daily cache, skipping northbound proxy")
+        return
+
+    import pandas as pd
+
+    top_stocks: list[dict[str, Any]] = []
+    for parquet_path in daily_dir.glob("*.parquet"):
+        try:
+            df = pd.read_parquet(parquet_path)
+        except Exception:
+            continue
+        if df.empty:
+            continue
+
+        # Find a date column
+        date_col = None
+        for c in ("trade_date", "datetime", "date"):
+            if c in df.columns:
+                date_col = c
+                break
+        if date_col is None:
+            continue
+
+        df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
+        target = pd.to_datetime(trade_date).date()
+        matched = df[df[date_col].dt.date == target]
+        if matched.empty:
+            continue
+
+        row = matched.iloc[-1]
+        amount = None
+        for col in ("amount", "成交额"):
+            if col in row.index:
+                try:
+                    amount = float(row[col])
+                except (TypeError, ValueError):
+                    amount = 0
+                break
+        if amount is None and "volume" in row.index and "close" in row.index:
+            try:
+                amount = float(row["volume"]) * float(row["close"])
+            except (TypeError, ValueError):
+                amount = 0
+
+        code = str(row.get("code", parquet_path.stem.replace("_", ".")))
+        name = str(row.get("name", ""))
+        top_stocks.append({
+            "code": code,
+            "name": name,
+            "net_buy": amount,  # proxy: turnover amount as pseudo northbound interest
+        })
+
+    top_stocks.sort(key=lambda x: x["net_buy"], reverse=True)
+    top20 = top_stocks[:20]
+
+    if top20:
+        atomic_write_text(path, json.dumps(top20, ensure_ascii=False, indent=2))
+        logger.info("Northbound proxy: %d stocks saved (top turnover)", len(top20))
+    else:
+        logger.debug("No stocks found for northbound proxy")
     return not _cache_gaps(cache_dir, trade_date)
 
 
@@ -817,17 +1162,38 @@ def _cache_gaps(cache_dir: Path, trade_date: str, *, require_news: bool = False)
     ]
     daily_dir = cache_dir / "daily"
     gaps = [name for name, path in required if not path.exists()]
-    if not daily_dir.exists() or not any(daily_dir.glob("*.parquet")):
+    if not _daily_cache_covers_trade_date(daily_dir, trade_date):
         gaps.append("daily_parquet")
     if require_news:
         news_dir = cache_dir / "news" / trade_date
         sector_news_dir = cache_dir / "sector_news" / trade_date
-        has_news = (news_dir.exists() and any(news_dir.glob("*.json"))) or (
-            sector_news_dir.exists() and any(sector_news_dir.glob("*.json"))
-        )
-        if not has_news:
-            gaps.append("news_optional")
+        if not _news_cache_scope_ready(news_dir):
+            gaps.append("news")
+        if not _news_cache_scope_ready(sector_news_dir):
+            gaps.append("sector_news")
     return gaps
+
+
+def _cache_ready(cache_dir: Path, trade_date: str) -> bool:
+    """Return True when required market cache files exist for a trade date."""
+    return not _cache_gaps(cache_dir, trade_date)
+
+
+def _daily_cache_covers_trade_date(daily_dir: Path, trade_date: str) -> bool:
+    """Return True if at least one daily parquet file contains trade_date."""
+    if not daily_dir.exists():
+        return False
+    for path in daily_dir.glob("*.parquet"):
+        if _daily_file_covers(path, trade_date):
+            return True
+    return False
+
+
+def _news_cache_scope_ready(directory: Path) -> bool:
+    """Return True when a news cache scope exists or has an attempt marker."""
+    if not directory.exists():
+        return False
+    return any(directory.glob("*.json"))
 
 
 def _print_cache_gaps(cache_dir: Path, trade_date: str) -> None:
@@ -867,32 +1233,125 @@ def _fetch_news_records(
     keyword: str | None = None,
     limit: int = 50,
 ) -> list[dict[str, Any]]:
+    """Fetch news from multiple sources and aggregate, deduplicating by URL."""
     ensure_default_vendor_registration()
+    merged: list[dict[str, Any]] = []
+    seen_urls: set[str] = set()
+
+    def _add(records: list[dict[str, Any]]) -> int:
+        added = 0
+        for r in records:
+            url = str(r.get("url", "") or r.get("title", ""))
+            if url and url in seen_urls:
+                continue
+            if url:
+                seen_urls.add(url)
+            merged.append(r)
+            added += 1
+            if len(merged) >= limit:
+                break
+        return added
+
     attempts = [
-        ("sina", {"code": ticker, "keyword": keyword, "limit": limit}),
-        ("cls", {"code": ticker, "keyword": keyword, "limit": limit}),
-        ("akshare", {"code": ticker, "keyword": keyword, "limit": limit}),
+        ("eastmoney", {"code": ticker, "limit": limit}),
     ]
+    # Supplement with global news filtered by keyword
+    stock_keyword = keyword or _default_news_keyword(ticker) or ticker.split(".")[0]
+    attempts.append(("eastmoney_global", {"keyword": stock_keyword, "limit": limit}))
+
     for vendor, kwargs in attempts:
         impl = get_vendor_impl("get_news", vendor)
         if impl is None:
             continue
         try:
             data = impl(**kwargs)
-            if isinstance(data, list) and data:
-                return data
+            if isinstance(data, list):
+                _add(data)
         except Exception as exc:
-            logger.warning("news cache fetch failed for %s via %s: %s", ticker, vendor, exc)
+            logger.debug("news fetch failed for %s via %s: %s", ticker, vendor, exc)
             continue
-    return []
+        if len(merged) >= limit:
+            return merged[:limit]
+
+    # Sina as fallback if still under limit
+    try:
+        sina_impl = get_vendor_impl("get_news", "sina")
+        if sina_impl is not None:
+            sina_data = sina_impl(code=ticker, keyword=keyword, limit=limit - len(merged))
+            if isinstance(sina_data, list):
+                _add(sina_data)
+    except Exception:
+        pass
+
+    return merged[:limit] if merged else []
+
+
+def _fetch_sector_news_records(
+    sector_name: str,
+    *,
+    limit: int = 50,
+) -> list[dict[str, Any]]:
+    """Fetch sector-level news directly by sector keyword before stock proxies."""
+    ensure_default_vendor_registration()
+    query = str(sector_name or "").strip()
+    if not query:
+        return []
+
+    merged: list[dict[str, Any]] = []
+    seen_urls: set[str] = set()
+
+    def _add(records: list[dict[str, Any]]) -> None:
+        for record in records:
+            if not isinstance(record, dict) or is_noise_news_record(record):
+                continue
+            key = str(record.get("url") or record.get("title") or "")
+            if not key or key in seen_urls:
+                continue
+            seen_urls.add(key)
+            merged.append({
+                **record,
+                "sector_name": record.get("sector_name") or query,
+                "news_scope": record.get("news_scope") or "sector",
+                "event_type": record.get("event_type", "板块新闻"),
+                "direct_beneficiaries": record.get("direct_beneficiaries") or [query],
+                "sector_match_mode": record.get("sector_match_mode") or "direct_keyword",
+            })
+            if len(merged) >= limit:
+                break
+
+    for vendor in ("eastmoney_global", "cls"):
+        if len(merged) >= limit:
+            break
+        impl = get_vendor_impl("get_news", vendor)
+        if impl is None:
+            continue
+        try:
+            data = impl(sector=query, keyword=query, limit=limit - len(merged))
+            if isinstance(data, list):
+                _add(data)
+        except Exception as exc:
+            logger.debug("sector news fetch failed for %s via %s: %s", query, vendor, exc)
+            continue
+
+    return merged[:limit]
+
+
+def _default_news_keyword(ticker: str) -> str | None:
+    try:
+        from .stock_profile import StockProfileResolver
+
+        profile = StockProfileResolver().resolve(ticker)
+        return profile.company_name or None
+    except Exception:
+        return None
 
 
 def _fetch_first_available(method: str, **kwargs: Any) -> list[Any]:
     ensure_default_vendor_registration()
     vendor_order = {
-        "get_st_status": ["local_cache"],
+        "get_st_status": ["local_cache", "baostock"],
         "get_suspended": ["local_cache", "baostock"],
-        "get_delisting": ["local_cache"],
+        "get_delisting": ["local_cache", "baostock"],
     }.get(method, [])
     for vendor in vendor_order:
         impl = get_vendor_impl(method, vendor)
@@ -900,7 +1359,7 @@ def _fetch_first_available(method: str, **kwargs: Any) -> list[Any]:
             continue
         try:
             data = impl(**kwargs)
-            if isinstance(data, list):
+            if isinstance(data, list) and data:
                 return data
         except Exception as exc:
             logger.warning("risk cache fetch failed for %s via %s: %s", method, vendor, exc)
@@ -952,11 +1411,17 @@ def main() -> None:
                         help="Compute short-term signals after caching (default: True)")
     parser.add_argument("--no-signals", action="store_false", dest="compute_signals",
                         help="Skip signal computation")
+    parser.add_argument("--no-news", action="store_false", dest="refresh_news",
+                        help="Skip daily news pre-cache refresh")
+    parser.add_argument("--force-news", action="store_true",
+                        help="Re-fetch today's cached news files even if they already exist")
     args = parser.parse_args()
 
     build(trade_date=args.date, output_dir=args.output_dir,
-          days_back=args.days_back, compute_signals=args.compute_signals)
+          days_back=args.days_back, compute_signals=args.compute_signals,
+          refresh_news=args.refresh_news, force_news=args.force_news)
 
 
 if __name__ == "__main__":
     main()
+

@@ -51,6 +51,7 @@ where = ["src"]
 include = ["advanced_trading_agent*"]
 
 [project.scripts]
+build-cache = "advanced_trading_agent.data_agent.build_cache:main"
 dataagent = "advanced_trading_agent.data_agent.cli:main"
 trading-agent = "advanced_trading_agent.interactive_cli:main"
 

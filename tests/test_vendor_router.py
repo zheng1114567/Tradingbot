@@ -18,11 +18,12 @@ from advanced_trading_agent.data_agent import vendor_router
 
 
 DEFAULT_DATA_VENDORS = {
-    "market_data": "local_cache,mootdx,baostock",
+    "market_data": "local_cache,akshare,mootdx,baostock",
     "fundamental_data": "local_cache,baostock",
-    "news_data": "local_cache,sina,cls",
+    "news_data": "local_cache,eastmoney_global,akshare,eastmoney,sina,cls",
     "capital_flow": "local_cache",
-    "a_share_specific": "local_cache,efinance,eastmoney",
+    "a_share_specific": "local_cache,akshare,efinance,eastmoney",
+    "etf_data": "local_cache,akshare,sina,eastmoney",
     "analysis": "baostock",
     "risk_data": "local_cache,baostock",
 }
@@ -139,10 +140,42 @@ class TestVendorChain:
         assert trace[1]["status"] == "success"
         assert trace[1]["record_count"] == 1
 
+    def test_repeated_rate_limit_like_errors_cool_down_vendor(self):
+        trace: list[dict] = []
+        calls = {"eastmoney": 0, "sina": 0}
+
+        def eastmoney(code):
+            calls["eastmoney"] += 1
+            raise RuntimeError("ProxyError: Remote end closed connection without response")
+
+        def sina(code):
+            calls["sina"] += 1
+            return [{"code": code, "source": "sina"}]
+
+        register_vendor_impl("get_news", "eastmoney", eastmoney)
+        register_vendor_impl("get_news", "sina", sina)
+        original = config.get("data_vendors").copy()
+        config.update({"data_vendors": {"news_data": "eastmoney,sina"}})
+
+        try:
+            for _ in range(3):
+                assert route_to_vendor("get_news", code="000001.SZ") == [{"code": "000001.SZ", "source": "sina"}]
+            assert route_to_vendor("get_news", code="000001.SZ", _route_trace=trace) == [{"code": "000001.SZ", "source": "sina"}]
+        finally:
+            config.update({"data_vendors": original})
+
+        assert calls["eastmoney"] == 3
+        assert calls["sina"] == 4
+        assert trace[0]["vendor"] == "eastmoney"
+        assert trace[0]["status"] == "rate_limited"
+        assert "cooling down" in trace[0]["error"]
+        assert trace[1]["vendor"] == "sina"
+        assert trace[1]["status"] == "success"
+
     def test_fallback_order_across_vendors(self):
         """使用已知的 get_daily 方法测试降级顺序"""
         chain = get_vendor_chain("get_daily")
-        assert chain[:3] == ["local_cache", "mootdx", "baostock"]
+        assert chain[:4] == ["local_cache", "akshare", "mootdx", "baostock"]
         # 注册 mock 到链中的第一个供应商
         first_vendor = chain[0]
         def mock_impl(code):
@@ -152,7 +185,7 @@ class TestVendorChain:
         assert result == {"mock": "data"}
 
     def test_configured_chains_are_free_only(self):
-        free_vendors = {"local_cache", "mootdx", "baostock", "eastmoney", "efinance", "sina", "cls"}
+        free_vendors = {"local_cache", "akshare", "mootdx", "baostock", "eastmoney", "efinance", "sina", "cls", "tencent", "eastmoney_global"}
         for method in [
             "get_daily",
             "get_capital_flow",
@@ -162,14 +195,16 @@ class TestVendorChain:
             "get_st_status",
             "get_suspended",
             "get_delisting",
+            "get_etf_spot",
+            "get_etf_daily",
         ]:
             chain = get_vendor_chain(method)
             assert chain
             assert set(chain) <= free_vendors
 
     def test_news_and_sector_have_free_fallbacks(self):
-        assert get_vendor_chain("get_news") == ["local_cache", "sina", "cls"]
-        assert get_vendor_chain("get_sector") == ["local_cache", "efinance", "eastmoney"]
+        assert get_vendor_chain("get_news") == ["local_cache", "eastmoney_global", "akshare", "eastmoney", "sina", "cls"]
+        assert get_vendor_chain("get_sector") == ["local_cache", "akshare", "efinance", "eastmoney"]
 
     def test_default_vendor_registration_covers_tool_methods(self):
         ensure_default_vendor_registration()
@@ -188,6 +223,11 @@ class TestVendorChain:
             "get_limit_up_tiers",
             "get_dragon_tiger",
             "get_factors",
+            "get_etf_universe",
+            "get_etf_spot",
+            "get_etf_daily",
+            "get_etf_info",
+            "get_etf_premium_discount",
         ]:
             registered = set(_VENDOR_IMPLEMENTATIONS.get(method, {}))
             expected = set(get_vendor_chain(method))

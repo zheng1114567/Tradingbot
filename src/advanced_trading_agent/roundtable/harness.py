@@ -16,7 +16,38 @@ from ..tool_nodes.registry import get_allowed_tool_names
 from .schemas import EvidenceItem
 
 
-_AGENT_ORDER = ("Market", "Event", "Analysis", "Backtest")
+# Roundtable participant ordering.
+# Default participants are always present; specialists join conditionally
+# based on A-share signal triggers.
+_ALL_PARTICIPANTS_ORDERED: tuple[str, ...] = (
+    "Market", "Event", "Policy", "HotMoney", "Analysis", "Unlock", "Backtest",
+)
+_DEFAULT_PARTICIPANTS: tuple[str, ...] = ("Market", "Event", "Analysis", "Backtest")
+
+# Trigger rules for conditional specialist participants.
+# Keys match tier2_data.a_share_signals dict keys (lowercase with underscores).
+_TRIGGER_RULES: dict[str, dict[str, Any]] = {
+    "policy": {
+        "min_strength": 0.6,
+        "required_signals": ["positive", "negative"],
+        "require_data_status": ["available", "partial"],
+    },
+    "hot_money": {
+        "required_signals": ["confirmed", "speculative", "overheated"],
+        "require_data_status": ["available", "partial"],
+    },
+    "unlock": {
+        "required_risk_levels": ["high", "medium"],
+        "require_data_status": ["available"],
+    },
+}
+
+# Map signal dict keys → participant display names used in _ALL_PARTICIPANTS_ORDERED.
+_SIGNAL_TO_PARTICIPANT: dict[str, str] = {
+    "policy": "Policy",
+    "hot_money": "HotMoney",
+    "unlock": "Unlock",
+}
 
 
 @dataclass(frozen=True)
@@ -51,6 +82,7 @@ class RoundtableContext:
     shared_evidence_text: str = ""
     evidence_board: list[EvidenceItem] = field(default_factory=list)
     task: str = ""
+    agent_order: tuple[str, ...] = ()
 
 
 class RoundtableHarness:
@@ -64,15 +96,76 @@ class RoundtableHarness:
       own report and evidence pack, and must not invent unavailable data.
     """
 
-    _REPORT_KEYS = {
+    _REPORT_KEYS: dict[str, str] = {
         "Market": "market_report",
         "Event": "event_report",
         "Analysis": "analysis_report",
         "Backtest": "backtest_report",
+        "HotMoney": "hot_money_report",
+        "Policy": "policy_report",
+        "Unlock": "unlock_report",
     }
 
     def __init__(self, *, char_limit: int = 1800) -> None:
         self.char_limit = char_limit
+
+    @staticmethod
+    def _signal_meets_criteria(
+        signal_data: dict[str, Any],
+        rules: dict[str, Any],
+    ) -> bool:
+        """Check if a signal dict meets its trigger rules.
+
+        Returns True when all conditions in *rules* are satisfied.
+        """
+        # data_status gate
+        required_statuses = rules.get("require_data_status", [])
+        if required_statuses:
+            if signal_data.get("data_status") not in required_statuses:
+                return False
+
+        # signal value match (at least one must match)
+        if signal_data.get("signal") in rules.get("required_signals", []):
+            return True
+
+        # min_strength threshold
+        min_strength = rules.get("min_strength")
+        if min_strength is not None:
+            try:
+                if float(signal_data.get("strength", 0)) >= min_strength:
+                    return True
+            except (TypeError, ValueError):
+                pass
+
+        # risk_level match (for Unlock)
+        if signal_data.get("risk_level") in rules.get("required_risk_levels", []):
+            return True
+
+        return False
+
+    @staticmethod
+    def _resolve_participants(
+        tier2: dict[str, Any],
+    ) -> tuple[str, ...]:
+        """Resolve the participant list from A-share signal triggers.
+
+        Always includes default participants; conditionally activates
+        specialists whose signals pass the trigger rules.
+        """
+        a_share = tier2.get("a_share_signals", {}) or {}
+        active_specialists: set[str] = set()
+
+        for signal_key, rules in _TRIGGER_RULES.items():
+            signal_data = a_share.get(signal_key, {}) or {}
+            if RoundtableHarness._signal_meets_criteria(signal_data, rules):
+                participant = _SIGNAL_TO_PARTICIPANT.get(signal_key)
+                if participant:
+                    active_specialists.add(participant)
+
+        return tuple(
+            p for p in _ALL_PARTICIPANTS_ORDERED
+            if p in _DEFAULT_PARTICIPANTS or p in active_specialists
+        )
 
     def build_context(
         self,
@@ -84,6 +177,7 @@ class RoundtableHarness:
         brief = self._build_brief(state, tier1=tier1, tier2=tier2)
         shared = self._build_shared_evidence(brief, contradictions)
         evidence_board = self.build_evidence_board(state)
+        participants = self._resolve_participants(tier2)
         agent_contexts = {
             agent: self._build_agent_context(
                 agent,
@@ -93,7 +187,7 @@ class RoundtableHarness:
                 shared_evidence=shared,
                 evidence_board=evidence_board,
             )
-            for agent in _AGENT_ORDER
+            for agent in participants
         }
         task = self._build_task(
             ticker=brief.ticker,
@@ -108,6 +202,7 @@ class RoundtableHarness:
             shared_evidence_text=shared,
             evidence_board=evidence_board,
             task=task,
+            agent_order=participants,
         )
 
     def _build_brief(
@@ -203,8 +298,10 @@ class RoundtableHarness:
                 market["index_change_pct"],
             )
         sector = tier1.get("sector", {}) or {}
-        if sector.get("leading_sector"):
-            _add("Market", "tier1_data.sector.leading_sector", sector["leading_sector"])
+        sector_name = sector.get("matched_sector") or sector.get("leading_sector")
+        if sector_name:
+            field = "tier1_data.sector.matched_sector" if sector.get("matched_sector") else "tier1_data.sector.leading_sector"
+            _add("Market", field, sector_name)
 
         # Event evidence from tier2
         events = tier2.get("events", []) or []
@@ -217,12 +314,27 @@ class RoundtableHarness:
         factors = tier2.get("factors", []) or []
         for i, fct in enumerate(factors[:5]):
             _add("Analysis", f"tier2_data.factors[{i}].name", fct.get("name", ""))
-            if fct.get("score") is not None:
-                _add("Analysis", f"tier2_data.factors[{i}].score", fct["score"])
+            score = fct.get("composite_score", fct.get("score"))
+            if score is not None:
+                field = "composite_score" if fct.get("composite_score") is not None else "score"
+                _add("Analysis", f"tier2_data.factors[{i}].{field}", score)
 
         # Backtest evidence from tier2
         samples = tier2.get("backtest_samples", []) or []
         _add("Backtest", "tier2_data.backtest_samples.count", len(samples))
+
+        # HotMoney evidence from tier2_data.a_share_signals
+        a_share = tier2.get("a_share_signals", {}) or {}
+        hm = a_share.get("hot_money", {}) or {}
+        if hm.get("signal"):
+            _add("HotMoney", "a_share_signals.hot_money.signal", hm["signal"])
+        if hm.get("score"):
+            _add("HotMoney", "a_share_signals.hot_money.score", hm["score"])
+        if hm.get("board_count"):
+            _add("HotMoney", "a_share_signals.hot_money.board_count", hm["board_count"])
+        if hm.get("warnings"):
+            for w in hm["warnings"][:2]:
+                _add("HotMoney", "a_share_signals.hot_money.warning", w)
 
         # Agent report summaries
         for agent_name, key in [
@@ -230,6 +342,7 @@ class RoundtableHarness:
             ("Event", "event_report_obj"),
             ("Analysis", "analysis_report_obj"),
             ("Backtest", "backtest_report_obj"),
+            ("HotMoney", "hot_money_report_obj"),
         ]:
             rpt = state.get(key)
             if rpt:
@@ -306,6 +419,15 @@ class RoundtableHarness:
                 ),
                 "price_data_tail": self._limit_list(tier2.get("price_data", []), 10),
                 "data_quality": tier2.get("data_quality", {}),
+            }
+        elif agent == "HotMoney":
+            a_share = tier2.get("a_share_signals", {}) or {}
+            payload = {
+                "hot_money": a_share.get("hot_money", {}),
+                "limit_up_summary": tier2.get("limit_up_summary", {}),
+                "dragon_tiger": self._limit_list(
+                    tier2.get("dragon_tiger", []), 10
+                ),
             }
         else:
             payload = {}

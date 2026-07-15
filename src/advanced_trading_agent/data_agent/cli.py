@@ -11,7 +11,7 @@ from .data_agent import DataAgent, DataAgentRequest
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="dataagent",
-        description="Run DataAgent only: collect, clean, analyze, and persist layered data artifacts.",
+        description="Run DataAgent only: delegate fetch/clean to Scan, process data, and persist layered artifacts.",
     )
     parser.add_argument("--ticker", "-t", required=True, help="Ticker, e.g. 000001.SZ")
     parser.add_argument("--date", "-d", dest="trade_date", help="Trade date, e.g. 2026-07-10")

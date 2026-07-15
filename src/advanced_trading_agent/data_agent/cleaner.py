@@ -35,11 +35,21 @@ class DataCleaner:
         ]:
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors="coerce")
+        if "close" in df.columns:
+            if "pre_close" not in df.columns:
+                df["pre_close"] = df["close"].shift(1)
+            else:
+                df["pre_close"] = df["pre_close"].fillna(df["close"].shift(1))
+        if "pct_chg" not in df.columns and {"close", "pre_close"}.issubset(df.columns):
+            df["pct_chg"] = (df["close"] - df["pre_close"]) / df["pre_close"] * 100
+        elif "pct_chg" in df.columns and {"close", "pre_close"}.issubset(df.columns):
+            derived_pct = (df["close"] - df["pre_close"]) / df["pre_close"] * 100
+            df["pct_chg"] = df["pct_chg"].fillna(derived_pct)
         # 缺失值: 回测数据禁止用未来值回填过去。
         df = df.ffill()
         # 异常值
         if "pct_chg" in df.columns:
-            df = df[df["pct_chg"].abs() <= 100]  # 过滤极端涨跌幅
+            df = df[df["pct_chg"].isna() | (df["pct_chg"].abs() <= 100)]  # 过滤极端涨跌幅
         return df
 
     @staticmethod
@@ -63,6 +73,7 @@ class DataCleaner:
             "日期": "trade_date",
             # baostock -> 标准
             "date": "trade_date",
+            "datetime": "trade_date",
             "code": "code",
             "preclose": "pre_close",
             "pctChg": "pct_chg",

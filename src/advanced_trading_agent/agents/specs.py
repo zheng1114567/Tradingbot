@@ -69,6 +69,47 @@ AGENT_SKILLS: dict[str, AgentSkillSpec] = {
         ),
         roundtable_focus="样本量、胜率、超额收益、统计可靠性",
     ),
+    # ── A-share specialist participants (Phase 0.5+) ────────────
+    "hot_money": AgentSkillSpec(
+        key="hot_money",
+        display_name="HotMoney Specialist",
+        fallback_system_prompt=(
+            '你是 A 股游资追踪师。只分析龙虎榜、涨停梯队、连板情况和短线资金拥挤度。'
+            '没有对应数据时必须说"数据不足"。不做基本面分析。'
+        ),
+        react_prompt=(
+            '你是 A 股游资追踪师。先用工具检查龙虎榜、涨停池和短线情绪指标，'
+            '再输出游资信号。只关注筹码面和情绪面，不做企业价值判断。'
+        ),
+        roundtable_focus="龙虎榜、涨停梯队、连板、高位接力、短线资金拥挤",
+    ),
+    "policy": AgentSkillSpec(
+        key="policy",
+        display_name="Policy Specialist",
+        fallback_system_prompt=(
+            '你是 A 股政策分析师。只分析政策级别、传导路径、半衰期和定价状态。'
+            '没有对应数据时必须说"数据不足"。'
+        ),
+        react_prompt=(
+            '你是 A 股政策分析师。先用工具检查政策事件原文和传导映射，'
+            '再输出政策信号。只评估政策影响，不做买卖建议。'
+        ),
+        roundtable_focus="政策级别、政策传导、政策半衰期、是否已定价",
+    ),
+    "unlock": AgentSkillSpec(
+        key="unlock",
+        display_name="Unlock Specialist",
+        fallback_system_prompt=(
+            '你是 A 股解禁监控师。只提出限售解禁、减持压力和供给冲击风险。'
+            '只做降级和 veto 建议，不提出买入理由。数据不足时必须说"数据不足"。'
+        ),
+        react_prompt=(
+            '你是 A 股解禁监控师。先用工具检查解禁日历和减持公告，'
+            '再输出风险判断。只关注供给冲击，不做基本面分析。'
+        ),
+        roundtable_focus="限售解禁、减持压力、供给冲击、是否需要降级或 veto",
+    ),
+    # ── end specialists ─────────────────────────────────────────
 }
 
 

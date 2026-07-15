@@ -22,11 +22,12 @@ from .vendor_router import (
     VendorRateLimitError,
     register_vendor_impl,
 )
+from .vendor_throttle import call_with_vendor_guard
 
 logger = logging.getLogger(__name__)
 
 
-def _vendor_jitter(min_seconds: float = 0.1, max_seconds: float = 0.5) -> None:
+def _vendor_jitter(min_seconds: float = 0.8, max_seconds: float = 2.0) -> None:
     """Best-effort jitter to reduce bursty free-endpoint access."""
     time.sleep(random.uniform(min_seconds, max_seconds))
 
@@ -96,6 +97,36 @@ def _with_source(records: list[dict[str, Any]], source: str, code: str = "") -> 
     return records
 
 
+def _write_through_news_cache(
+    records: list[dict[str, Any]],
+    *,
+    code: str | None = None,
+    sector: str | None = None,
+    keyword: str | None = None,
+    trade_date: str | None = None,
+) -> None:
+    """Best-effort news write-through cache for ticker and sector scopes."""
+    if not records:
+        return
+    try:
+        if code:
+            from .local_cache import save_cached_news
+
+            save_cached_news(code, records, trade_date=trade_date)
+        elif sector or keyword:
+            from .local_cache import save_cached_sector_news
+
+            sector_name = str(sector or keyword or "").strip()
+            if sector_name:
+                save_cached_sector_news(sector_name, records, trade_date=trade_date)
+    except Exception as cache_exc:
+        logger.debug(
+            "news write-through cache failed for %s: %s",
+            code or sector or keyword or "unknown",
+            cache_exc,
+        )
+
+
 def _float_or_none(value: Any) -> float | None:
     if value is None:
         return None
@@ -141,11 +172,101 @@ def _get_mootdx():
         raise VendorNotConfiguredError("mootdx not installed (pip install mootdx)", vendor="mootdx") from exc
 
 
+def _get_akshare():
+    try:
+        import akshare as ak
+        return ak
+    except ImportError as exc:
+        raise VendorNotConfiguredError("akshare not installed (pip install akshare)", vendor="akshare") from exc
+
+
 def _read_baostock_rows(result: Any) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     while getattr(result, "error_code", "0") == "0" and result.next():
         rows.append(dict(zip(result.fields, result.get_row_data())))
     return rows
+
+
+def _normalize_ticker_code(code: str) -> str:
+    """Normalize six-digit A-share / ETF codes to ticker suffix notation."""
+    digits = _digits(code)
+    if len(digits) != 6:
+        return code
+    if digits.startswith(("5", "6", "9")):
+        return f"{digits}.SH"
+    if digits.startswith(("0", "1", "2", "3")):
+        return f"{digits}.SZ"
+    return digits
+
+
+def _first_present(record: dict[str, Any], keys: list[str]) -> Any:
+    for key in keys:
+        value = record.get(key)
+        if value not in (None, ""):
+            return value
+    return None
+
+
+def _normalize_akshare_daily_frame(df: pd.DataFrame, code: str, source: str) -> list[dict[str, Any]]:
+    if df is None or df.empty:
+        return []
+    frame = df.copy()
+    rename = {
+        "date": "trade_date",
+        "日期": "trade_date",
+        "开盘": "open",
+        "收盘": "close",
+        "最高": "high",
+        "最低": "low",
+        "成交量": "volume",
+        "成交额": "amount",
+        "振幅": "amplitude",
+        "涨跌幅": "pct_chg",
+        "涨跌额": "change",
+        "换手率": "turnover_rate",
+    }
+    frame = frame.rename(columns={k: v for k, v in rename.items() if k in frame.columns})
+    if "trade_date" in frame.columns:
+        frame["trade_date"] = pd.to_datetime(frame["trade_date"], errors="coerce")
+    for column in ["open", "close", "high", "low", "volume", "amount", "pct_chg", "turnover_rate"]:
+        if column in frame.columns:
+            frame[column] = pd.to_numeric(frame[column], errors="coerce")
+    frame["code"] = code
+    frame["data_source"] = source
+    return frame.to_dict("records")
+
+
+def _eastmoney_secid(code: str) -> str:
+    """Return Eastmoney secid prefix for A-share/ETF symbols."""
+    digits = _digits(code)
+    suffix = _market_suffix(code)
+    market_id = "1" if suffix == "sh" else "0"
+    return f"{market_id}.{digits}"
+
+
+def _normalize_eastmoney_kline_rows(rows: list[str], code: str, source: str) -> list[dict[str, Any]]:
+    """Normalize Eastmoney kline comma rows into OHLCV records."""
+    records: list[dict[str, Any]] = []
+    for raw in rows:
+        parts = str(raw).split(",")
+        if len(parts) < 7:
+            continue
+        records.append({
+            "trade_date": parts[0],
+            "open": _float_or_none(parts[1]),
+            "close": _float_or_none(parts[2]),
+            "high": _float_or_none(parts[3]),
+            "low": _float_or_none(parts[4]),
+            "volume": _float_or_none(parts[5]),
+            "amount": _float_or_none(parts[6]),
+            "amplitude": _float_or_none(parts[7]) if len(parts) > 7 else None,
+            "pct_chg": _float_or_none(parts[8]) if len(parts) > 8 else None,
+            "change": _float_or_none(parts[9]) if len(parts) > 9 else None,
+            "turnover_rate": _float_or_none(parts[10]) if len(parts) > 10 else None,
+            "code": code,
+            "data_source": source,
+        })
+    return records
 
 
 def get_daily_mootdx(
@@ -179,7 +300,14 @@ def get_daily_mootdx(
             df["turnover_rate"] = pd.to_numeric(df["turn"], errors="coerce")
         if "amount" not in df.columns and {"close", "volume"}.issubset(df.columns):
             df["amount"] = pd.to_numeric(df["close"], errors="coerce") * pd.to_numeric(df["volume"], errors="coerce")
-        return _with_source(df.to_dict("records"), "mootdx", code)
+        records = _with_source(df.to_dict("records"), "mootdx", code)
+        try:
+            from .local_cache import save_cached_daily
+
+            save_cached_daily(code, records)
+        except Exception as cache_exc:
+            logger.debug("daily write-through cache failed for %s via mootdx: %s", code, cache_exc)
+        return records
     except NoMarketDataError:
         raise
     except Exception as exc:
@@ -214,12 +342,55 @@ def get_daily_baostock(
             rows.append(dict(zip(rs.fields, rs.get_row_data())))
         if not rows:
             raise NoMarketDataError(f"No daily data for {code}", symbol=code, vendor="baostock")
-        return _with_source(rows, "baostock", code)
+        records = _with_source(rows, "baostock", code)
+        try:
+            from .local_cache import save_cached_daily
+
+            save_cached_daily(code, records)
+        except Exception as cache_exc:
+            logger.debug("daily write-through cache failed for %s via baostock: %s", code, cache_exc)
+        return records
     finally:
         try:
             bs.logout()
         except Exception:
             pass
+
+
+def get_daily_akshare(
+    code: str,
+    start_date: str | None = None,
+    end_date: str | None = None,
+) -> list[dict[str, Any]]:
+    """Daily A-share OHLCV from akshare, with local write-through cache."""
+    ak = _get_akshare()
+    start = _fmt_yyyymmdd(start_date, date.today() - timedelta(days=365))
+    end = _fmt_yyyymmdd(end_date, date.today())
+    digits = _digits(code)
+    try:
+        _vendor_jitter()
+        df = call_with_vendor_guard(
+            "akshare",
+            lambda: ak.stock_zh_a_hist(
+                symbol=digits,
+                period="daily",
+                start_date=start,
+                end_date=end,
+                adjust="qfq",
+            ),
+        )
+    except Exception as exc:
+        raise NoMarketDataError(f"akshare daily failed for {code}: {exc}", symbol=code, vendor="akshare") from exc
+    records = _normalize_akshare_daily_frame(df, _normalize_ticker_code(code), "akshare")
+    if not records:
+        raise NoMarketDataError(f"No akshare daily data for {code}", symbol=code, vendor="akshare")
+    try:
+        from .local_cache import save_cached_daily
+
+        save_cached_daily(_normalize_ticker_code(code), records)
+    except Exception as cache_exc:
+        logger.debug("daily write-through cache failed for %s via akshare: %s", code, cache_exc)
+    return records
 
 
 def get_financial_baostock(
@@ -386,14 +557,197 @@ def get_news_sina(
         }
         if keyword and keyword.lower() not in json.dumps(candidate, ensure_ascii=False).lower():
             continue
+        from .news_text import is_noise_news_record
+        if is_noise_news_record(candidate):
+            continue
         seen.add(link)
         records.append(candidate)
         if len(records) >= limit:
-            return records
+            break
 
     if not records:
         raise NoMarketDataError(f"No Sina news for {code}", symbol=code, vendor="sina")
-    return records[:limit]
+    result = records[:limit]
+    _write_through_news_cache(result, code=code, sector=sector, keyword=keyword, trade_date=kwargs.get("trade_date"))
+    return result
+
+
+def get_news_akshare(
+    code: str | None = None,
+    sector: str | None = None,
+    keyword: str | None = None,
+    days: int = 2,
+    limit: int = 50,
+    include_announcements: bool = True,
+    **kwargs: Any,
+) -> list[dict[str, Any]]:
+    """Ticker news via akshare stock_news_em, cached on success."""
+    del sector, days, include_announcements
+    if not code:
+        raise NoMarketDataError("akshare stock news requires a stock code", symbol="", vendor="akshare")
+    ak = _get_akshare()
+    trade_date = kwargs.get("trade_date")
+    digits = _digits(code)
+    try:
+        _vendor_jitter()
+        df = call_with_vendor_guard("akshare", lambda: ak.stock_news_em(symbol=digits))
+    except Exception as exc:
+        raise NoMarketDataError(f"akshare stock news failed for {code}: {exc}", symbol=code, vendor="akshare") from exc
+    if df is None or df.empty:
+        raise NoMarketDataError(f"No akshare news for {code}", symbol=code, vendor="akshare")
+
+    records: list[dict[str, Any]] = []
+    for _, row in df.iterrows():
+        raw = row.to_dict()
+        title = str(_first_present(raw, ["新闻标题", "标题", "title"]) or "")
+        if not title:
+            continue
+        candidate = {
+            "title": title,
+            "summary": str(_first_present(raw, ["新闻内容", "摘要", "内容", "summary"]) or title),
+            "source": "akshare",
+            "time": str(_first_present(raw, ["发布时间", "时间", "time"]) or ""),
+            "url": str(_first_present(raw, ["新闻链接", "链接", "url"]) or ""),
+            "type": "news",
+            "code": code,
+            "data_source": "akshare",
+        }
+        if keyword and keyword.lower() not in json.dumps(candidate, ensure_ascii=False).lower():
+            continue
+        from .news_text import is_noise_news_record
+        if is_noise_news_record(candidate):
+            continue
+        records.append(candidate)
+        if len(records) >= limit:
+            break
+
+    if not records:
+        raise NoMarketDataError(f"No akshare news for {code}", symbol=code, vendor="akshare")
+    _write_through_news_cache(records, code=code, keyword=keyword, trade_date=trade_date)
+    return records
+
+
+def get_news_eastmoney(
+    code: str | None = None,
+    sector: str | None = None,
+    keyword: str | None = None,
+    days: int = 2,
+    limit: int = 50,
+    include_announcements: bool = True,
+    **kwargs: Any,
+) -> list[dict[str, Any]]:
+    """个股新闻 via akshare stock_news_em (东方财富)."""
+    del days, include_announcements
+    trade_date = kwargs.get("trade_date")
+    digits = _digits(code or "") if code else ""
+    if not digits:
+        raise NoMarketDataError("Eastmoney news requires a stock code", symbol=code or "", vendor="eastmoney")
+
+    try:
+        import akshare as ak
+    except ImportError:
+        raise VendorNotConfiguredError("akshare not installed (pip install akshare)", vendor="eastmoney")
+
+    _vendor_jitter()
+    try:
+        df = call_with_vendor_guard("eastmoney", lambda: ak.stock_news_em(symbol=digits))
+    except Exception as exc:
+        raise NoMarketDataError(str(exc), symbol=code, vendor="eastmoney") from exc
+
+    if df is None or df.empty:
+        raise NoMarketDataError(f"No eastmoney news for {code}", symbol=code, vendor="eastmoney")
+
+    records: list[dict[str, Any]] = []
+    for _, row in df.iterrows():
+        title = str(row.get("新闻标题", ""))
+        if not title:
+            continue
+        candidate = {
+            "title": title,
+            "summary": str(row.get("新闻内容", title)),
+            "source": "eastmoney",
+            "time": str(row.get("发布时间", "")),
+            "url": str(row.get("新闻链接", "")),
+            "type": "news",
+            "code": code,
+            "data_source": "eastmoney",
+        }
+        if keyword and keyword.lower() not in json.dumps(candidate, ensure_ascii=False).lower():
+            continue
+        from .news_text import is_noise_news_record
+        if is_noise_news_record(candidate):
+            continue
+        records.append(candidate)
+        if len(records) >= limit:
+            break
+
+    if not records:
+        raise NoMarketDataError(f"No eastmoney news for {code}", symbol=code, vendor="eastmoney")
+    _write_through_news_cache(records, code=code, sector=sector, keyword=keyword, trade_date=trade_date)
+    return records
+
+
+def get_news_eastmoney_global(
+    code: str | None = None,
+    sector: str | None = None,
+    keyword: str | None = None,
+    days: int = 2,
+    limit: int = 50,
+    include_announcements: bool = True,
+    **kwargs: Any,
+) -> list[dict[str, Any]]:
+    """全局财经快讯 via akshare stock_info_global_em，关键词过滤."""
+    del days, include_announcements
+    trade_date = kwargs.get("trade_date")
+    query = str(keyword or code or "").strip()
+    if not query:
+        raise NoMarketDataError("global news requires a keyword or code", symbol=code or "", vendor="eastmoney_global")
+
+    try:
+        import akshare as ak
+    except ImportError:
+        raise VendorNotConfiguredError("akshare not installed (pip install akshare)", vendor="eastmoney_global")
+
+    _vendor_jitter()
+    try:
+        df = call_with_vendor_guard("eastmoney_global", lambda: ak.stock_info_global_em())
+    except Exception as exc:
+        raise NoMarketDataError(str(exc), symbol=code, vendor="eastmoney_global") from exc
+
+    if df is None or df.empty:
+        raise NoMarketDataError("No global news available", vendor="eastmoney_global")
+
+    import re
+    keywords = re.split(r"[|,;]", query)
+    records: list[dict[str, Any]] = []
+    for _, row in df.iterrows():
+        title = str(row.get("标题", ""))
+        if not title:
+            continue
+        text = f"{title} {row.get('摘要', '')}"
+        if not any(kw.lower() in text.lower() for kw in keywords if kw.strip()):
+            continue
+        candidate = {
+            "title": title,
+            "summary": str(row.get("摘要", title)),
+            "source": "eastmoney_global",
+            "time": str(row.get("发布时间", "")),
+            "url": str(row.get("链接", "")),
+            "type": "news",
+            "code": code,
+            "data_source": "eastmoney_global",
+        }
+        from .news_text import is_noise_news_record
+        if is_noise_news_record(candidate):
+            continue
+        records.append(candidate)
+        if len(records) >= limit:
+            break
+
+    if not records:
+        raise NoMarketDataError(f"No global news matching {query}", vendor="eastmoney_global")
+    _write_through_news_cache(records, code=code, sector=sector, keyword=keyword, trade_date=trade_date)
+    return records
 
 
 def get_news_cls(
@@ -407,6 +761,7 @@ def get_news_cls(
 ) -> list[dict[str, Any]]:
     """财联社快讯 fallback, filtered locally by ticker/sector keyword."""
     del days, include_announcements
+    trade_date = kwargs.get("trade_date")
     query = str(keyword or sector or code or "").strip()
     if not query:
         raise NoMarketDataError("CLS news requires a keyword, sector, or code", symbol=code or "", vendor="cls")
@@ -459,6 +814,7 @@ def get_news_cls(
 
     if not records:
         raise NoMarketDataError(f"No CLS news for {query}", symbol=code or query, vendor="cls")
+    _write_through_news_cache(records, code=code, sector=sector, keyword=keyword, trade_date=trade_date)
     return records
 
 
@@ -515,6 +871,103 @@ def get_sector_eastmoney(top_n: int = 10, **kwargs: Any) -> list[dict[str, Any]]
     return records[:top_n]
 
 
+def _normalize_akshare_sector_frame(df: pd.DataFrame, sector_type: str, top_n: int) -> list[dict[str, Any]]:
+    if df is None or df.empty:
+        return []
+    records: list[dict[str, Any]] = []
+    for idx, row in enumerate(df.head(max(top_n, 20)).to_dict("records"), start=1):
+        name = str(_first_present(row, ["板块名称", "行业名称", "概念名称", "名称", "name"]) or "")
+        if not name:
+            continue
+        change_pct = _float_or_none(_first_present(row, ["涨跌幅", "涨跌幅%", "涨幅", "change_pct"])) or 0.0
+        records.append({
+            "rank": int(_first_present(row, ["排名", "rank"]) or idx),
+            "sector_code": str(_first_present(row, ["板块代码", "代码", "code"]) or ""),
+            "sector_name": name,
+            "sector_type": sector_type,
+            "change_pct": change_pct,
+            "strength_score": change_pct,
+            "net_inflow_main": _float_or_none(_first_present(row, ["主力净流入", "净流入", "资金净流入"])),
+            "leading_stock": str(_first_present(row, ["领涨股票", "领涨股"]) or ""),
+            "data_source": "akshare",
+            "raw": row,
+        })
+    return records[:top_n]
+
+
+def get_sector_akshare(top_n: int = 10, **kwargs: Any) -> list[dict[str, Any]]:
+    """Sector ranking via akshare industry/concept board endpoints."""
+    del kwargs
+    ak = _get_akshare()
+    records: list[dict[str, Any]] = []
+    last_error: Exception | None = None
+    endpoints = [
+        ("industry", "stock_board_industry_name_em"),
+        ("concept", "stock_board_concept_name_em"),
+    ]
+    for sector_type, fn_name in endpoints:
+        fn = getattr(ak, fn_name, None)
+        if fn is None:
+            continue
+        try:
+            _vendor_jitter()
+            df = call_with_vendor_guard("akshare", fn)
+            records.extend(_normalize_akshare_sector_frame(df, sector_type, top_n))
+        except Exception as exc:
+            last_error = exc
+            logger.warning("akshare sector failed for %s: %s", sector_type, exc)
+    if not records:
+        detail = f": {last_error}" if last_error else ""
+        raise NoMarketDataError(f"No akshare sector data{detail}", vendor="akshare")
+    records.sort(key=lambda item: float(item.get("strength_score") or 0), reverse=True)
+    for idx, record in enumerate(records, start=1):
+        record["rank"] = idx
+    return records[:top_n]
+
+
+def get_sector_constituents_akshare(sector_name: str = "", trade_date: str | None = None) -> list[dict[str, Any]]:
+    """Sector constituents via akshare industry/concept board endpoints."""
+    del trade_date
+    if not sector_name:
+        return []
+    ak = _get_akshare()
+    endpoints = [
+        ("industry", "stock_board_industry_cons_em"),
+        ("concept", "stock_board_concept_cons_em"),
+    ]
+    last_error: Exception | None = None
+    for sector_type, fn_name in endpoints:
+        fn = getattr(ak, fn_name, None)
+        if fn is None:
+            continue
+        try:
+            _vendor_jitter()
+            df = call_with_vendor_guard("akshare", lambda fn=fn: fn(symbol=sector_name))
+        except Exception as exc:
+            last_error = exc
+            continue
+        if df is None or df.empty:
+            continue
+        records: list[dict[str, Any]] = []
+        for row in df.to_dict("records"):
+            code = str(_first_present(row, ["代码", "股票代码", "code"]) or "")
+            name = str(_first_present(row, ["名称", "股票名称", "name"]) or "")
+            if not code:
+                continue
+            records.append({
+                "code": _normalize_ticker_code(code),
+                "name": name,
+                "sector": sector_name,
+                "sector_type": sector_type,
+                "data_source": "akshare",
+                "raw": row,
+            })
+        if records:
+            return records
+    detail = f": {last_error}" if last_error else ""
+    raise NoMarketDataError(f"No akshare constituents for {sector_name}{detail}", vendor="akshare")
+
+
 _EASTMONEY_API = "http://push2.eastmoney.com/api/qt/clist/get"
 _EM_HEADERS = {
     "User-Agent": (
@@ -533,23 +986,26 @@ def _eastmoney_diff(
 ) -> list[dict[str, Any]]:
     """Fetch diff rows from eastmoney push2 HTTP API."""
     try:
-        response = requests.get(
-            _EASTMONEY_API,
-            params={
-                "pn": 1, "pz": pz, "po": po, "np": 1,
-                "fltt": 2, "invt": 2,
-                "fid": fid, "fs": fs,
-                "fields": fields,
-                "ut": "bd1d9ddb04089700cf9c27f6f7426281",
-            },
-            headers=_EM_HEADERS,
-            timeout=10,
+        response = call_with_vendor_guard(
+            "eastmoney",
+            lambda: requests.get(
+                _EASTMONEY_API,
+                params={
+                    "pn": 1, "pz": pz, "po": po, "np": 1,
+                    "fltt": 2, "invt": 2,
+                    "fid": fid, "fs": fs,
+                    "fields": fields,
+                    "ut": "bd1d9ddb04089700cf9c27f6f7426281",
+                },
+                headers=_EM_HEADERS,
+                timeout=10,
+            ),
         )
         response.raise_for_status()
         payload = response.json()
         return (payload.get("data") or {}).get("diff") or []
-    except Exception:
-        return []
+    except Exception as exc:
+        raise NoMarketDataError(f"Eastmoney diff failed: {exc}", vendor="eastmoney") from exc
 
 
 def get_limit_up_tiers_eastmoney(**kwargs: Any) -> dict[str, Any]:
@@ -588,6 +1044,59 @@ def get_limit_up_tiers_eastmoney(**kwargs: Any) -> dict[str, Any]:
         "third_plus": third_plus,
         "stocks": limit_up[:200],
         "data_source": "eastmoney",
+    }
+
+
+def get_limit_up_tiers_akshare(trade_date: str | None = None, **kwargs: Any) -> dict[str, Any]:
+    """Limit-up pool via akshare stock_zt_pool_em."""
+    del kwargs
+    ak = _get_akshare()
+    td = _fmt_yyyymmdd(trade_date, date.today())
+    try:
+        _vendor_jitter()
+        df = call_with_vendor_guard("akshare", lambda: ak.stock_zt_pool_em(date=td))
+    except TypeError:
+        try:
+            df = call_with_vendor_guard("akshare", ak.stock_zt_pool_em)
+        except Exception as exc:
+            raise NoMarketDataError(f"akshare limit-up failed: {exc}", vendor="akshare") from exc
+    except Exception as exc:
+        raise NoMarketDataError(f"akshare limit-up failed: {exc}", vendor="akshare") from exc
+    if df is None or df.empty:
+        raise NoMarketDataError(f"No akshare limit-up data for {td}", vendor="akshare")
+
+    stocks: list[dict[str, Any]] = []
+    for row in df.to_dict("records"):
+        code = str(_first_present(row, ["代码", "股票代码", "code"]) or "")
+        if not code:
+            continue
+        board_count = int(_float_or_none(_first_present(row, ["连板数", "几天几板", "board_count"])) or 1)
+        stocks.append({
+            "ticker": _normalize_ticker_code(code),
+            "code": code,
+            "name": str(_first_present(row, ["名称", "股票名称", "name"]) or ""),
+            "change_pct": _float_or_none(_first_present(row, ["涨跌幅", "涨幅", "change_pct"])),
+            "price": _float_or_none(_first_present(row, ["最新价", "收盘价", "price"])),
+            "volume": _float_or_none(_first_present(row, ["成交量", "volume"])),
+            "amount": _float_or_none(_first_present(row, ["成交额", "amount"])),
+            "board_count": board_count,
+            "reason": str(_first_present(row, ["涨停原因类别", "涨停原因", "原因"]) or ""),
+            "data_source": "akshare",
+            "raw": row,
+        })
+
+    if not stocks:
+        raise NoMarketDataError(f"No akshare limit-up stocks for {td}", vendor="akshare")
+    first_board = sum(1 for item in stocks if int(item.get("board_count") or 1) <= 1)
+    second_board = sum(1 for item in stocks if int(item.get("board_count") or 1) == 2)
+    third_plus = sum(1 for item in stocks if int(item.get("board_count") or 1) >= 3)
+    return {
+        "first_board": first_board,
+        "second_board": second_board,
+        "third_plus": third_plus,
+        "stocks": stocks[:300],
+        "data_source": "akshare",
+        "trade_date": td,
     }
 
 
@@ -690,10 +1199,62 @@ def get_suspended_baostock(trade_date: str | None = None) -> list[str]:
             row = dict(zip(rs.fields, rs.get_row_data()))
             status = row.get("tradeStatus", row.get("tradestatus", "1"))
             if status not in {"1", "交易"}:
-                suspended.append(str(row.get("code", "")))
+                suspended.append(_normalize_baostock_code(str(row.get("code", ""))))
         return suspended
     except Exception as exc:
         logger.warning("baostock suspended list failed: %s", exc)
+        return []
+    finally:
+        try:
+            bs.logout()
+        except Exception:
+            pass
+
+
+def get_st_status_baostock(trade_date: str | None = None) -> list[str]:
+    """ST/*ST stock codes from baostock query_all_stock."""
+    bs = _get_baostock()
+    day = _fmt_iso(trade_date, date.today())
+    login_result = bs.login()
+    if getattr(login_result, "error_code", "0") != "0":
+        raise VendorRateLimitError(getattr(login_result, "error_msg", "baostock login failed"), vendor="baostock")
+    try:
+        rs = bs.query_all_stock(day=day)
+        st_codes: list[str] = []
+        while getattr(rs, "error_code", "0") == "0" and rs.next():
+            row = dict(zip(rs.fields, rs.get_row_data()))
+            name = row.get("code_name", row.get("stock_name", ""))
+            if "ST" in str(name).upper():
+                st_codes.append(_normalize_baostock_code(str(row.get("code", ""))))
+        return st_codes
+    except Exception as exc:
+        logger.warning("baostock ST list failed: %s", exc)
+        return []
+    finally:
+        try:
+            bs.logout()
+        except Exception:
+            pass
+
+
+def get_delisting_baostock(trade_date: str | None = None) -> list[str]:
+    """Delisting-risk stock codes from baostock (name contains 退)."""
+    bs = _get_baostock()
+    day = _fmt_iso(trade_date, date.today())
+    login_result = bs.login()
+    if getattr(login_result, "error_code", "0") != "0":
+        raise VendorRateLimitError(getattr(login_result, "error_msg", "baostock login failed"), vendor="baostock")
+    try:
+        rs = bs.query_all_stock(day=day)
+        delisted: list[str] = []
+        while getattr(rs, "error_code", "0") == "0" and rs.next():
+            row = dict(zip(rs.fields, rs.get_row_data()))
+            name = row.get("code_name", row.get("stock_name", ""))
+            if "退" in str(name):
+                delisted.append(_normalize_baostock_code(str(row.get("code", ""))))
+        return delisted
+    except Exception as exc:
+        logger.warning("baostock delisting list failed: %s", exc)
         return []
     finally:
         try:
@@ -1049,12 +1610,263 @@ def get_daily_local(code: str = "", start_date: str | None = None,
     from .local_cache import get_cached_daily
 
     try:
-        data = get_cached_daily(code, start_date, end_date)
+        data = get_cached_daily(code, start_date, end_date, allow_online_repair=False)
         if not data:
             raise NoMarketDataError(f"No cached daily data for {code}", symbol=code, vendor="local_cache")
         return data
     except ImportError:
         raise VendorNotConfiguredError("local_cache requires baostock", vendor="local_cache")
+
+
+def get_etf_spot_local(trade_date: str | None = None, **kwargs: Any) -> list[dict[str, Any]]:
+    """ETF spot rows from local cache."""
+    del kwargs
+    from .local_cache import get_cached_etf_spot
+
+    data = get_cached_etf_spot(trade_date=trade_date)
+    if not data:
+        raise NoMarketDataError("No cached ETF spot data", vendor="local_cache")
+    return data
+
+
+def get_etf_universe_local(trade_date: str | None = None, **kwargs: Any) -> list[dict[str, Any]]:
+    """ETF universe from cached spot rows."""
+    return get_etf_spot_local(trade_date=trade_date, **kwargs)
+
+
+def get_etf_daily_local(
+    code: str = "",
+    start_date: str | None = None,
+    end_date: str | None = None,
+    **kwargs: Any,
+) -> list[dict[str, Any]]:
+    """ETF daily OHLCV from local parquet cache."""
+    del kwargs
+    from .local_cache import get_cached_etf_daily
+
+    data = get_cached_etf_daily(code, start_date=start_date, end_date=end_date)
+    if not data:
+        raise NoMarketDataError(f"No cached ETF daily data for {code}", symbol=code, vendor="local_cache")
+    return data
+
+
+def _normalize_etf_spot_frame(df: pd.DataFrame, source: str) -> list[dict[str, Any]]:
+    if df is None or df.empty:
+        return []
+    records: list[dict[str, Any]] = []
+    for row in df.to_dict("records"):
+        code = str(_first_present(row, ["代码", "基金代码", "symbol", "code"]) or "")
+        name = str(_first_present(row, ["名称", "基金简称", "基金名称", "name"]) or "")
+        if not code:
+            continue
+        records.append({
+            "code": _normalize_ticker_code(code),
+            "raw_code": code,
+            "name": name,
+            "latest_price": _float_or_none(_first_present(row, ["最新价", "现价", "price", "最新"])),
+            "change_pct": _float_or_none(_first_present(row, ["涨跌幅", "涨幅", "change_pct"])),
+            "volume": _float_or_none(_first_present(row, ["成交量", "volume"])),
+            "amount": _float_or_none(_first_present(row, ["成交额", "amount"])),
+            "premium_discount": _float_or_none(_first_present(row, ["折价率", "溢价率", "折溢价率", "premium_discount"])),
+            "data_source": source,
+            "raw": row,
+        })
+    return records
+
+
+def get_etf_spot_akshare(trade_date: str | None = None, **kwargs: Any) -> list[dict[str, Any]]:
+    """ETF spot/universe rows via akshare fund_etf_spot_em."""
+    del kwargs
+    ak = _get_akshare()
+    try:
+        _vendor_jitter()
+        df = call_with_vendor_guard("akshare", ak.fund_etf_spot_em)
+    except Exception as exc:
+        raise NoMarketDataError(f"akshare ETF spot failed: {exc}", vendor="akshare") from exc
+    records = _normalize_etf_spot_frame(df, "akshare")
+    if not records:
+        raise NoMarketDataError("No akshare ETF spot data", vendor="akshare")
+    try:
+        from .local_cache import save_cached_etf_spot
+
+        save_cached_etf_spot(records, trade_date=trade_date)
+    except Exception as cache_exc:
+        logger.debug("ETF spot write-through cache failed via akshare: %s", cache_exc)
+    return records
+
+
+def get_etf_universe_akshare(trade_date: str | None = None, **kwargs: Any) -> list[dict[str, Any]]:
+    """ETF universe via akshare spot endpoint."""
+    return get_etf_spot_akshare(trade_date=trade_date, **kwargs)
+
+
+def get_etf_daily_akshare(
+    code: str = "",
+    start_date: str | None = None,
+    end_date: str | None = None,
+    **kwargs: Any,
+) -> list[dict[str, Any]]:
+    """ETF daily OHLCV via akshare fund_etf_hist_em."""
+    del kwargs
+    if not code:
+        raise NoMarketDataError("ETF daily requires code", vendor="akshare")
+    ak = _get_akshare()
+    start = _fmt_yyyymmdd(start_date, date.today() - timedelta(days=365))
+    end = _fmt_yyyymmdd(end_date, date.today())
+    digits = _digits(code)
+    try:
+        _vendor_jitter()
+        df = call_with_vendor_guard(
+            "akshare",
+            lambda: ak.fund_etf_hist_em(
+                symbol=digits,
+                period="daily",
+                start_date=start,
+                end_date=end,
+                adjust="qfq",
+            ),
+        )
+    except Exception as exc:
+        raise NoMarketDataError(f"akshare ETF daily failed for {code}: {exc}", symbol=code, vendor="akshare") from exc
+    etf_code = _normalize_ticker_code(code)
+    records = _normalize_akshare_daily_frame(df, etf_code, "akshare")
+    if not records:
+        raise NoMarketDataError(f"No akshare ETF daily data for {code}", symbol=code, vendor="akshare")
+    try:
+        from .local_cache import save_cached_etf_daily
+
+        save_cached_etf_daily(etf_code, records)
+    except Exception as cache_exc:
+        logger.debug("ETF daily write-through cache failed for %s via akshare: %s", code, cache_exc)
+    return records
+
+
+def get_etf_daily_eastmoney(
+    code: str = "",
+    start_date: str | None = None,
+    end_date: str | None = None,
+    **kwargs: Any,
+) -> list[dict[str, Any]]:
+    """ETF daily OHLCV via direct Eastmoney kline endpoint."""
+    del kwargs
+    if not code:
+        raise NoMarketDataError("ETF daily requires code", vendor="eastmoney")
+    etf_code = _normalize_ticker_code(code)
+    start = _fmt_yyyymmdd(start_date, date.today() - timedelta(days=365))
+    end = _fmt_yyyymmdd(end_date, date.today())
+    try:
+        _vendor_jitter()
+        response = call_with_vendor_guard(
+            "eastmoney",
+            lambda: requests.get(
+                "http://push2his.eastmoney.com/api/qt/stock/kline/get",
+                params={
+                    "secid": _eastmoney_secid(code),
+                    "fields1": "f1,f2,f3,f4,f5,f6",
+                    "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
+                    "ut": "7eea3edcaed734bea9cbfc24409ed989",
+                    "klt": 101,
+                    "fqt": 1,
+                    "beg": start,
+                    "end": end,
+                },
+                headers=_http_headers(),
+                timeout=10,
+            ),
+        )
+        response.raise_for_status()
+        payload = response.json()
+    except Exception as exc:
+        raise NoMarketDataError(f"Eastmoney ETF daily failed for {code}: {exc}", symbol=code, vendor="eastmoney") from exc
+
+    klines = (payload.get("data") or {}).get("klines") or []
+    records = _normalize_eastmoney_kline_rows(klines, etf_code, "eastmoney")
+    if not records:
+        raise NoMarketDataError(f"No Eastmoney ETF daily data for {code}", symbol=code, vendor="eastmoney")
+    try:
+        from .local_cache import save_cached_etf_daily
+
+        save_cached_etf_daily(etf_code, records)
+    except Exception as cache_exc:
+        logger.debug("ETF daily write-through cache failed for %s via eastmoney: %s", code, cache_exc)
+    return records
+
+
+def get_etf_daily_sina(
+    code: str = "",
+    start_date: str | None = None,
+    end_date: str | None = None,
+    **kwargs: Any,
+) -> list[dict[str, Any]]:
+    """ETF daily OHLCV via Sina, accessed through akshare's Sina adapter."""
+    del kwargs
+    if not code:
+        raise NoMarketDataError("ETF daily requires code", vendor="sina")
+    ak = _get_akshare()
+    etf_code = _normalize_ticker_code(code)
+    symbol = f"{_market_suffix(code)}{_digits(code)}"
+    try:
+        _vendor_jitter()
+        df = call_with_vendor_guard("sina", lambda: ak.fund_etf_hist_sina(symbol=symbol))
+    except Exception as exc:
+        raise NoMarketDataError(f"Sina ETF daily failed for {code}: {exc}", symbol=code, vendor="sina") from exc
+    if df is None or df.empty:
+        raise NoMarketDataError(f"No Sina ETF daily data for {code}", symbol=code, vendor="sina")
+
+    frame = df.copy()
+    date_col = "date" if "date" in frame.columns else "trade_date" if "trade_date" in frame.columns else None
+    if date_col:
+        frame[date_col] = pd.to_datetime(frame[date_col], errors="coerce")
+        if start_date:
+            frame = frame[frame[date_col].dt.date >= pd.to_datetime(_fmt_iso(start_date, date.today())).date()]
+        if end_date:
+            frame = frame[frame[date_col].dt.date <= pd.to_datetime(_fmt_iso(end_date, date.today())).date()]
+    records = _normalize_akshare_daily_frame(frame, etf_code, "sina")
+    if not records:
+        raise NoMarketDataError(f"No Sina ETF daily data for {code} in requested range", symbol=code, vendor="sina")
+    try:
+        from .local_cache import save_cached_etf_daily
+
+        save_cached_etf_daily(etf_code, records)
+    except Exception as cache_exc:
+        logger.debug("ETF daily write-through cache failed for %s via sina: %s", code, cache_exc)
+    return records
+
+
+def get_etf_info_akshare(code: str = "", **kwargs: Any) -> dict[str, Any]:
+    """ETF info via akshare fund_etf_fund_info_em when available."""
+    del kwargs
+    if not code:
+        raise NoMarketDataError("ETF info requires code", vendor="akshare")
+    ak = _get_akshare()
+    digits = _digits(code)
+    try:
+        _vendor_jitter()
+        df = call_with_vendor_guard("akshare", lambda: ak.fund_etf_fund_info_em(fund=digits))
+    except Exception as exc:
+        raise NoMarketDataError(f"akshare ETF info failed for {code}: {exc}", symbol=code, vendor="akshare") from exc
+    if df is None or df.empty:
+        raise NoMarketDataError(f"No akshare ETF info for {code}", symbol=code, vendor="akshare")
+    return {
+        "code": _normalize_ticker_code(code),
+        "records": df.to_dict("records"),
+        "data_source": "akshare",
+    }
+
+
+def get_etf_premium_discount_akshare(code: str = "", trade_date: str | None = None, **kwargs: Any) -> dict[str, Any]:
+    """Best-effort ETF premium/discount lookup from akshare spot rows."""
+    rows = get_etf_spot_akshare(trade_date=trade_date, **kwargs)
+    normalized = _normalize_ticker_code(code)
+    for row in rows:
+        if row.get("code") == normalized or str(row.get("raw_code")) == _digits(code):
+            return {
+                "code": normalized,
+                "premium_discount": row.get("premium_discount"),
+                "latest_price": row.get("latest_price"),
+                "data_source": row.get("data_source", "akshare"),
+            }
+    raise NoMarketDataError(f"No akshare ETF premium/discount row for {code}", symbol=code, vendor="akshare")
 
 
 def get_capital_flow_local(code: str = "", start_date: str | None = None,
@@ -1213,9 +2025,10 @@ def get_snapshot_tencent_batch(codes: list[str]) -> list[dict[str, Any]]:
 
 
 def register_all_vendors() -> None:
-    """Register free vendor adapters (no akshare dependency)."""
+    """Register free vendor adapters."""
 
     register_vendor_impl("get_daily", "local_cache", get_daily_local)
+    register_vendor_impl("get_daily", "akshare", get_daily_akshare)
     register_vendor_impl("get_daily", "mootdx", get_daily_mootdx)
     register_vendor_impl("get_daily", "baostock", get_daily_baostock)
     register_vendor_impl("get_market_breadth", "local_cache", get_market_breadth_local)
@@ -1224,9 +2037,13 @@ def register_all_vendors() -> None:
     register_vendor_impl("get_financial", "local_cache", get_financial_local)
     register_vendor_impl("get_financial", "baostock", get_financial_baostock)
     register_vendor_impl("get_capital_flow", "local_cache", get_capital_flow_local)
+    register_vendor_impl("get_news", "akshare", get_news_akshare)
+    register_vendor_impl("get_news", "eastmoney", get_news_eastmoney)
+    register_vendor_impl("get_news", "eastmoney_global", get_news_eastmoney_global)
     register_vendor_impl("get_news", "local_cache", get_news_local)
     register_vendor_impl("get_news", "sina", get_news_sina)
     register_vendor_impl("get_news", "cls", get_news_cls)
+    register_vendor_impl("get_sector", "akshare", get_sector_akshare)
     register_vendor_impl("get_sector", "eastmoney", get_sector_eastmoney)
     register_vendor_impl("get_sector", "efinance", get_sector_efinance)
     register_vendor_impl("get_sector", "local_cache", get_sector_local)
@@ -1235,11 +2052,14 @@ def register_all_vendors() -> None:
     register_vendor_impl("get_suspended", "baostock", get_suspended_baostock)
     register_vendor_impl("get_suspended", "eastmoney", get_suspended_eastmoney)
     register_vendor_impl("get_st_status", "local_cache", get_st_status_local)
+    register_vendor_impl("get_st_status", "baostock", get_st_status_baostock)
     register_vendor_impl("get_st_status", "eastmoney", get_st_status_eastmoney)
     register_vendor_impl("get_delisting", "local_cache", get_delisting_local)
+    register_vendor_impl("get_delisting", "baostock", get_delisting_baostock)
     register_vendor_impl("get_delisting", "eastmoney", get_delisting_eastmoney)
 
     register_vendor_impl("get_limit_up_tiers", "local_cache", get_limit_up_tiers_local)
+    register_vendor_impl("get_limit_up_tiers", "akshare", get_limit_up_tiers_akshare)
     register_vendor_impl("get_limit_up_tiers", "eastmoney", get_limit_up_tiers_eastmoney)
     register_vendor_impl("get_northbound_flow", "local_cache", get_northbound_flow_local)
     register_vendor_impl("get_northbound_top10", "local_cache", get_northbound_top10_local)
@@ -1247,9 +2067,22 @@ def register_all_vendors() -> None:
     register_vendor_impl("get_dragon_tiger", "local_cache", get_dragon_tiger_local)
     register_vendor_impl("get_sector_constituents", "efinance", get_sector_constituents_efinance)
     register_vendor_impl("get_sector_constituents", "local_cache", get_sector_constituents_local)
+    register_vendor_impl("get_sector_constituents", "akshare", get_sector_constituents_akshare)
     register_vendor_impl("get_snapshot", "tencent", get_snapshot_tencent)
 
     register_vendor_impl("get_factors", "local_cache", get_factors_computed)
 
+    register_vendor_impl("get_etf_universe", "local_cache", get_etf_universe_local)
+    register_vendor_impl("get_etf_universe", "akshare", get_etf_universe_akshare)
+    register_vendor_impl("get_etf_spot", "local_cache", get_etf_spot_local)
+    register_vendor_impl("get_etf_spot", "akshare", get_etf_spot_akshare)
+    register_vendor_impl("get_etf_daily", "local_cache", get_etf_daily_local)
+    register_vendor_impl("get_etf_daily", "akshare", get_etf_daily_akshare)
+    register_vendor_impl("get_etf_daily", "sina", get_etf_daily_sina)
+    register_vendor_impl("get_etf_daily", "eastmoney", get_etf_daily_eastmoney)
+    register_vendor_impl("get_etf_info", "akshare", get_etf_info_akshare)
+    register_vendor_impl("get_etf_premium_discount", "akshare", get_etf_premium_discount_akshare)
+
 
 register_all_vendors()
+

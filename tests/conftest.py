@@ -4,6 +4,17 @@ from __future__ import annotations
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def disable_vendor_throttle_sleep(monkeypatch):
+    """Keep vendor-throttle tests deterministic and fast."""
+    from advanced_trading_agent.data_agent import vendor_throttle
+
+    vendor_throttle.reset_vendor_throttle()
+    monkeypatch.setattr(vendor_throttle.time, "sleep", lambda _seconds: None)
+    yield
+    vendor_throttle.reset_vendor_throttle()
+
+
 @pytest.fixture
 def sample_ticker() -> str:
     return "000001.SZ"

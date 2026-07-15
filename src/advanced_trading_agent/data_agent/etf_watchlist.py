@@ -1,0 +1,313 @@
+"""JSON-first sector ETF watchlist contracts and deterministic decision rules."""
+
+from __future__ import annotations
+
+from datetime import datetime
+from typing import Any, Literal
+
+from pydantic import BaseModel, Field
+
+
+WatchlistStatus = Literal["active", "monitor", "excluded"]
+Confidence = Literal["high", "medium", "low"]
+ExcludedReason = Literal[
+    "no_tradable_etf",
+    "low_etf_liquidity",
+    "etf_suspended",
+    "mapping_uncertain",
+]
+
+
+class ETFWatchlistLimits(BaseModel):
+    """Portfolio and report limits for the ETF observation pool."""
+
+    max_roundtable_sectors: int = 8
+    max_final_etfs_per_sector: int = 3
+    max_active_sectors: int = 4
+    max_total_active_weight: float = 0.60
+    max_single_sector_weight: float = 0.15
+    default_active_weight: float = 0.10
+    high_confidence_active_weight: float = 0.15
+    low_confidence_active_weight: float = 0.05
+    monitor_weight: float = 0.0
+    excluded_weight: float = 0.0
+
+
+class WatchlistETFCandidate(BaseModel):
+    """ETF candidate shown to and returned by the sector ETF roundtable."""
+
+    code: str
+    name: str
+    match_score: float = 0.0
+    liquidity_score: float = 0.0
+    tracking_purity_score: float = 0.0
+    total_score: float = 0.0
+    reason: str = ""
+    tradable: bool = True
+    blocked_reasons: list[str] = Field(default_factory=list)
+    pre_rank: int | None = None
+    raw: dict[str, Any] = Field(default_factory=dict)
+
+
+class SectorCandidatePayload(BaseModel):
+    """Sector candidate passed into the batch roundtable."""
+
+    sector_name: str
+    pre_score: float
+    momentum_score: float = 0.0
+    breadth_score: float = 0.0
+    event_score: float = 0.0
+    evidence: dict[str, list[str]] = Field(default_factory=dict)
+    support_evidence: list[str] = Field(default_factory=list)
+    risk_flags: list[str] = Field(default_factory=list)
+    raw_etf_candidates: list[WatchlistETFCandidate] = Field(default_factory=list)
+    raw: dict[str, Any] = Field(default_factory=dict)
+
+
+class ExcludedSectorCandidate(BaseModel):
+    """Sector removed before roundtable because no executable ETF exists."""
+
+    sector: str
+    excluded_stage: Literal["pre_roundtable"] = "pre_roundtable"
+    excluded_reason: ExcludedReason
+    brief_evidence: list[str] = Field(default_factory=list)
+    raw: dict[str, Any] = Field(default_factory=dict)
+
+
+class SectorWatchlistDecision(BaseModel):
+    """Final JSON contract for one sector in the ETF watchlist."""
+
+    sector: str
+    status: WatchlistStatus
+    primary_etf: WatchlistETFCandidate
+    backup_etfs: list[WatchlistETFCandidate] = Field(default_factory=list, max_length=2)
+    watchlist_weight_hint: float = 0.0
+    support_reasons: list[str] = Field(default_factory=list)
+    objections: list[str] = Field(default_factory=list)
+    risk_details: list[str] = Field(default_factory=list)
+    why_primary_etf: list[str] = Field(default_factory=list)
+    why_not_backups: list[str] = Field(default_factory=list)
+    invalid_conditions: list[str] = Field(default_factory=list)
+    confidence: Confidence = "low"
+    review_horizon_days: list[int] = Field(default_factory=lambda: [1, 3, 5, 10])
+    execution_requires_approval: bool = True
+    execution_allowed: bool = False
+    roundtable_score: float = 0.0
+
+
+class DailyETFWatchlistReport(BaseModel):
+    """Top-level JSON-first daily ETF observation pool report."""
+
+    trade_date: str
+    run_id: str
+    scope: Literal["a_share_sector_etf_watchlist"] = "a_share_sector_etf_watchlist"
+    generated_at: str = Field(default_factory=lambda: datetime.now().isoformat())
+    limits: ETFWatchlistLimits = Field(default_factory=ETFWatchlistLimits)
+    decisions: list[SectorWatchlistDecision] = Field(default_factory=list)
+    excluded_sector_candidates: list[ExcludedSectorCandidate] = Field(default_factory=list)
+    data_quality: dict[str, Any] = Field(default_factory=dict)
+    roundtable_summary: dict[str, Any] = Field(default_factory=dict)
+    approval: dict[str, Any] = Field(default_factory=lambda: {
+        "status": "pending",
+        "execution_allowed": False,
+    })
+
+
+def build_watchlist_report(
+    *,
+    trade_date: str,
+    candidates: list[SectorCandidatePayload],
+    excluded: list[ExcludedSectorCandidate],
+    limits: ETFWatchlistLimits | None = None,
+    provider: str = "deterministic_batch_roundtable",
+) -> DailyETFWatchlistReport:
+    """Build deterministic JSON decisions from sector and ETF candidates.
+
+    This is the fallback roundtable adapter: it preserves the contract that the
+    System Agent must output JSON with a primary ETF, support reasons, objections,
+    and weight hints, without requiring live LLM/AutoGen calls in tests.
+    """
+    limits = limits or ETFWatchlistLimits()
+    decisions = [_decision_from_candidate(c, limits) for c in candidates[: limits.max_roundtable_sectors]]
+    decisions.sort(key=lambda item: item.roundtable_score, reverse=True)
+    decisions = _enforce_active_limits(decisions, limits)
+    return DailyETFWatchlistReport(
+        trade_date=trade_date,
+        run_id=f"etf_watchlist_{trade_date}_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+        limits=limits,
+        decisions=decisions,
+        excluded_sector_candidates=excluded,
+        data_quality={
+            "candidate_count": len(candidates),
+            "excluded_count": len(excluded),
+            "all_final_decisions_have_primary_etf": all(bool(d.primary_etf.code) for d in decisions),
+        },
+        roundtable_summary={
+            "provider": provider,
+            "input_sector_count": len(candidates),
+            "decision_count": len(decisions),
+            "max_active_sectors": limits.max_active_sectors,
+            "note": "Deterministic JSON fallback; AutoGen can replace this adapter without changing the report contract.",
+        },
+    )
+
+
+def render_watchlist_markdown(report: DailyETFWatchlistReport) -> str:
+    """Render a readable Markdown report from the JSON contract."""
+    lines = [
+        "# A股板块 ETF 观察池",
+        "",
+        f"**交易日期**: {report.trade_date}",
+        f"**运行ID**: {report.run_id}",
+        f"**生成时间**: {report.generated_at}",
+        "",
+        "## 观察池结论",
+        "",
+    ]
+    if not report.decisions:
+        lines.append("未发现具备可交易 ETF 的板块候选。")
+    for idx, decision in enumerate(report.decisions, start=1):
+        primary = decision.primary_etf
+        backups = "；".join(f"{e.code} {e.name}" for e in decision.backup_etfs) or "无"
+        lines.extend([
+            f"### {idx}. {decision.sector} - {decision.status}",
+            "",
+            f"- **首选 ETF**: {primary.code} {primary.name}",
+            f"- **备选 ETF**: {backups}",
+            f"- **观察池权重**: {decision.watchlist_weight_hint:.0%}",
+            f"- **置信度**: {decision.confidence}",
+            "",
+            "**支持理由**:",
+            *[f"- {reason}" for reason in decision.support_reasons],
+            "",
+            "**反对理由**:",
+            *[f"- {reason}" for reason in (decision.objections or ["暂无重大反对意见"])],
+            "",
+            "**为什么是首选 ETF**:",
+            *[f"- {reason}" for reason in decision.why_primary_etf],
+            "",
+            "**失效条件**:",
+            *[f"- {item}" for item in decision.invalid_conditions],
+            "",
+        ])
+    if report.excluded_sector_candidates:
+        lines.extend(["## 剔除清单", ""])
+        for item in report.excluded_sector_candidates:
+            evidence = "；".join(item.brief_evidence[:4])
+            lines.append(f"- **{item.sector}**: {item.excluded_reason}。{evidence}")
+    lines.extend([
+        "",
+        "## 审批",
+        "",
+        f"- 状态: {report.approval.get('status', 'pending')}",
+        f"- 可执行: {report.approval.get('execution_allowed', False)}",
+    ])
+    return "\n".join(lines)
+
+
+def _decision_from_candidate(
+    candidate: SectorCandidatePayload,
+    limits: ETFWatchlistLimits,
+) -> SectorWatchlistDecision:
+    etfs = sorted(candidate.raw_etf_candidates, key=lambda item: item.total_score, reverse=True)
+    final_etfs = etfs[: limits.max_final_etfs_per_sector]
+    if not final_etfs:
+        raise ValueError(f"Sector {candidate.sector_name} has no ETF candidates")
+    primary = final_etfs[0]
+    backups = final_etfs[1:3]
+    objections = list(candidate.risk_flags)
+    score = candidate.pre_score + min(primary.total_score / 4.0, 3.0)
+    confidence: Confidence = "high" if score >= 9 and len(objections) <= 1 else "medium" if score >= 7 else "low"
+    status: WatchlistStatus
+    if score >= 8 and primary.liquidity_score >= 1.0:
+        status = "active"
+    elif score >= 5:
+        status = "monitor"
+    else:
+        status = "excluded"
+    if primary.blocked_reasons:
+        status = "excluded"
+        objections.extend(primary.blocked_reasons)
+    weight = _weight_for_status(status, confidence, limits)
+    why_not_backups = [
+        f"{etf.code} {etf.name}: 备选，综合分 {etf.total_score:.1f} 低于首选 {primary.total_score:.1f}"
+        for etf in backups
+    ]
+    return SectorWatchlistDecision(
+        sector=candidate.sector_name,
+        status=status,
+        primary_etf=primary,
+        backup_etfs=backups,
+        watchlist_weight_hint=weight,
+        support_reasons=_support_reasons(candidate, primary),
+        objections=objections,
+        risk_details=objections,
+        why_primary_etf=[
+            primary.reason,
+            f"ETF 综合分 {primary.total_score:.1f}，流动性评分 {primary.liquidity_score:.1f}",
+            f"主题跟踪纯度评分 {primary.tracking_purity_score:.1f}",
+        ],
+        why_not_backups=why_not_backups,
+        invalid_conditions=[
+            "板块动量和宽度明显回落",
+            "首选 ETF 成交额跌破流动性阈值",
+            "事件催化证伪或新闻半衰期结束",
+            "ETF 停牌、涨跌停或出现异常溢价",
+        ],
+        confidence=confidence,
+        roundtable_score=round(score, 2),
+    )
+
+
+def _support_reasons(candidate: SectorCandidatePayload, primary: WatchlistETFCandidate) -> list[str]:
+    reasons = [
+        f"板块预评分 {candidate.pre_score:.1f}",
+        *candidate.support_evidence[:5],
+        f"首选 ETF {primary.code} {primary.name} 匹配该板块且具备可交易性",
+    ]
+    return [reason for reason in reasons if reason]
+
+
+def _weight_for_status(
+    status: WatchlistStatus,
+    confidence: Confidence,
+    limits: ETFWatchlistLimits,
+) -> float:
+    if status != "active":
+        return 0.0
+    if confidence == "high":
+        return limits.high_confidence_active_weight
+    if confidence == "low":
+        return limits.low_confidence_active_weight
+    return limits.default_active_weight
+
+
+def _enforce_active_limits(
+    decisions: list[SectorWatchlistDecision],
+    limits: ETFWatchlistLimits,
+) -> list[SectorWatchlistDecision]:
+    active_count = 0
+    total_weight = 0.0
+    adjusted: list[SectorWatchlistDecision] = []
+    for decision in decisions:
+        if decision.status != "active":
+            adjusted.append(decision)
+            continue
+        would_exceed_count = active_count >= limits.max_active_sectors
+        would_exceed_weight = total_weight + decision.watchlist_weight_hint > limits.max_total_active_weight
+        if would_exceed_count or would_exceed_weight:
+            downgraded = decision.model_copy(deep=True)
+            downgraded.status = "monitor"
+            downgraded.watchlist_weight_hint = 0.0
+            downgraded.objections = [
+                "active 名额或总权重约束降级为 monitor",
+                *downgraded.objections,
+            ]
+            downgraded.risk_details = downgraded.objections
+            adjusted.append(downgraded)
+            continue
+        decision.watchlist_weight_hint = min(decision.watchlist_weight_hint, limits.max_single_sector_weight)
+        total_weight += decision.watchlist_weight_hint
+        active_count += 1
+        adjusted.append(decision)
+    return adjusted

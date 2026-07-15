@@ -73,13 +73,19 @@ python -m advanced_trading_agent.main --sector-etf-scan --date 2026-07-15 --scan
 python -m advanced_trading_agent.main --sector-etf-scan --sector 半导体 --date 2026-07-15
 ```
 
-运行完整 LangGraph 板块 ETF 决策流水线（选择板块/ETF → 召回对话记忆 → AutoGen 圆桌 → 写入对话记忆 → 报告）:
+生成每日板块 ETF 观察池（最多 8 个板块进入 JSON 圆桌；每个板块最终只保留 1 个首选 ETF + 2 个备选 ETF）:
 
 ```bash
-python -m advanced_trading_agent.main --sector-etf-analyze --sector 半导体 --date 2026-07-15
+python -m advanced_trading_agent.main --sector-etf-analyze --date 2026-07-15
 ```
 
-调试时可以关闭 AutoGen 和对话记忆写入:
+输出 JSON-first 报告，便于复盘、审批和后续 paper trading:
+
+```bash
+python -m advanced_trading_agent.main --sector-etf-analyze --date 2026-07-15 --json
+```
+
+只分析一个指定板块的对话问答路径仍保留:
 
 ```bash
 python -m advanced_trading_agent.main --sector-etf-analyze --sector 半导体 --date 2026-07-15 --no-autogen --no-conversation-memory
@@ -190,15 +196,17 @@ tier2_data.events[*].evidence_text / content_status / content_cleaning / llm_rea
 ## 运行
 
 ```bash
-# 单标的分
-python -m advanced_trading_agent.main --ticker 000001.SZ
+# 默认：生成 A 股板块 ETF 观察池
+python -m advanced_trading_agent.main --date 2026-07-15
 
-# 批量分析
-python -m advanced_trading_agent.main --batch stocks.txt
+# JSON-first 输出
+python -m advanced_trading_agent.main --sector-etf-analyze --date 2026-07-15 --json
 
-# 调试模式
-python -m advanced_trading_agent.main --ticker 000001.SZ --debug
+# 只刷新 ETF 数据缓存
+python -m advanced_trading_agent.main --refresh-etf-cache --date 2026-07-15
 ```
+
+旧 `--ticker` / `--batch` / `--scan` 个股买入入口已下线；个股数据仍作为板块宽度、事件传导和风险证据源保留。
 
 ## 项目结构
 

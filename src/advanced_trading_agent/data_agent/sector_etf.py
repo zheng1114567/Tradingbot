@@ -14,6 +14,11 @@ from dataclasses import asdict, dataclass, field
 from datetime import date
 from typing import Any, Callable
 
+from .etf_watchlist import (
+    ExcludedSectorCandidate,
+    SectorCandidatePayload,
+    WatchlistETFCandidate,
+)
 from .scanner import MarketScanner, ScanResult
 from .vendor_router import route_to_vendor
 
@@ -32,9 +37,28 @@ class ETFCandidate:
     total_score: float
     reason: str
     raw: dict[str, Any] = field(default_factory=dict)
+    tracking_purity_score: float = 0.0
+    tradable: bool = True
+    blocked_reasons: list[str] = field(default_factory=list)
+    pre_rank: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+    def to_watchlist_candidate(self) -> WatchlistETFCandidate:
+        return WatchlistETFCandidate(
+            code=self.code,
+            name=self.name,
+            match_score=self.match_score,
+            liquidity_score=self.liquidity_score,
+            tracking_purity_score=self.tracking_purity_score,
+            total_score=self.total_score,
+            reason=self.reason,
+            tradable=self.tradable,
+            blocked_reasons=self.blocked_reasons,
+            pre_rank=self.pre_rank,
+            raw=_slim_etf_raw(self.raw),
+        )
 
 
 @dataclass
@@ -59,6 +83,44 @@ class SectorCandidate:
         payload = asdict(self)
         payload["primary_etf"] = self.primary_etf.to_dict() if self.primary_etf else None
         return payload
+
+    def to_watchlist_payload(self) -> SectorCandidatePayload:
+        return SectorCandidatePayload(
+            sector_name=self.sector_name,
+            pre_score=self.score,
+            momentum_score=self.momentum_score,
+            breadth_score=self.breadth_score,
+            event_score=self.event_score,
+            evidence={
+                "momentum": [item for item in self.evidence if "动量" in item],
+                "breadth": [item for item in self.evidence if "宽度" in item],
+                "events": [item for item in self.evidence if "新闻" in item or "事件" in item],
+                "etf": [item for item in self.evidence if "ETF" in item],
+            },
+            support_evidence=list(self.evidence),
+            risk_flags=list(self.risks),
+            raw_etf_candidates=[etf.to_watchlist_candidate() for etf in self.etfs],
+            raw=_slim_etf_raw(self.raw),
+        )
+
+
+@dataclass
+class SectorETFSelection:
+    """Batch selection output: roundtable-ready candidates plus pre-roundtable exclusions."""
+
+    trade_date: str
+    candidates: list[SectorCandidate] = field(default_factory=list)
+    excluded: list[ExcludedSectorCandidate] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "trade_date": self.trade_date,
+            "candidates": [payload.model_dump(mode="json") for payload in self.watchlist_payloads()],
+            "excluded": [item.model_dump(mode="json") for item in self.excluded],
+        }
+
+    def watchlist_payloads(self) -> list[SectorCandidatePayload]:
+        return [candidate.to_watchlist_payload() for candidate in self.candidates]
 
 
 class SectorETFSelector:
@@ -141,6 +203,34 @@ class SectorETFSelector:
 
         candidates.sort(key=lambda item: (item.primary_etf is not None, item.score), reverse=True)
         return candidates[: self.top_sectors]
+
+    def select_with_exclusions(
+        self,
+        trade_date: str | None = None,
+        *,
+        sector_query: str | None = None,
+        scan_results: list[ScanResult] | None = None,
+        max_roundtable_sectors: int = 8,
+    ) -> SectorETFSelection:
+        """Return candidates allowed into the batch roundtable plus excluded sectors.
+
+        Final ETF watchlist reports require a primary ETF for every sector.  Sectors
+        with no ETF mapping, untradable ETF rows, or weak ETF liquidity are therefore
+        removed before the roundtable and preserved in a compact exclusion list.
+        """
+        td = trade_date or date.today().isoformat()
+        raw_candidates = self.select(td, sector_query=sector_query, scan_results=scan_results)
+        candidates: list[SectorCandidate] = []
+        excluded: list[ExcludedSectorCandidate] = []
+        for candidate in raw_candidates:
+            reason = self._pre_roundtable_exclusion_reason(candidate)
+            if reason:
+                excluded.append(self._excluded_sector(candidate, reason))
+                continue
+            candidates.append(candidate)
+            if len(candidates) >= max_roundtable_sectors:
+                break
+        return SectorETFSelection(trade_date=td, candidates=candidates, excluded=excluded)
 
     def explain_sector(
         self,
@@ -304,7 +394,9 @@ class SectorETFSelector:
                 continue
             match_score = 5.0 if contains else 3.0 + len(overlap)
             liquidity = self._liquidity_score(row)
-            total = round(match_score + liquidity, 2)
+            purity = self._tracking_purity_score(sector_name, name, row)
+            blocked = self._etf_blocked_reasons(row)
+            total = round(match_score + liquidity + purity, 2)
             candidates.append(
                 ETFCandidate(
                     code=code,
@@ -312,11 +404,16 @@ class SectorETFSelector:
                     match_score=round(match_score, 2),
                     liquidity_score=round(liquidity, 2),
                     total_score=total,
-                    reason=f"名称与“{sector_name}”匹配，流动性评分 {liquidity:.1f}",
+                    reason=f"名称与“{sector_name}”匹配，流动性评分 {liquidity:.1f}，跟踪纯度 {purity:.1f}",
                     raw=dict(row),
+                    tracking_purity_score=round(purity, 2),
+                    tradable=not blocked,
+                    blocked_reasons=blocked,
                 )
             )
         candidates.sort(key=lambda item: item.total_score, reverse=True)
+        for idx, candidate in enumerate(candidates, start=1):
+            candidate.pre_rank = idx
         return candidates
 
     @staticmethod
@@ -331,6 +428,30 @@ class SectorETFSelector:
         if amount >= 30_000_000:
             return 1.0
         return 0.2
+
+    @staticmethod
+    def _tracking_purity_score(sector_name: str, etf_name: str, row: dict[str, Any]) -> float:
+        """Score how directly an ETF tracks the requested sector/theme."""
+        del row
+        broad_terms = ("沪深300", "中证500", "中证1000", "创业板", "上证50", "A500", "红利", "央企")
+        if any(term in etf_name for term in broad_terms):
+            return 0.2
+        if sector_name and sector_name in etf_name:
+            return 2.0
+        overlap = SectorETFSelector._tokens(sector_name) & SectorETFSelector._tokens(etf_name)
+        return min(0.5 + len(overlap) * 0.2, 1.5) if overlap else 0.0
+
+    @staticmethod
+    def _etf_blocked_reasons(row: dict[str, Any]) -> list[str]:
+        reasons: list[str] = []
+        name = str(row.get("name") or row.get("名称") or "")
+        status = str(row.get("status") or row.get("交易状态") or "")
+        pct = _float(row.get("pct_chg") or row.get("涨跌幅"))
+        if "停牌" in status or "停牌" in name:
+            reasons.append("ETF 停牌")
+        if pct is not None and abs(pct) >= 9.8:
+            reasons.append("ETF 接近涨跌停，交易可执行性不足")
+        return reasons
 
     @staticmethod
     def _risk_flags(
@@ -357,6 +478,32 @@ class SectorETFSelector:
         return risks
 
     @staticmethod
+    def _pre_roundtable_exclusion_reason(candidate: SectorCandidate) -> str:
+        if not candidate.etfs:
+            return "no_tradable_etf"
+        tradable = [etf for etf in candidate.etfs if etf.tradable]
+        if not tradable:
+            return "etf_suspended"
+        if max(etf.liquidity_score for etf in tradable) < 1.0:
+            return "low_etf_liquidity"
+        if max(etf.match_score for etf in tradable) < 3.5:
+            return "mapping_uncertain"
+        return ""
+
+    @staticmethod
+    def _excluded_sector(candidate: SectorCandidate, reason: str) -> ExcludedSectorCandidate:
+        return ExcludedSectorCandidate(
+            sector=candidate.sector_name,
+            excluded_reason=reason,  # type: ignore[arg-type]
+            brief_evidence=[
+                f"板块评分 {candidate.score:.1f}",
+                *candidate.evidence[:3],
+                *(candidate.risks[:2] if candidate.risks else []),
+            ],
+            raw={"sector_name": candidate.sector_name, "score": candidate.score, "risks": candidate.risks},
+        )
+
+    @staticmethod
     def _tokens(text: str) -> set[str]:
         cleaned = re.sub(r"(ETF|基金|指数|联接|增强|LOF|C|A)$", "", text, flags=re.IGNORECASE)
         chunks = re.findall(r"[\u4e00-\u9fffA-Za-z0-9]+", cleaned)
@@ -373,6 +520,12 @@ class SectorETFSelector:
         if query in sector_name or sector_name in query:
             return True
         return bool(SectorETFSelector._tokens(sector_name) & SectorETFSelector._tokens(query))
+
+
+def _slim_etf_raw(raw: dict[str, Any]) -> dict[str, Any]:
+    """Keep final watchlist JSON compact while preserving audit-relevant ETF fields."""
+    keys = ("code", "raw_code", "name", "latest_price", "change_pct", "amount", "premium_discount", "data_source")
+    return {key: raw.get(key) for key in keys if key in raw}
 
 
 def sector_candidates_to_json(candidates: list[SectorCandidate]) -> str:

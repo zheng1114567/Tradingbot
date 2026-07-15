@@ -23,7 +23,7 @@ from .backtest.portfolio import ObservationPortfolioBacktester
 from .backtest.review import ReviewEngine
 from .backtest.scheduler import run_daily_review
 from .config import config
-from .core.atomic_write import atomic_write_text
+from .core.atomic_write import atomic_write_json, atomic_write_text
 from .data_agent.data_agent import DataAgent, DataAgentRequest
 from .data_agent.scanner import MarketScanner, ScanBundle
 from .graph.workflow import TradingSystem
@@ -261,8 +261,9 @@ def scan_sector_etfs(
     top_n: int = 8,
     force: bool = False,
 ) -> str:
-    """Scan sectors first and return ETF candidates instead of stock picks."""
-    from .data_agent.sector_etf import SectorETFSelector, sector_candidates_to_json
+    """Scan sectors first and return JSON-first ETF watchlist candidates."""
+    from .data_agent.etf_watchlist import build_watchlist_report, render_watchlist_markdown
+    from .data_agent.sector_etf import SectorETFSelector
 
     trade_date = trade_date or str(date.today())
     results_dir = Path(config.get("results_dir"))
@@ -275,22 +276,19 @@ def scan_sector_etfs(
         return report_path.read_text(encoding="utf-8")
 
     selector = SectorETFSelector(top_sectors=top_n)
-    candidates = selector.select(trade_date, sector_query=sector)
-    markdown = "\n".join([
-        "# 板块ETF扫描报告",
-        "",
-        f"**交易日期**: {trade_date}",
-        f"**范围**: {sector or '全市场热点板块'}",
-        "",
-        selector.format_markdown(candidates),
-        "",
-        "## 执行口径",
-        "",
-        "- 策略主线是先选板块，再选择可映射ETF；个股只作为板块宽度和热度证据。",
-        "- 若没有匹配ETF、流动性不足、事件催化缺失或板块内强势样本过少，则降级为暂不适合。",
-    ])
+    selection = selector.select_with_exclusions(
+        trade_date,
+        sector_query=sector,
+        max_roundtable_sectors=top_n,
+    )
+    report = build_watchlist_report(
+        trade_date=trade_date,
+        candidates=selection.watchlist_payloads(),
+        excluded=selection.excluded,
+    )
+    markdown = render_watchlist_markdown(report)
     atomic_write_text(report_path, markdown)
-    atomic_write_text(json_path, sector_candidates_to_json(candidates))
+    atomic_write_json(json_path, report.model_dump(mode="json"))
     return markdown
 
 
@@ -314,6 +312,37 @@ def analyze_sector_etf(
         store_memory=store_memory,
     )
     return report
+
+
+def analyze_sector_etf_watchlist(
+    trade_date: str | None = None,
+    *,
+    max_roundtable_sectors: int = 8,
+    store_memory: bool = True,
+    force: bool = False,
+    json_output: bool = False,
+) -> str:
+    """Run the batch sector ETF observation-pool workflow."""
+    from .graph.sector_etf_workflow import SectorETFWatchlistSystem
+
+    trade_date = trade_date or str(date.today())
+    results_dir = Path(config.get("results_dir"))
+    results_dir.mkdir(parents=True, exist_ok=True)
+    report_path = results_dir / f"sector_etf_watchlist_{trade_date}.md"
+    json_path = results_dir / f"sector_etf_watchlist_{trade_date}.json"
+
+    if report_path.exists() and json_path.exists() and not force:
+        return json_path.read_text(encoding="utf-8") if json_output else report_path.read_text(encoding="utf-8")
+
+    state, markdown = SectorETFWatchlistSystem().analyze(
+        trade_date=trade_date,
+        max_roundtable_sectors=max_roundtable_sectors,
+        store_memory=store_memory,
+    )
+    payload = state.get("watchlist_report", {})
+    atomic_write_text(report_path, markdown)
+    atomic_write_json(json_path, payload)
+    return json.dumps(payload, ensure_ascii=False, indent=2) if json_output else markdown
 
 
 def audit_strategy_proposal(
@@ -714,15 +743,22 @@ def main():
         return
 
     if args.sector_etf_analyze:
-        if not args.sector:
-            parser.error("--sector-etf-analyze requires --sector")
-        print(analyze_sector_etf(
-            args.sector,
-            args.date,
-            question=f"{args.sector}板块是否适合买ETF？",
-            use_autogen=not args.no_autogen,
-            store_memory=not args.no_conversation_memory,
-        ))
+        if args.sector:
+            print(analyze_sector_etf(
+                args.sector,
+                args.date,
+                question=f"{args.sector}板块是否适合买ETF？",
+                use_autogen=not args.no_autogen,
+                store_memory=not args.no_conversation_memory,
+            ))
+        else:
+            print(analyze_sector_etf_watchlist(
+                args.date,
+                max_roundtable_sectors=min(args.scan_top_n, 8),
+                store_memory=not args.no_conversation_memory,
+                force=args.force,
+                json_output=args.json,
+            ))
         return
 
     if args.refresh_cache:
@@ -774,53 +810,21 @@ def main():
         return
 
     if args.scan:
-        print(scan_and_analyze(
-            top_n=args.scan_top_n,
-            trade_date=args.date,
-            debug=args.debug,
-            skip_backtest=args.skip_backtest,
-            force=args.force,
-            refresh_cache=args.refresh_scan_cache and not args.no_refresh_cache,
-        ))
-        return
+        parser.error("旧个股扫描入口已下线；请使用 --sector-etf-analyze 生成板块 ETF 观察池")
 
     if args.batch:
-        reports = analyze_batch(
-            args.batch,
-            debug=args.debug,
-            max_workers=args.workers,
-            skip_backtest=args.skip_backtest,
-        )
-        print(f"Batch complete: {len(reports)} tickers analyzed")
-        return
+        parser.error("旧个股批量分析入口已下线；ETF 观察池按板块批量生成")
 
-    if not args.ticker:
-        # 无参数时默认运行热点扫描
-        print(scan_and_analyze(
-            top_n=10,
-            trade_date=args.date,
-            debug=args.debug,
-            skip_backtest=args.skip_backtest,
-            force=args.force,
-            refresh_cache=args.refresh_scan_cache and not args.no_refresh_cache,
-        ))
-        return
+    if args.ticker:
+        parser.error("旧个股买入分析入口已下线；个股数据仅作为板块 ETF 证据源保留")
 
-    report = analyze_single(
-        args.ticker,
+    print(analyze_sector_etf_watchlist(
         args.date,
-        debug=args.debug,
-        skip_backtest=args.skip_backtest,
-    )
-
-    if args.json:
-        # 提取 JSON 部分
-        from .agents.memory_agent import MemoryStore
-        store = MemoryStore()
-        entries = store.load_entries()
-        print(json.dumps(entries, ensure_ascii=False, indent=2))
-    else:
-        print(report)
+        max_roundtable_sectors=8,
+        store_memory=not args.no_conversation_memory,
+        force=args.force,
+        json_output=args.json,
+    ))
 
 
 if __name__ == "__main__":

@@ -13,6 +13,12 @@ from typing import Any, Callable, TypedDict
 from langgraph.graph import END, START, StateGraph
 
 from ..agents.conversation_memory import ConversationEntry, ConversationMemoryStore
+from ..data_agent.etf_watchlist import (
+    DailyETFWatchlistReport,
+    ETFWatchlistLimits,
+    build_watchlist_report,
+    render_watchlist_markdown,
+)
 from ..data_agent.sector_etf import SectorETFSelector
 from ..roundtable.sector_qa import answer_sector_question_with_roundtable
 
@@ -32,6 +38,19 @@ class SectorETFState(TypedDict, total=False):
     memory_context: str
     sector_evidence: dict[str, Any]
     roundtable_result: dict[str, Any]
+    final_report: str
+    errors: list[str]
+
+
+class SectorETFWatchlistState(TypedDict, total=False):
+    """State for the batch ETF observation-pool workflow."""
+
+    messages: list[Any]
+    trade_date: str
+    max_roundtable_sectors: int
+    store_memory: bool
+    selection: dict[str, Any]
+    watchlist_report: dict[str, Any]
     final_report: str
     errors: list[str]
 
@@ -175,6 +194,127 @@ class SectorETFTradingSystem:
             "sector_name": sector_name,
             "trade_date": td,
             "use_autogen": use_autogen,
+            "store_memory": store_memory,
+            "errors": [],
+        }
+        final_state = self.workflow.invoke(init_state)
+        return final_state, str(final_state.get("final_report", ""))
+
+
+def create_sector_etf_watchlist_workflow(
+    *,
+    selector: SectorETFSelector | None = None,
+    memory_store: ConversationMemoryStore | None = None,
+    limits: ETFWatchlistLimits | None = None,
+) -> Any:
+    """Create the batch sector ETF observation-pool workflow.
+
+    The roundtable step is JSON-first: every final sector decision must include
+    a primary ETF, support reasons, objections, and approval-gated weight hints.
+    """
+    limits = limits or ETFWatchlistLimits()
+    selector = selector or SectorETFSelector(top_sectors=limits.max_roundtable_sectors)
+    memory_store = memory_store or ConversationMemoryStore()
+
+    def select_batch_node(state: SectorETFWatchlistState) -> dict[str, Any]:
+        trade_date = state.get("trade_date") or date.today().isoformat()
+        selection = selector.select_with_exclusions(
+            trade_date,
+            max_roundtable_sectors=state.get("max_roundtable_sectors", limits.max_roundtable_sectors),
+        )
+        return {"selection": selection.to_dict()}
+
+    def roundtable_json_node(state: SectorETFWatchlistState) -> dict[str, Any]:
+        selection_raw = state.get("selection", {}) or {}
+        from ..data_agent.etf_watchlist import ExcludedSectorCandidate, SectorCandidatePayload
+
+        candidates = [
+            SectorCandidatePayload(**item)
+            for item in selection_raw.get("candidates", [])
+            if isinstance(item, dict)
+        ]
+        excluded = [
+            ExcludedSectorCandidate(**item)
+            for item in selection_raw.get("excluded", [])
+            if isinstance(item, dict)
+        ]
+        report = build_watchlist_report(
+            trade_date=state.get("trade_date") or date.today().isoformat(),
+            candidates=candidates,
+            excluded=excluded,
+            limits=limits,
+        )
+        return {"watchlist_report": report.model_dump(mode="json")}
+
+    def store_memory_node(state: SectorETFWatchlistState) -> dict[str, Any]:
+        if not state.get("store_memory", True):
+            return {}
+        report = DailyETFWatchlistReport(**(state.get("watchlist_report") or {}))
+        summary = ", ".join(
+            f"{d.sector}:{d.status}:{d.primary_etf.code}"
+            for d in report.decisions[:8]
+        )
+        memory_store.append(ConversationEntry(
+            question="每日板块 ETF 观察池",
+            answer=summary,
+            trade_date=report.trade_date,
+            target_type="sector_etf_watchlist",
+            target="batch",
+            evidence={
+                "run_id": report.run_id,
+                "decision_count": len(report.decisions),
+                "excluded_count": len(report.excluded_sector_candidates),
+            },
+        ))
+        return {}
+
+    def report_node(state: SectorETFWatchlistState) -> dict[str, Any]:
+        report = DailyETFWatchlistReport(**(state.get("watchlist_report") or {}))
+        return {"final_report": render_watchlist_markdown(report)}
+
+    workflow = StateGraph(SectorETFWatchlistState)
+    workflow.add_node("Select Sector ETF Basket", select_batch_node)
+    workflow.add_node("JSON Roundtable Decision", roundtable_json_node)
+    workflow.add_node("Store Watchlist Memory", store_memory_node)
+    workflow.add_node("Render Report", report_node)
+
+    workflow.add_edge(START, "Select Sector ETF Basket")
+    workflow.add_edge("Select Sector ETF Basket", "JSON Roundtable Decision")
+    workflow.add_edge("JSON Roundtable Decision", "Store Watchlist Memory")
+    workflow.add_edge("Store Watchlist Memory", "Render Report")
+    workflow.add_edge("Render Report", END)
+    return workflow.compile()
+
+
+class SectorETFWatchlistSystem:
+    """Batch sector ETF observation-pool entrypoint."""
+
+    def __init__(
+        self,
+        *,
+        selector: SectorETFSelector | None = None,
+        memory_store: ConversationMemoryStore | None = None,
+        limits: ETFWatchlistLimits | None = None,
+    ) -> None:
+        self.limits = limits or ETFWatchlistLimits()
+        self.workflow = create_sector_etf_watchlist_workflow(
+            selector=selector,
+            memory_store=memory_store,
+            limits=self.limits,
+        )
+
+    def analyze(
+        self,
+        *,
+        trade_date: str | None = None,
+        max_roundtable_sectors: int | None = None,
+        store_memory: bool = True,
+    ) -> tuple[dict[str, Any], str]:
+        td = trade_date or date.today().isoformat()
+        init_state: SectorETFWatchlistState = {
+            "messages": [("human", f"生成 {td} A股板块 ETF 观察池")],
+            "trade_date": td,
+            "max_roundtable_sectors": max_roundtable_sectors or self.limits.max_roundtable_sectors,
             "store_memory": store_memory,
             "errors": [],
         }

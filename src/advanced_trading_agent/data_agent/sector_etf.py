@@ -133,8 +133,13 @@ class SectorETFSelector:
         route_fn: RouteFn | None = None,
         top_sectors: int = 8,
         top_etfs_per_sector: int = 3,
+        auto_refresh_cache: bool = False,
     ) -> None:
-        self.scanner = scanner or MarketScanner(top_sectors=top_sectors, top_n=30, auto_refresh_cache=True)
+        self.scanner = scanner or MarketScanner(
+            top_sectors=top_sectors,
+            top_n=30,
+            auto_refresh_cache=auto_refresh_cache,
+        )
         self.route_fn = route_fn or route_to_vendor
         self.top_sectors = top_sectors
         self.top_etfs_per_sector = top_etfs_per_sector

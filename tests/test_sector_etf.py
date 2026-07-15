@@ -4,6 +4,21 @@ from advanced_trading_agent.data_agent.scanner import ScanResult
 from advanced_trading_agent.data_agent.sector_etf import SectorETFSelector
 
 
+def test_sector_selector_defaults_to_saved_cache_without_auto_refresh():
+    selector = SectorETFSelector(route_fn=lambda *_args, **_kwargs: [])
+
+    assert selector.scanner._auto_refresh_cache is False
+
+
+def test_sector_selector_can_opt_in_to_cache_refresh():
+    selector = SectorETFSelector(
+        route_fn=lambda *_args, **_kwargs: [],
+        auto_refresh_cache=True,
+    )
+
+    assert selector.scanner._auto_refresh_cache is True
+
+
 def test_sector_selector_maps_hot_sector_to_liquid_etf():
     calls: list[tuple[str, dict]] = []
 

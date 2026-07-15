@@ -12,22 +12,17 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import time
 from datetime import date
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-import pandas as pd
-
-from .agents.memory_agent import MemoryStore
-from .backtest.portfolio import ObservationPortfolioBacktester
-from .backtest.review import ReviewEngine
-from .backtest.scheduler import run_daily_review
 from .config import config
 from .core.atomic_write import atomic_write_json, atomic_write_text
-from .data_agent.data_agent import DataAgent, DataAgentRequest
-from .data_agent.scanner import MarketScanner, ScanBundle
-from .graph.workflow import TradingSystem
 from .strategy_rules import load_strategy_proposals, review_strategy_proposal
+
+if TYPE_CHECKING:
+    from .data_agent.scanner import ScanBundle
 
 # 日志: 控制台 + 文件 (results_dir/runtime.log)
 _log_dir = Path(config.get("results_dir"))
@@ -56,6 +51,8 @@ def analyze_single(ticker: str, trade_date: str | None = None,
     Returns:
         Markdown 格式的分析报告
     """
+    from .graph.workflow import TradingSystem
+
     trade_date = trade_date or str(date.today())
     logger.info("Analyzing %s on %s...", ticker, trade_date)
 
@@ -125,6 +122,11 @@ def review_memory(price_file: str | None = None, as_of: str | None = None) -> st
     price_file 可选，格式为 CSV，至少包含 code/trade_date/open/close/volume/amount。
     若不传 price_file，则只汇总已有 resolved 复盘记录。
     """
+    import pandas as pd
+
+    from .agents.memory_agent import MemoryStore
+    from .backtest.review import ReviewEngine
+
     store = MemoryStore()
     reviewer = ReviewEngine()
 
@@ -150,6 +152,10 @@ def review_memory(price_file: str | None = None, as_of: str | None = None) -> st
 
 def backtest_portfolio(signals_file: str, price_file: str) -> str:
     """Run observation-pool portfolio backtest from signal and price CSV files."""
+    import pandas as pd
+
+    from .backtest.portfolio import ObservationPortfolioBacktester
+
     signals = pd.read_csv(signals_file)
     prices = pd.read_csv(price_file)
     result = ObservationPortfolioBacktester().run(signals, prices)
@@ -184,6 +190,8 @@ def run_standalone_data_agent(
     fetch_news_full_text: bool = True,
 ) -> str:
     """Run data collection, cleaning, analysis, and layered persistence only."""
+    from .data_agent.data_agent import DataAgent, DataAgentRequest
+
     result = DataAgent(results_dir=output_dir).run(
         DataAgentRequest(
             ticker=ticker,
@@ -260,6 +268,7 @@ def scan_sector_etfs(
     sector: str | None = None,
     top_n: int = 8,
     force: bool = False,
+    refresh_cache: bool = False,
 ) -> str:
     """Scan sectors first and return JSON-first ETF watchlist candidates."""
     from .data_agent.etf_watchlist import build_watchlist_report, render_watchlist_markdown
@@ -275,7 +284,7 @@ def scan_sector_etfs(
     if report_path.exists() and json_path.exists() and not force:
         return report_path.read_text(encoding="utf-8")
 
-    selector = SectorETFSelector(top_sectors=top_n)
+    selector = SectorETFSelector(top_sectors=top_n, auto_refresh_cache=refresh_cache)
     selection = selector.select_with_exclusions(
         trade_date,
         sector_query=sector,
@@ -299,12 +308,13 @@ def analyze_sector_etf(
     question: str | None = None,
     use_autogen: bool = True,
     store_memory: bool = True,
+    refresh_cache: bool = False,
 ) -> str:
     """Run the full LangGraph sector ETF pipeline."""
     from .graph.sector_etf_workflow import SectorETFTradingSystem
 
     trade_date = trade_date or str(date.today())
-    _state, report = SectorETFTradingSystem().analyze(
+    _state, report = SectorETFTradingSystem(refresh_cache=refresh_cache).analyze(
         sector,
         question=question,
         trade_date=trade_date,
@@ -321,9 +331,11 @@ def analyze_sector_etf_watchlist(
     store_memory: bool = True,
     force: bool = False,
     json_output: bool = False,
+    refresh_cache: bool = False,
 ) -> str:
-    """Run the batch sector ETF observation-pool workflow."""
-    from .graph.sector_etf_workflow import SectorETFWatchlistSystem
+    """Run the fast batch sector ETF observation-pool workflow."""
+    from .data_agent.etf_watchlist import build_watchlist_report, render_watchlist_markdown
+    from .data_agent.sector_etf import SectorETFSelector
 
     trade_date = trade_date or str(date.today())
     results_dir = Path(config.get("results_dir"))
@@ -334,12 +346,52 @@ def analyze_sector_etf_watchlist(
     if report_path.exists() and json_path.exists() and not force:
         return json_path.read_text(encoding="utf-8") if json_output else report_path.read_text(encoding="utf-8")
 
-    state, markdown = SectorETFWatchlistSystem().analyze(
-        trade_date=trade_date,
-        max_roundtable_sectors=max_roundtable_sectors,
-        store_memory=store_memory,
+    started = time.perf_counter()
+    selector = SectorETFSelector(
+        top_sectors=max_roundtable_sectors,
+        auto_refresh_cache=refresh_cache,
     )
-    payload = state.get("watchlist_report", {})
+    selection = selector.select_with_exclusions(
+        trade_date,
+        max_roundtable_sectors=max_roundtable_sectors,
+    )
+    select_seconds = time.perf_counter() - started
+
+    roundtable_started = time.perf_counter()
+    report = build_watchlist_report(
+        trade_date=trade_date,
+        candidates=selection.watchlist_payloads(),
+        excluded=selection.excluded,
+    )
+    roundtable_seconds = time.perf_counter() - roundtable_started
+    payload = report.model_dump(mode="json")
+    payload["roundtable_summary"]["timings"] = {
+        "select_and_process_seconds": round(select_seconds, 3),
+        "fast_roundtable_seconds": round(roundtable_seconds, 3),
+        "total_pre_render_seconds": round(time.perf_counter() - started, 3),
+    }
+    markdown = render_watchlist_markdown(report)
+
+    if store_memory:
+        from .agents.conversation_memory import ConversationEntry, ConversationMemoryStore
+
+        summary = ", ".join(
+            f"{d.sector}:{d.status}:{d.primary_etf.code}"
+            for d in report.decisions[:8]
+        )
+        ConversationMemoryStore().append(ConversationEntry(
+            question="每日板块 ETF 观察池",
+            answer=summary,
+            trade_date=report.trade_date,
+            target_type="sector_etf_watchlist",
+            target="batch",
+            evidence={
+                "run_id": report.run_id,
+                "decision_count": len(report.decisions),
+                "excluded_count": len(report.excluded_sector_candidates),
+            },
+        ))
+
     atomic_write_text(report_path, markdown)
     atomic_write_json(json_path, payload)
     return json.dumps(payload, ensure_ascii=False, indent=2) if json_output else markdown
@@ -377,6 +429,8 @@ def scan_and_analyze(top_n: int = 10, trade_date: str | None = None,
 
     Returns a consolidated Markdown report.
     """
+    from .data_agent.scanner import MarketScanner
+
     trade_date = trade_date or str(date.today())
     results_dir = Path(config.get("results_dir"))
     results_dir.mkdir(parents=True, exist_ok=True)
@@ -452,6 +506,7 @@ def _analyze_from_bundle(
     so DataAgent only performs structured processing.
     """
     from .data_agent.data_agent import DataAgent, DataAgentRequest
+    from .graph.workflow import TradingSystem
 
 
     da_result = DataAgent().run(
@@ -502,6 +557,7 @@ def ask_llm(
     """
     trade_date = trade_date or str(date.today())
     from .agents.conversation_memory import ConversationEntry, ConversationMemoryStore
+    from .data_agent.data_agent import DataAgent, DataAgentRequest
     from .data_agent.scanner import MarketScanner
     from .graph.sector_etf_workflow import SectorETFTradingSystem
 
@@ -725,6 +781,8 @@ def main():
         return
 
     if args.daily_review:
+        from .backtest.scheduler import run_daily_review
+
         result = run_daily_review(price_file=args.price_file, as_of=args.date)
         print(result.report)
         return
@@ -739,6 +797,7 @@ def main():
             sector=args.sector,
             top_n=args.scan_top_n,
             force=args.force,
+            refresh_cache=args.refresh_scan_cache,
         ))
         return
 
@@ -750,6 +809,7 @@ def main():
                 question=f"{args.sector}板块是否适合买ETF？",
                 use_autogen=not args.no_autogen,
                 store_memory=not args.no_conversation_memory,
+                refresh_cache=args.refresh_scan_cache,
             ))
         else:
             print(analyze_sector_etf_watchlist(
@@ -758,6 +818,7 @@ def main():
                 store_memory=not args.no_conversation_memory,
                 force=args.force,
                 json_output=args.json,
+                refresh_cache=args.refresh_scan_cache,
             ))
         return
 
@@ -824,6 +885,7 @@ def main():
         store_memory=not args.no_conversation_memory,
         force=args.force,
         json_output=args.json,
+        refresh_cache=args.refresh_scan_cache,
     ))
 
 

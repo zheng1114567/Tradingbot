@@ -63,9 +63,10 @@ def create_sector_etf_workflow(
     selector: SectorETFSelector | None = None,
     roundtable_fn: RoundtableFn | None = None,
     memory_store: ConversationMemoryStore | None = None,
+    refresh_cache: bool = False,
 ) -> Any:
     """Create the compiled LangGraph workflow for sector ETF decisions."""
-    selector = selector or SectorETFSelector()
+    selector = selector or SectorETFSelector(auto_refresh_cache=refresh_cache)
     roundtable_fn = roundtable_fn or answer_sector_question_with_roundtable
     memory_store = memory_store or ConversationMemoryStore()
 
@@ -174,11 +175,13 @@ class SectorETFTradingSystem:
         selector: SectorETFSelector | None = None,
         roundtable_fn: RoundtableFn | None = None,
         memory_store: ConversationMemoryStore | None = None,
+        refresh_cache: bool = False,
     ) -> None:
         self.workflow = create_sector_etf_workflow(
             selector=selector,
             roundtable_fn=roundtable_fn,
             memory_store=memory_store,
+            refresh_cache=refresh_cache,
         )
 
     def analyze(
@@ -209,6 +212,7 @@ def create_sector_etf_watchlist_workflow(
     selector: SectorETFSelector | None = None,
     memory_store: ConversationMemoryStore | None = None,
     limits: ETFWatchlistLimits | None = None,
+    refresh_cache: bool = False,
 ) -> Any:
     """Create the batch sector ETF observation-pool workflow.
 
@@ -216,7 +220,10 @@ def create_sector_etf_watchlist_workflow(
     a primary ETF, support reasons, objections, and approval-gated weight hints.
     """
     limits = limits or ETFWatchlistLimits()
-    selector = selector or SectorETFSelector(top_sectors=limits.max_roundtable_sectors)
+    selector = selector or SectorETFSelector(
+        top_sectors=limits.max_roundtable_sectors,
+        auto_refresh_cache=refresh_cache,
+    )
     memory_store = memory_store or ConversationMemoryStore()
 
     def select_batch_node(state: SectorETFWatchlistState) -> dict[str, Any]:
@@ -309,12 +316,14 @@ class SectorETFWatchlistSystem:
         selector: SectorETFSelector | None = None,
         memory_store: ConversationMemoryStore | None = None,
         limits: ETFWatchlistLimits | None = None,
+        refresh_cache: bool = False,
     ) -> None:
         self.limits = limits or ETFWatchlistLimits()
         self.workflow = create_sector_etf_watchlist_workflow(
             selector=selector,
             memory_store=memory_store,
             limits=self.limits,
+            refresh_cache=refresh_cache,
         )
 
     def analyze(

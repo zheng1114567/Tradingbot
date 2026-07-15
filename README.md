@@ -67,6 +67,12 @@ python -m advanced_trading_agent.main --refresh-etf-cache --date 2026-07-15
 python -m advanced_trading_agent.main --sector-etf-scan --date 2026-07-15 --scan-top-n 8
 ```
 
+默认 ETF 扫描/观察池路径只读取已保存缓存，适合盘后快速圆桌；如果需要先补行情缓存，再显式加 `--refresh-scan-cache`:
+
+```bash
+python -m advanced_trading_agent.main --sector-etf-analyze --date 2026-07-15 --json --refresh-scan-cache
+```
+
 只分析一个指定板块:
 
 ```bash
@@ -201,6 +207,9 @@ python -m advanced_trading_agent.main --date 2026-07-15
 
 # JSON-first 输出
 python -m advanced_trading_agent.main --sector-etf-analyze --date 2026-07-15 --json
+
+# 需要刷新扫描缓存时才打开；默认使用已保存缓存，避免圆桌耗时过长
+python -m advanced_trading_agent.main --sector-etf-analyze --date 2026-07-15 --json --refresh-scan-cache
 
 # 只刷新 ETF 数据缓存
 python -m advanced_trading_agent.main --refresh-etf-cache --date 2026-07-15

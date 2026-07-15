@@ -102,6 +102,39 @@ def test_watchlist_report_keeps_only_top_three_final_decisions():
     assert all("turns" in item for item in report.roundtable_summary["round_history"])
 
 
+def test_watchlist_report_applies_autogen_final_decisions():
+    candidates = [_watchlist_candidate(f"主题{i}", f"51248{i}.SH", 12 - i) for i in range(4)]
+    report = build_watchlist_report(
+        trade_date="2026-07-15",
+        candidates=candidates,
+        excluded=[],
+        roundtable_summary={
+            "provider": "autogen",
+            "mode": "autogen_batch_roundtable",
+            "final_decisions": [
+                {
+                    "sector": "主题2",
+                    "status": "monitor",
+                    "primary_etf_code": "512482.SH",
+                    "support_reasons": ["圆桌认为事件质量最高"],
+                    "objections": ["动量弱于第一名"],
+                    "confidence": "medium",
+                }
+            ],
+            "excluded_by_roundtable": [
+                {"sector": "主题0", "reason": "事件不可验证"},
+            ],
+        },
+    )
+
+    assert [decision.sector for decision in report.decisions] == ["主题2"]
+    assert report.decisions[0].status == "monitor"
+    assert report.decisions[0].support_reasons == ["圆桌认为事件质量最高"]
+    assert report.decisions[0].objections == ["动量弱于第一名"]
+    assert report.roundtable_summary["final_decisions_applied"] is True
+    assert report.roundtable_summary["decision_count"] == 1
+
+
 def test_batch_watchlist_workflow_outputs_json_contract(tmp_path):
     class FakeSelector:
         def select_with_exclusions(self, trade_date, max_roundtable_sectors=8, **kwargs):

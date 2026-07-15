@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -38,6 +39,8 @@ class ETFWatchlistAutoGenResult:
     dialogue_records: list[RoundtableDialogueTurn] = field(default_factory=list)
     round_history: list[dict[str, Any]] = field(default_factory=list)
     raw_messages: list[dict[str, Any]] = field(default_factory=list)
+    final_decisions: list[dict[str, Any]] = field(default_factory=list)
+    excluded_by_roundtable: list[dict[str, Any]] = field(default_factory=list)
 
     def to_summary_dict(self) -> dict[str, Any]:
         return {
@@ -49,6 +52,8 @@ class ETFWatchlistAutoGenResult:
             "round_history": self.round_history,
             "summary": self.summary,
             "raw_messages": self.raw_messages,
+            "final_decisions": self.final_decisions,
+            "excluded_by_roundtable": self.excluded_by_roundtable,
             "note": "AutoGen batch roundtable; no backtest is used for ETF watchlist decisions.",
         }
 
@@ -149,7 +154,9 @@ class ETFWatchlistAutoGenRoundtable:
                     system_message=(
                         "你是 System Moderator。你要综合四个 Agent 的发言，"
                         "给出最终保留的 Top ETF 板块排序、每个板块的首选 ETF、主要理由和反对意见。"
-                        "结尾必须写 TERMINATE。"
+                        "你最后必须输出一个 JSON 对象，字段为 final_decisions 和 excluded_by_roundtable，"
+                        "final_decisions 每项必须包含 sector/status/primary_etf_code/support_reasons/objections/confidence。"
+                        "JSON 之后结尾必须写 TERMINATE。"
                     ),
                 ),
             ]
@@ -239,6 +246,22 @@ class ETFWatchlistAutoGenRoundtable:
             f"请召开 A 股板块 ETF 批量圆桌会议。交易日: {trade_date}\n"
             f"最终最多保留 {max_final_decisions} 个板块，每个板块必须有首选 ETF。\n"
             "不要使用回测，不要允许自动执行交易。请逐个 Agent 发言，最后 Moderator 总结。\n"
+            "Moderator 最后必须输出严格 JSON，格式如下:\n"
+            "{\n"
+            '  "final_decisions": [\n'
+            "    {\n"
+            '      "sector": "板块名",\n'
+            '      "status": "active|monitor",\n'
+            '      "primary_etf_code": "ETF代码",\n'
+            '      "support_reasons": ["理由1", "理由2"],\n'
+            '      "objections": ["反对意见或风险"],\n'
+            '      "confidence": "high|medium|low"\n'
+            "    }\n"
+            "  ],\n"
+            '  "excluded_by_roundtable": [\n'
+            '    {"sector": "板块名", "reason": "圆桌否决理由"}\n'
+            "  ]\n"
+            "}\n"
             "候选 JSON:\n"
             f"{json.dumps(payload, ensure_ascii=False, indent=2)}"
         )
@@ -309,6 +332,7 @@ class ETFWatchlistAutoGenRoundtable:
                 break
         if not summary:
             summary = "\n".join(turn.message for turn in dialogue[-3:])
+        structured = ETFWatchlistAutoGenRoundtable._extract_structured_summary(summary)
         return ETFWatchlistAutoGenResult(
             summary=summary[:3000],
             agent_outputs=agent_outputs,
@@ -320,7 +344,38 @@ class ETFWatchlistAutoGenRoundtable:
                 "turns": [turn.model_dump(mode="json") for turn in dialogue],
             }],
             raw_messages=messages,
+            final_decisions=structured.get("final_decisions", []),
+            excluded_by_roundtable=structured.get("excluded_by_roundtable", []),
         )
+
+    @staticmethod
+    def _extract_structured_summary(content: str) -> dict[str, list[dict[str, Any]]]:
+        """Extract the Moderator's final JSON object from free-form text."""
+        for candidate in ETFWatchlistAutoGenRoundtable._json_object_candidates(content):
+            try:
+                parsed = json.loads(candidate)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(parsed, dict):
+                continue
+            final_decisions = parsed.get("final_decisions")
+            excluded = parsed.get("excluded_by_roundtable")
+            if isinstance(final_decisions, list):
+                return {
+                    "final_decisions": [item for item in final_decisions if isinstance(item, dict)],
+                    "excluded_by_roundtable": [item for item in excluded if isinstance(item, dict)] if isinstance(excluded, list) else [],
+                }
+        return {"final_decisions": [], "excluded_by_roundtable": []}
+
+    @staticmethod
+    def _json_object_candidates(content: str) -> list[str]:
+        fenced = re.findall(r"```(?:json)?\s*(\{.*?\})\s*```", content, flags=re.DOTALL | re.IGNORECASE)
+        candidates = list(fenced)
+        start = content.find("{")
+        end = content.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            candidates.append(content[start : end + 1])
+        return candidates
 
     @staticmethod
     def _infer_stance(content: str) -> str:

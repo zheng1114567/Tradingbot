@@ -175,6 +175,7 @@ def build_watchlist_report(
             **roundtable_summary,
             "backtest_used": False,
         }
+        decisions = _apply_roundtable_final_decisions(decisions, candidates, limits, base_roundtable_summary)
     base_roundtable_summary.update({
         "input_sector_count": len(candidates),
         "roundtable_candidate_count": min(len(candidates), limits.max_roundtable_sectors),
@@ -215,6 +216,25 @@ def render_watchlist_markdown(report: DailyETFWatchlistReport) -> str:
     for idx, decision in enumerate(report.decisions, start=1):
         primary = decision.primary_etf
         backups = "；".join(f"{e.code} {e.name}" for e in decision.backup_etfs) or "无"
+        sector_outputs = [
+            item
+            for item in report.roundtable_summary.get("agent_outputs", [])
+            if item.get("sector") == decision.sector
+            or (item.get("sector") == "batch" and decision.sector in str(item.get("summary", "")))
+        ]
+        sector_dialogue = [
+            turn
+            for turn in report.roundtable_summary.get("dialogue_records", [])
+            if turn.get("sector") == decision.sector
+        ]
+        roundtable_output_lines = [
+            f"- {item.get('agent')}: {item.get('stance')} - {item.get('summary')}"
+            for item in sector_outputs
+        ] or ["- 详见下方“圆桌完整对话记录”；本轮 AutoGen 为 batch 讨论。"]
+        sector_dialogue_lines = [
+            f"- R{turn.get('round')} {turn.get('speaker')}: {turn.get('message')}"
+            for turn in sector_dialogue
+        ] or ["- 详见下方“圆桌完整对话记录”。"]
         lines.extend([
             f"### {idx}. {decision.sector} - {decision.status}",
             "",
@@ -227,18 +247,10 @@ def render_watchlist_markdown(report: DailyETFWatchlistReport) -> str:
             *[f"- {reason}" for reason in decision.support_reasons],
             "",
             "**圆桌输出**:",
-            *[
-                f"- {item.get('agent')}: {item.get('stance')} - {item.get('summary')}"
-                for item in report.roundtable_summary.get("agent_outputs", [])
-                if item.get("sector") == decision.sector
-            ],
+            *roundtable_output_lines,
             "",
             "**圆桌对话记录**:",
-            *[
-                f"- R{turn.get('round')} {turn.get('speaker')}: {turn.get('message')}"
-                for turn in report.roundtable_summary.get("dialogue_records", [])
-                if turn.get("sector") == decision.sector
-            ],
+            *sector_dialogue_lines,
             "",
             "**反对理由**:",
             *[f"- {reason}" for reason in (decision.objections or ["暂无重大反对意见"])],
@@ -325,6 +337,75 @@ def _decision_from_candidate(
         confidence=confidence,
         roundtable_score=round(score, 2),
     )
+
+
+def _apply_roundtable_final_decisions(
+    default_decisions: list[SectorWatchlistDecision],
+    candidates: list[SectorCandidatePayload],
+    limits: ETFWatchlistLimits,
+    roundtable_summary: dict[str, Any],
+) -> list[SectorWatchlistDecision]:
+    """Use AutoGen Moderator JSON as the authoritative final ordering when available."""
+    final_items = roundtable_summary.get("final_decisions")
+    if not isinstance(final_items, list) or not final_items:
+        roundtable_summary["final_decisions_applied"] = False
+        return default_decisions
+
+    by_sector = {decision.sector: decision for decision in default_decisions}
+    all_by_sector = {
+        candidate.sector_name: _decision_from_candidate(candidate, limits)
+        for candidate in candidates[: limits.max_roundtable_sectors]
+        if candidate.raw_etf_candidates
+    }
+    by_sector.update(all_by_sector)
+
+    applied: list[SectorWatchlistDecision] = []
+    for item in final_items[: limits.max_final_decisions]:
+        if not isinstance(item, dict):
+            continue
+        sector = str(item.get("sector") or "").strip()
+        if not sector or sector not in by_sector:
+            continue
+        decision = by_sector[sector].model_copy(deep=True)
+        status = str(item.get("status") or decision.status).strip().lower()
+        if status in ("active", "monitor", "excluded"):
+            decision.status = status  # type: ignore[assignment]
+        confidence = str(item.get("confidence") or decision.confidence).strip().lower()
+        if confidence in ("high", "medium", "low"):
+            decision.confidence = confidence  # type: ignore[assignment]
+        primary_code = str(item.get("primary_etf_code") or "").strip()
+        if primary_code:
+            matched = [decision.primary_etf, *decision.backup_etfs]
+            for etf in matched:
+                if etf.code == primary_code:
+                    decision.primary_etf = etf
+                    decision.backup_etfs = [candidate for candidate in matched if candidate.code != primary_code][:2]
+                    break
+        support_reasons = _coerce_reason_list(item.get("support_reasons"))
+        objections = _coerce_reason_list(item.get("objections"))
+        if support_reasons:
+            decision.support_reasons = support_reasons
+        if objections:
+            decision.objections = objections
+            decision.risk_details = objections
+        decision.watchlist_weight_hint = _weight_for_status(decision.status, decision.confidence, limits)
+        decision.execution_requires_approval = True
+        decision.execution_allowed = False
+        applied.append(decision)
+
+    applied = _enforce_active_limits(applied, limits)
+    roundtable_summary["final_decisions_applied"] = bool(applied)
+    if not applied:
+        return default_decisions
+    return applied
+
+
+def _coerce_reason_list(value: Any) -> list[str]:
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    if isinstance(value, str) and value.strip():
+        return [value.strip()]
+    return []
 
 
 def _rule_roundtable_outputs(candidate: SectorCandidatePayload) -> list[RoundtableAgentOutput]:

@@ -115,7 +115,7 @@ class DailyETFWatchlistReport(BaseModel):
 
 
 class RoundtableAgentOutput(BaseModel):
-    """One fast roundtable participant's structured opinion."""
+    """One roundtable participant's structured opinion."""
 
     agent: Literal["Market", "Event", "Analysis", "Risk"]
     sector: str
@@ -126,7 +126,7 @@ class RoundtableAgentOutput(BaseModel):
 
 
 class RoundtableDialogueTurn(BaseModel):
-    """One auditable dialogue turn in the fast JSON roundtable."""
+    """One auditable dialogue turn in the ETF roundtable."""
 
     round: int
     sector: str
@@ -141,7 +141,8 @@ def build_watchlist_report(
     candidates: list[SectorCandidatePayload],
     excluded: list[ExcludedSectorCandidate],
     limits: ETFWatchlistLimits | None = None,
-    provider: str = "deterministic_batch_roundtable",
+    provider: str = "rules_batch_roundtable",
+    roundtable_summary: dict[str, Any] | None = None,
 ) -> DailyETFWatchlistReport:
     """Build deterministic JSON decisions from sector and ETF candidates.
 
@@ -153,12 +154,34 @@ def build_watchlist_report(
     roundtable_outputs = [
         output
         for candidate in candidates[: limits.max_roundtable_sectors]
-        for output in _fast_roundtable_outputs(candidate)
+        for output in _rule_roundtable_outputs(candidate)
     ]
-    dialogue_records = _fast_roundtable_dialogue(candidates[: limits.max_roundtable_sectors], roundtable_outputs)
+    dialogue_records = _rule_roundtable_dialogue(candidates[: limits.max_roundtable_sectors], roundtable_outputs)
     decisions = [_decision_from_candidate(c, limits) for c in candidates[: limits.max_roundtable_sectors]]
     decisions.sort(key=lambda item: item.roundtable_score, reverse=True)
     decisions = _enforce_active_limits(decisions[: limits.max_final_decisions], limits)
+    base_roundtable_summary = {
+        "provider": provider,
+        "mode": "rules_batch_roundtable",
+        "backtest_used": False,
+        "agent_outputs": [output.model_dump(mode="json") for output in roundtable_outputs],
+        "dialogue_records": [turn.model_dump(mode="json") for turn in dialogue_records],
+        "round_history": _round_history_from_dialogue(dialogue_records),
+        "note": "Rules fallback roundtable; use AutoGen for the default batch ETF workflow.",
+    }
+    if roundtable_summary is not None:
+        base_roundtable_summary = {
+            **base_roundtable_summary,
+            **roundtable_summary,
+            "backtest_used": False,
+        }
+    base_roundtable_summary.update({
+        "input_sector_count": len(candidates),
+        "roundtable_candidate_count": min(len(candidates), limits.max_roundtable_sectors),
+        "decision_count": len(decisions),
+        "max_final_decisions": limits.max_final_decisions,
+        "max_active_sectors": limits.max_active_sectors,
+    })
     return DailyETFWatchlistReport(
         trade_date=trade_date,
         run_id=f"etf_watchlist_{trade_date}_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
@@ -171,20 +194,7 @@ def build_watchlist_report(
             "final_decision_count": len(decisions),
             "all_final_decisions_have_primary_etf": all(bool(d.primary_etf.code) for d in decisions),
         },
-        roundtable_summary={
-            "provider": provider,
-            "mode": "fast_json_roundtable",
-            "backtest_used": False,
-            "agent_outputs": [output.model_dump(mode="json") for output in roundtable_outputs],
-            "dialogue_records": [turn.model_dump(mode="json") for turn in dialogue_records],
-            "round_history": _round_history_from_dialogue(dialogue_records),
-            "input_sector_count": len(candidates),
-            "roundtable_candidate_count": min(len(candidates), limits.max_roundtable_sectors),
-            "decision_count": len(decisions),
-            "max_final_decisions": limits.max_final_decisions,
-            "max_active_sectors": limits.max_active_sectors,
-            "note": "Cache-first fast roundtable; no backtest and no long-running LLM calls on the default path.",
-        },
+        roundtable_summary=base_roundtable_summary,
     )
 
 
@@ -245,6 +255,14 @@ def render_watchlist_markdown(report: DailyETFWatchlistReport) -> str:
         for item in report.excluded_sector_candidates:
             evidence = "；".join(item.brief_evidence[:4])
             lines.append(f"- **{item.sector}**: {item.excluded_reason}。{evidence}")
+    dialogue_records = report.roundtable_summary.get("dialogue_records", [])
+    if dialogue_records:
+        lines.extend(["", "## 圆桌完整对话记录", ""])
+        for turn in dialogue_records:
+            lines.append(
+                f"- R{turn.get('round')} {turn.get('speaker')} "
+                f"[{turn.get('sector', 'batch')}]: {turn.get('message')}"
+            )
     lines.extend([
         "",
         "## 审批",
@@ -309,8 +327,8 @@ def _decision_from_candidate(
     )
 
 
-def _fast_roundtable_outputs(candidate: SectorCandidatePayload) -> list[RoundtableAgentOutput]:
-    """Produce fast deterministic agent opinions from collected/processed data."""
+def _rule_roundtable_outputs(candidate: SectorCandidatePayload) -> list[RoundtableAgentOutput]:
+    """Produce deterministic fallback agent opinions from collected/processed data."""
     best_etf = max(candidate.raw_etf_candidates, key=lambda item: item.total_score)
     market_stance: Literal["support", "caution", "block"] = (
         "support" if candidate.momentum_score >= 5 and candidate.breadth_score >= 1 else "caution"
@@ -361,11 +379,11 @@ def _fast_roundtable_outputs(candidate: SectorCandidatePayload) -> list[Roundtab
     ]
 
 
-def _fast_roundtable_dialogue(
+def _rule_roundtable_dialogue(
     candidates: list[SectorCandidatePayload],
     outputs: list[RoundtableAgentOutput],
 ) -> list[RoundtableDialogueTurn]:
-    """Build deterministic dialogue records without slow LLM calls."""
+    """Build deterministic fallback dialogue records without LLM calls."""
     outputs_by_sector: dict[str, list[RoundtableAgentOutput]] = {}
     for output in outputs:
         outputs_by_sector.setdefault(output.sector, []).append(output)

@@ -332,8 +332,9 @@ def analyze_sector_etf_watchlist(
     force: bool = False,
     json_output: bool = False,
     refresh_cache: bool = False,
+    use_autogen: bool = True,
 ) -> str:
-    """Run the fast batch sector ETF observation-pool workflow."""
+    """Run the batch sector ETF observation-pool workflow."""
     from .data_agent.etf_watchlist import build_watchlist_report, render_watchlist_markdown
     from .data_agent.sector_etf import SectorETFSelector
 
@@ -344,7 +345,11 @@ def analyze_sector_etf_watchlist(
     json_path = results_dir / f"sector_etf_watchlist_{trade_date}.json"
 
     if report_path.exists() and json_path.exists() and not force:
-        return json_path.read_text(encoding="utf-8") if json_output else report_path.read_text(encoding="utf-8")
+        cached_payload = json.loads(json_path.read_text(encoding="utf-8"))
+        cached_provider = (cached_payload.get("roundtable_summary") or {}).get("provider")
+        expected_provider = "autogen" if use_autogen else "rules_batch_roundtable"
+        if cached_provider == expected_provider:
+            return json.dumps(cached_payload, ensure_ascii=False, indent=2) if json_output else report_path.read_text(encoding="utf-8")
 
     started = time.perf_counter()
     selector = SectorETFSelector(
@@ -358,16 +363,31 @@ def analyze_sector_etf_watchlist(
     select_seconds = time.perf_counter() - started
 
     roundtable_started = time.perf_counter()
+    roundtable_summary = None
+    if use_autogen:
+        from .roundtable.etf_watchlist_autogen import ETFWatchlistAutoGenRoundtable
+
+        limits = None
+        autogen_result = ETFWatchlistAutoGenRoundtable().run(
+            trade_date=trade_date,
+            candidates=selection.watchlist_payloads(),
+            max_final_decisions=3,
+        )
+        roundtable_summary = autogen_result.to_summary_dict()
+    else:
+        limits = None
     report = build_watchlist_report(
         trade_date=trade_date,
         candidates=selection.watchlist_payloads(),
         excluded=selection.excluded,
+        limits=limits,
+        roundtable_summary=roundtable_summary,
     )
     roundtable_seconds = time.perf_counter() - roundtable_started
     payload = report.model_dump(mode="json")
     payload["roundtable_summary"]["timings"] = {
         "select_and_process_seconds": round(select_seconds, 3),
-        "fast_roundtable_seconds": round(roundtable_seconds, 3),
+        "autogen_roundtable_seconds" if use_autogen else "rules_roundtable_seconds": round(roundtable_seconds, 3),
         "total_pre_render_seconds": round(time.perf_counter() - started, 3),
     }
     markdown = render_watchlist_markdown(report)
@@ -819,6 +839,7 @@ def main():
                 force=args.force,
                 json_output=args.json,
                 refresh_cache=args.refresh_scan_cache,
+                use_autogen=not args.no_autogen,
             ))
         return
 
@@ -886,6 +907,7 @@ def main():
         force=args.force,
         json_output=args.json,
         refresh_cache=args.refresh_scan_cache,
+        use_autogen=not args.no_autogen,
     ))
 
 

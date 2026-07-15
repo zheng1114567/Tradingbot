@@ -261,7 +261,7 @@ def create_sector_etf_watchlist_workflow(
             limits=limits,
         )
         timings = dict(selection_raw.get("timings", {}) or state.get("timings", {}) or {})
-        timings["fast_roundtable_seconds"] = round(time.perf_counter() - started, 3)
+        timings["rules_roundtable_seconds"] = round(time.perf_counter() - started, 3)
         timings["total_pre_render_seconds"] = round(sum(timings.values()), 3)
         payload = report.model_dump(mode="json")
         payload["roundtable_summary"]["timings"] = timings

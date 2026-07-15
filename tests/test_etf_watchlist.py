@@ -143,7 +143,7 @@ def test_batch_watchlist_workflow_outputs_json_contract(tmp_path):
     assert len(report["roundtable_summary"]["agent_outputs"]) == 4
     assert len(report["roundtable_summary"]["dialogue_records"]) >= 6
     assert report["roundtable_summary"]["round_history"][0]["sector"] == "半导体"
-    assert report["roundtable_summary"]["timings"]["fast_roundtable_seconds"] >= 0
+    assert report["roundtable_summary"]["timings"]["rules_roundtable_seconds"] >= 0
 
 
 def _watchlist_candidate(sector: str, code: str, score: float) -> SectorCandidatePayload:

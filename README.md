@@ -93,7 +93,7 @@ START
     → 冰点 → 跳过深度分析
     → 正常 → Event[LLM] → Analysis[LLM] → Backtest[LLM]
   → Risk Check 2       [代码]  流动性/涨跌停检查
-  → 矛盾检测           [模式8+LLM]  检测 Agent 间矛盾
+  → 矛盾检测           [模式+LLM]  检测 Agent 间分歧，结果供 System Agent 参考
   → Risk Check 3       [代码]  冲击成本/仓位 → HARD_VETO → END
   → System Agent       [LLM]  综合裁定 (硬风控不可覆盖)
   → Approval → Report → END

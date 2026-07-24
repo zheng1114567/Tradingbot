@@ -17,13 +17,14 @@ from __future__ import annotations
 import logging
 import math
 from dataclasses import dataclass, field
-from datetime import date, datetime, timezone
+from datetime import datetime, timezone
 from typing import Any, Callable, TypedDict
 
 from ..core.vendor import timed_vendor_call
 from .build_cache import ensure_scan_cache
 from .scan_cleaning import clean_data_agent_raw as clean_raw_payload
 from .news_text import enrich_news_full_text
+from .trading_calendar import resolve_market_trade_date
 from .vendor_router import ensure_default_vendor_registration, get_vendor_impl, route_to_vendor
 
 logger = logging.getLogger(__name__)
@@ -170,7 +171,7 @@ class MarketScanner:
 
     def scan(self, trade_date: str | None = None) -> list[ScanResult]:
         """Run full market scan and return ranked results."""
-        td = trade_date or date.today().isoformat()
+        td = resolve_market_trade_date(trade_date)
         self._ensure_cache_ready(td)
         scorer: dict[str, _ScorerEntry] = {}  # ticker -> accumulated evidence
         ctx: dict[str, Any] = {"trade_date": td}
@@ -1058,7 +1059,7 @@ class MarketScanner:
 
         Returns a ScanBundle ready to feed into DataAgent.run_with_raw().
         """
-        td = trade_date or date.today().isoformat()
+        td = resolve_market_trade_date(trade_date)
         self._ensure_cache_ready(td)
         limit = top_n or self.top_n
         route_trace: list[dict[str, Any]] = []

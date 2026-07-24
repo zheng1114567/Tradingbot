@@ -2,8 +2,9 @@
 条件路由逻辑 — 控制 LangGraph 流程
 
 1. after_risk_check_1: 硬风控1通过 → Round 1, 否决 → END
-2. after_round2_judge: 需要 Round 2 → 辩论, 不需要 → 裁定
-3. after_risk_check_3: 硬风控3通过 → 裁定, 否决 → END
+2. after_market: 冰点模式跳过深度分析
+3. after_round1: 判断矛盾检测后是否需要进入风控3
+4. after_risk_check_3: 硬风控3通过 → 裁定, 否决 → END
 """
 from __future__ import annotations
 
@@ -34,14 +35,6 @@ def after_round1(state: AgentState) -> Literal["round2", "finalize"]:
     if round2.get("active") and not round2.get("completed"):
         return "round2"
     return "finalize"
-
-
-def after_round2_turn(state: AgentState) -> Literal["continue_round2", "finalize"]:
-    """Round 2 每轮后: 继续辩论或结束"""
-    round2 = state.get("round2_state", {})
-    if round2.get("completed") or round2.get("round_count", 0) >= round2.get("max_rounds", 8):
-        return "finalize"
-    return "continue_round2"
 
 
 def after_risk_check_3(state: AgentState) -> Literal["finalize", "end"]:

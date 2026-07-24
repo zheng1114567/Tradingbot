@@ -158,6 +158,60 @@ class HardRiskController:
             )
         return RiskVerdict()
 
+    def check_etf_execution(
+        self,
+        *,
+        code: str,
+        daily_amount_cny: float | None = None,
+        premium_discount_pct: float | None = None,
+        is_suspended: bool = False,
+        is_limit_up: bool = False,
+        is_limit_down: bool = False,
+        current_sector_pct: float = 0,
+        proposed_pct: float = 0.10,
+        max_abs_premium_discount_pct: float = 2.0,
+    ) -> RiskVerdict:
+        """ETF-specific hard-risk wrapper for the sector ETF strategy."""
+        if is_suspended:
+            return RiskVerdict(
+                verdict=RiskVerdictType.HARD_VETO,
+                reasons=[f"{code} ETF 停牌中"],
+            )
+        tradability = self.check_limit_up_down(is_limit_up, is_limit_down, direction="buy")
+        if tradability.verdict == RiskVerdictType.HARD_VETO:
+            return tradability
+
+        all_reasons: list[str] = []
+        all_actions: list[str] = []
+        worst_verdict = RiskVerdictType.PASS
+        if daily_amount_cny is not None:
+            liquidity = self.check_liquidity(daily_amount_cny)
+            if liquidity.verdict == RiskVerdictType.SOFT_VETO:
+                worst_verdict = RiskVerdictType.SOFT_VETO
+                all_reasons.extend(liquidity.reasons)
+
+        if premium_discount_pct is not None and abs(premium_discount_pct) > max_abs_premium_discount_pct:
+            worst_verdict = RiskVerdictType.SOFT_VETO
+            all_reasons.append(
+                f"ETF 溢折价 {premium_discount_pct:+.2f}% 超过阈值 {max_abs_premium_discount_pct:.2f}%"
+            )
+            all_actions.append("建议等待溢折价收敛或改用备选 ETF")
+
+        sector = self.check_sector_limit(current_sector_pct, proposed_pct)
+        if sector.verdict == RiskVerdictType.SOFT_VETO:
+            worst_verdict = RiskVerdictType.SOFT_VETO
+            all_reasons.extend(sector.reasons)
+            all_actions.extend(sector.suggested_actions)
+
+        if worst_verdict != RiskVerdictType.PASS:
+            return RiskVerdict(
+                verdict=worst_verdict,
+                reasons=all_reasons,
+                suggested_actions=all_actions,
+                position_limit=proposed_pct,
+            )
+        return RiskVerdict(verdict=RiskVerdictType.PASS, position_limit=proposed_pct)
+
     # ============================================================
     # 综合检查
     # ============================================================

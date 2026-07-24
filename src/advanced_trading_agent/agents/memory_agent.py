@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import threading
 from datetime import datetime
 from pathlib import Path
@@ -42,7 +43,7 @@ class MemoryStore:
 
         if index_path:
             index = index_path
-        elif log_path and self._log_path:
+        elif self._log_path and not os.getenv("ATA_MEMORY_INDEX_PATH"):
             index = str(self._log_path.with_suffix(".jsonl"))
         else:
             index = config.get("memory_index_path", "")
@@ -329,9 +330,37 @@ class MemoryStore:
     def _format_resolved_entry(entry: dict[str, Any]) -> str:
         return MemoryStore._format_markdown_entry({**entry, "pending": False, "status": "resolved"})
 
-    def get_context(self, ticker: str, n_same: int = 5) -> str:
-        """Return resolved historical context for System Agent."""
-        entries = [e for e in self.load_entries() if not e.get("pending")]
+    @staticmethod
+    def _visible_as_of(entry: dict[str, Any], as_of: str | None) -> bool:
+        if not as_of:
+            return True
+        reflection_as_of = (entry.get("reflection") or {}).get("as_of")
+        if not reflection_as_of:
+            return False
+        reflection_date = MemoryStore._parse_memory_date(reflection_as_of)
+        analysis_date = MemoryStore._parse_memory_date(as_of)
+        if reflection_date is None or analysis_date is None:
+            return False
+        return reflection_date <= analysis_date
+
+    @staticmethod
+    def _parse_memory_date(value: Any):
+        raw = str(value or "").strip()
+        if not raw:
+            return None
+        try:
+            if len(raw) == 8 and raw.isdigit():
+                return datetime.strptime(raw, "%Y%m%d").date()
+            return datetime.fromisoformat(raw).date()
+        except ValueError:
+            return None
+
+    def get_context(self, ticker: str, n_same: int = 5, as_of: str | None = None) -> str:
+        """Return point-in-time resolved historical context for System Agent."""
+        entries = [
+            e for e in self.load_entries()
+            if not e.get("pending") and self._visible_as_of(e, as_of)
+        ]
         same = [e for e in reversed(entries) if e["ticker"] == ticker][:n_same]
         if not same:
             return ""
@@ -353,10 +382,11 @@ def create_memory_agent(llm: LLMClient):
 
     def memory_node(state: dict[str, Any]) -> dict[str, Any]:
         ticker = state.get("company_of_interest", "")
+        trade_date = state.get("trade_date")
 
         store = MemoryStore()
-        context = store.get_context(ticker)
-        entries = store.load_entries()
+        context = store.get_context(ticker, as_of=trade_date)
+        entries = [e for e in store.load_entries() if store._visible_as_of(e, trade_date)]
 
         same_ticker = [e for e in entries if e["ticker"] == ticker and not e.get("pending")]
         success_cases = [e for e in same_ticker if e["decision"] == "推荐"]

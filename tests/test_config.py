@@ -1,5 +1,4 @@
 """配置测试"""
-import pytest
 from advanced_trading_agent.config import Config, config
 
 
@@ -11,16 +10,17 @@ def test_config_singleton():
 
 def test_config_defaults():
     assert config.get("llm_provider") is not None
+    assert config.get("llm_model") == "qwen3.6-flash"
     assert config.get("deep_think_llm") is not None
     assert config.get("risk_config") is not None
     assert config.get("backtest_config") is not None
 
 
 def test_config_update():
+    previous_provider = config.get("llm_provider")
     config.update({"llm_provider": "test"})
     assert config.get("llm_provider") == "test"
-    # 恢复
-    config.update({"llm_provider": "deepseek"})
+    config.update({"llm_provider": previous_provider})
 
 
 def test_risk_config_values():

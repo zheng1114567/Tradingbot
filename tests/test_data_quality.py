@@ -76,6 +76,39 @@ class TestDataQualityChecker:
         assert result.passed is False
         assert len(result.critical_missing) >= 1
 
+    def test_check_tier1_zero_index_close_is_critical(self):
+        tier1 = {
+            "market": {
+                "index_close": 0,
+                "index_change_pct": 0,
+                "advance_count": 0,
+                "decline_count": 0,
+                "limit_up_count": 0,
+                "limit_down_count": 0,
+            },
+            "sentiment": {"sentiment": "未知"},
+        }
+        result = DataQualityChecker.check_tier1(tier1)
+        assert result.grade == "F"
+        assert result.passed is False
+        assert "market.index_close" in result.critical_missing
+
+    def test_check_tier1_zero_breadth_warns(self):
+        tier1 = {
+            "market": {
+                "index_close": 3500.0,
+                "index_change_pct": 0,
+                "advance_count": 0,
+                "decline_count": 0,
+                "limit_up_count": 0,
+                "limit_down_count": 0,
+            },
+            "sentiment": {"sentiment": "正常"},
+        }
+        result = DataQualityChecker.check_tier1(tier1)
+        assert result.passed is True
+        assert any("涨跌家数" in warning for warning in result.warnings)
+
     def test_check_tier1_with_trade_date_stale(self):
         tier1 = {
             "market": {

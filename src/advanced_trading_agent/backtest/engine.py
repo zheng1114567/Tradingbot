@@ -46,6 +46,7 @@ class BacktestResult:
     max_drawdown: float | None = None
     tradable: bool = True
     invalid_triggered: bool = False
+    invalid_reason: str = ""
     cost_bps: float = 0
     benchmark: str = "000300.SH"  # 沪深300
 
@@ -64,6 +65,7 @@ class BacktestResult:
             "max_drawdown": self.max_drawdown,
             "tradable": self.tradable,
             "invalid_triggered": self.invalid_triggered,
+            "invalid_reason": self.invalid_reason,
             "cost_bps": self.cost_bps,
             "benchmark": self.benchmark,
         }
@@ -146,12 +148,21 @@ class BacktestEngine:
             return BacktestResult(
                 run_date=date.today(), target_date=entry_date,
                 code=code, decision=decision, tradable=False,
-                benchmark=self.benchmark,
+                invalid_reason="empty_price_data", benchmark=self.benchmark,
             )
 
-        # Point-in-time: 找到 entry_date 在数据中的位置。
-        # 盘后观察池的 trade_date 是信号生成日，实际买入只能发生在下一交易日。
-        price_df = price_df.sort_values("trade_date").reset_index(drop=True)
+        if "trade_date" not in price_df.columns:
+            return BacktestResult(
+                run_date=date.today(), target_date=entry_date,
+                code=code, decision=decision, alpha_source=alpha_source,
+                tradable=False, invalid_reason="missing_trade_date", benchmark=self.benchmark,
+            )
+
+        # Point-in-time: locate the signal date before entering on the next trading day.
+        # The trade_date is the after-close signal date; execution starts at T+1.
+        price_df = price_df.copy()
+        price_df["trade_date"] = pd.to_datetime(price_df["trade_date"], errors="coerce")
+        price_df = price_df.dropna(subset=["trade_date"]).sort_values("trade_date").reset_index(drop=True)
         try:
             signal_idx = price_df[
                 price_df["trade_date"] == pd.Timestamp(entry_date)
@@ -160,7 +171,7 @@ class BacktestEngine:
             return BacktestResult(
                 run_date=date.today(), target_date=entry_date,
                 code=code, decision=decision, tradable=False,
-                benchmark=self.benchmark,
+                invalid_reason="entry_date_not_found", benchmark=self.benchmark,
             )
 
         entry_idx = signal_idx + 1
@@ -170,7 +181,7 @@ class BacktestEngine:
                 run_date=date.today(), target_date=entry_date,
                 code=code, decision=decision, alpha_source=alpha_source,
                 returns=returns, excess_returns=excess_returns,
-                tradable=False, benchmark=self.benchmark,
+                tradable=False, invalid_reason="no_next_trading_day", benchmark=self.benchmark,
             )
 
         # 检查可成交性
@@ -183,7 +194,7 @@ class BacktestEngine:
                 code=code, decision=decision, alpha_source=alpha_source,
                 entry_price=entry_row.get("open", entry_row.get("close")),
                 returns=returns, excess_returns=excess_returns,
-                tradable=False, benchmark=self.benchmark,
+                tradable=False, invalid_reason=reason, benchmark=self.benchmark,
             )
 
         # T+1: 最早次日卖出

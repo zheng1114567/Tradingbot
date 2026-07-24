@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import re
-from datetime import date
 
 from pydantic import BaseModel, Field, field_validator
+
+from .trading_calendar import compact_market_trade_date, resolve_market_trade_date
 
 
 class DataAgentRequest(BaseModel):
@@ -24,6 +25,7 @@ class DataAgentRequest(BaseModel):
     news_keyword: str | None = None
     sector_keyword: str | None = None
     use_llm_news_filter: bool = True
+    use_llm_data_review: bool = False
     fetch_news_full_text: bool = True
     news_relevance_threshold: float = Field(default=0.5, ge=0.0, le=1.0)
     use_react_planner: bool = False
@@ -52,11 +54,11 @@ class DataAgentRequest(BaseModel):
         return v
 
     def normalized_trade_date(self) -> str:
-        return self.trade_date or date.today().isoformat()
+        return resolve_market_trade_date(self.trade_date)
 
     def normalized_end_date(self) -> str | None:
         if self.end_date:
-            return self.end_date
+            return compact_market_trade_date(self.end_date)
         if self.trade_date:
-            return self.trade_date.replace("-", "")
+            return compact_market_trade_date(self.trade_date)
         return None

@@ -307,6 +307,13 @@ class DataAgent:
             agent_payload,
         )
 
+        if errors:
+            audit_trail.append(audit_event("data", f"数据流水线完成，{len(errors)} 个阶段出错", level="warning" if len(errors) < 3 else "error"))
+        else:
+            audit_trail.append(audit_event("data", "数据流水线全部完成", level="info"))
+
+        manifest_path = manifest.save(results_dir=str(run_dir / "06_final"))
+
         final_payload = {
             "stage": "final",
             "created_at": _utc_now(),
@@ -323,13 +330,6 @@ class DataAgent:
             "errors": errors,
         }
         artifacts["final"] = self._write_json(run_dir / "06_final" / "response.json", final_payload)
-
-        manifest_path = manifest.save(results_dir=str(run_dir / "06_final"))
-
-        if errors:
-            audit_trail.append(audit_event("data", f"数据流水线完成，{len(errors)} 个阶段出错", level="warning" if len(errors) < 3 else "error"))
-        else:
-            audit_trail.append(audit_event("data", "数据流水线全部完成", level="info"))
 
         return DataAgentRun(
             run_id=run_dir.name,
@@ -456,18 +456,53 @@ class DataAgent:
         route_trace: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         daily_records = cleaned_payload.get("daily", {}).get("records", [])
+        if not isinstance(daily_records, list):
+            daily_records = []
         market_records = cleaned_payload.get("market", {}).get("records", [])
+        if not isinstance(market_records, list):
+            market_records = []
         sector_records = cleaned_payload.get("sector_context", {}).get("records", [])
+        if not isinstance(sector_records, list):
+            sector_records = []
         limit_up_summary = cleaned_payload.get("limit_up_summary", {})
         dragon_tiger_records = cleaned_payload.get("dragon_tiger", {}).get("records", [])
+        if not isinstance(dragon_tiger_records, list):
+            dragon_tiger_records = []
         market_breadth = cleaned_payload.get("market_breadth", {})
         news_records = cleaned_payload.get("news", {}).get("records", [])
+        if not isinstance(news_records, list):
+            news_records = []
         daily_df = pd.DataFrame(daily_records)
         market_df = pd.DataFrame(market_records)
         factor_records: list[dict[str, Any]] = []
-        news_filter = self._filter_news_with_llm(news_records, request)
-        event_records = self._build_event_records(news_filter["records"], request)
-        capital_summary = self._summarize_capital(cleaned_payload.get("capital_flow", {}).get("records", []))
+        processing_errors: list[dict[str, str]] = []
+        try:
+            news_filter = self._filter_news_with_llm(news_records, request)
+        except Exception as exc:
+            logger.warning("News filtering failed; using deterministic fallback: %s", exc)
+            processing_errors.append({"stage": "news_filter", "error": str(exc)})
+            fallback_records = self._filter_news_deterministically(news_records, request)
+            news_filter = {
+                "records": fallback_records,
+                "trace": {
+                    "mode": "deterministic_fallback",
+                    "error": str(exc),
+                    "input_count": len(news_records),
+                    "output_count": len(fallback_records),
+                },
+            }
+        try:
+            event_records = self._build_event_records(news_filter.get("records", []), request)
+        except Exception as exc:
+            logger.warning("Event record building failed: %s", exc)
+            processing_errors.append({"stage": "event_records", "error": str(exc)})
+            event_records = []
+        try:
+            capital_summary = self._summarize_capital(cleaned_payload.get("capital_flow", {}).get("records", []))
+        except Exception as exc:
+            logger.warning("Capital summary failed: %s", exc)
+            processing_errors.append({"stage": "capital_summary", "error": str(exc)})
+            capital_summary = self._summarize_capital([])
         summary: dict[str, Any] = {
             "ticker": request.ticker,
             "record_count": int(len(daily_df)),
@@ -479,7 +514,7 @@ class DataAgent:
 
         if not daily_df.empty:
             if "trade_date" in daily_df.columns:
-                daily_df["trade_date"] = pd.to_datetime(daily_df["trade_date"])
+                daily_df["trade_date"] = pd.to_datetime(daily_df["trade_date"], errors="coerce")
                 daily_df = daily_df.sort_values("trade_date")
             latest = daily_df.iloc[-1].to_dict()
             summary.update(
@@ -492,16 +527,38 @@ class DataAgent:
             )
 
         if request.include_factors and not daily_df.empty:
-            factor_df = FactorCalculator.run_all(self._enrich_daily_with_financials(daily_df.copy(), request.ticker))
-            factor_records = _records_from_frame(factor_df, limit=request.max_return_records)
+            try:
+                factor_df = FactorCalculator.run_all(
+                    self._enrich_daily_with_financials(
+                        daily_df.copy(),
+                        request.ticker,
+                        as_of_date=request.normalized_trade_date(),
+                    )
+                )
+                factor_df = factor_df.replace([np.inf, -np.inf], np.nan)
+                factor_records = _records_from_frame(factor_df, limit=request.max_return_records)
+            except Exception as exc:
+                logger.warning("Factor calculation failed: %s", exc)
+                processing_errors.append({"stage": "factor_calculation", "error": str(exc)})
+                factor_records = []
 
-        market_summary = self._summarize_market(
-            market_df,
-            limit_up_summary=limit_up_summary if isinstance(limit_up_summary, dict) else {},
-            dragon_tiger_records=dragon_tiger_records if isinstance(dragon_tiger_records, list) else [],
-            market_breadth=market_breadth if isinstance(market_breadth, dict) else {},
-        )
-        sector_summary = self._summarize_sector_context(sector_records, request)
+        try:
+            market_summary = self._summarize_market(
+                market_df,
+                limit_up_summary=limit_up_summary if isinstance(limit_up_summary, dict) else {},
+                dragon_tiger_records=dragon_tiger_records if isinstance(dragon_tiger_records, list) else [],
+                market_breadth=market_breadth if isinstance(market_breadth, dict) else {},
+            )
+        except Exception as exc:
+            logger.warning("Market summary failed: %s", exc)
+            processing_errors.append({"stage": "market_summary", "error": str(exc)})
+            market_summary = self._summarize_market(pd.DataFrame())
+        try:
+            sector_summary = self._summarize_sector_context(sector_records, request)
+        except Exception as exc:
+            logger.warning("Sector summary failed: %s", exc)
+            processing_errors.append({"stage": "sector_summary", "error": str(exc)})
+            sector_summary = {"status": "error", "error": str(exc), "top_sectors": []}
         data_quality = {
             "daily_consistency": self._build_daily_consistency_report(
                 daily_records,
@@ -513,6 +570,11 @@ class DataAgent:
                 end_date=request.normalized_end_date(),
                 cache_entry=self._daily_cache_manifest_entry(request.ticker),
             ),
+            "request_window": self._build_request_window_report(
+                daily_records,
+                request,
+            ),
+            "processing_errors": processing_errors,
         }
         risk_summary = self._summarize_risk(
             cleaned_payload.get("risk", {}),
@@ -528,15 +590,26 @@ class DataAgent:
             daily_records=daily_records,
             factor_records=factor_records,
             event_records=event_records,
-            dragon_tiger_records=dragon_tiger_records if isinstance(dragon_tiger_records, list) else [],
+            dragon_tiger_records=self._select_agent_dragon_tiger_records(
+                dragon_tiger_records,
+                ticker=request.ticker,
+                limit=50,
+            ),
             data_quality=data_quality,
         )
         # Phase 0.5: inject A-share specialist signals into tier2
         a_share_signals = AShareSignalBuilder.build(tier2)
         tier2["a_share_signals"] = a_share_signals
 
-        # LLM data quality review
-        review = self._llm_review_data(tier1, tier2, request)
+        # Optional LLM data quality review. API/CLI rules mode must remain
+        # deterministic unless callers explicitly opt into model calls.
+        review = self._llm_review_data(tier1, tier2, request) if request.use_llm_data_review else {
+            "ok": True,
+            "issues": [],
+            "confidence": 0.5,
+            "mode": "skipped",
+            "reason": "LLM data review disabled",
+        }
 
         return {
             "stage": "analysis",
@@ -554,7 +627,7 @@ class DataAgent:
             "events": {
                 "record_count": len(event_records),
                 "records": event_records,
-                "filter": news_filter["trace"],
+                "filter": news_filter.get("trace", {}),
             },
             "factors": {
                 "record_count": len(factor_records),
@@ -575,8 +648,6 @@ class DataAgent:
     ) -> dict[str, Any]:
         """LLM sanity check on collected data quality."""
         try:
-            from ..llm.client import create_llm
-
             # Build a compact summary for the LLM
             factors = tier2.get("factors", [])
             latest_factor = factors[-1] if factors else {}
@@ -605,7 +676,11 @@ class DataAgent:
                 },
             }
 
-            llm = create_llm()
+            llm = self._llm_client
+            if llm is None:
+                from ..llm.client import create_llm
+
+                llm = create_llm()
             prompt = json.dumps(summary, ensure_ascii=False, indent=2)
             response = llm.chat(
                 [
@@ -750,6 +825,37 @@ class DataAgent:
             "risk_data_errors": errors,
         }
 
+
+    @staticmethod
+    def _select_agent_dragon_tiger_records(
+        records: list[dict[str, Any]],
+        *,
+        ticker: str,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        """Keep agent payload bounded while preserving target-relevant records."""
+        if not isinstance(records, list) or not records:
+            return []
+        ticker_digits = str(ticker).split(".")[0]
+        target_records = [
+            record for record in records
+            if isinstance(record, dict) and str(record.get("code", "")).split(".")[0] == ticker_digits
+        ]
+        remaining_slots = max(limit - len(target_records), 0)
+        tail_records = [
+            record for record in records[-remaining_slots:]
+            if isinstance(record, dict)
+        ] if remaining_slots else []
+        selected: list[dict[str, Any]] = []
+        seen: set[tuple[Any, Any, Any]] = set()
+        for record in [*target_records, *tail_records]:
+            key = (record.get("code"), record.get("date"), record.get("reason"))
+            if key in seen:
+                continue
+            seen.add(key)
+            selected.append(record)
+        return selected[:limit]
+
     @staticmethod
     def _build_agent_payload(
         *,
@@ -783,7 +889,12 @@ class DataAgent:
         return clean_sector_context(records)
 
     @staticmethod
-    def _enrich_daily_with_financials(daily_df: pd.DataFrame, ticker: str) -> pd.DataFrame:
+    def _enrich_daily_with_financials(
+        daily_df: pd.DataFrame,
+        ticker: str,
+        *,
+        as_of_date: str | None = None,
+    ) -> pd.DataFrame:
         """Merge latest quarterly financial data into OHLCV for FactorCalculator."""
         try:
             import baostock as bs
@@ -791,8 +902,9 @@ class DataAgent:
 
             parts = ticker.split(".")
             code = f"{parts[1].lower()}.{parts[0]}" if len(parts) == 2 else ticker
-            today = dt_date.today()
-            y, q = today.year, (today.month - 1) // 3 + 1
+            raw_as_of = (as_of_date or dt_date.today().isoformat()).replace("-", "")
+            as_of = dt_date(int(raw_as_of[:4]), int(raw_as_of[4:6]), int(raw_as_of[6:8]))
+            y, q = as_of.year, (as_of.month - 1) // 3 + 1
 
             bs.login()
             try:
@@ -858,8 +970,8 @@ class DataAgent:
                 daily_df["profit_growth"] = yoy_ni
                 daily_df["revenue_growth"] = yoy_ni  # proxy: no direct revenue growth in growth_data
 
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("financial enrichment skipped for %s as_of=%s: %s", ticker, as_of_date, exc)
         return daily_df
 
     @classmethod
@@ -919,6 +1031,82 @@ class DataAgent:
             "attempt_count": len(route_trace),
             "vendors": vendors,
             "attempts": route_trace,
+        }
+
+    @classmethod
+    def _build_request_window_report(
+        cls,
+        daily_records: list[dict[str, Any]],
+        request: DataAgentRequest,
+    ) -> dict[str, Any]:
+        """Audit whether daily records satisfy the requested date window."""
+        target = pd.to_datetime(request.normalized_trade_date(), errors="coerce")
+        start_raw = request.start_date or request.normalized_end_date() or request.normalized_trade_date()
+        end_raw = request.normalized_end_date() or request.normalized_trade_date()
+        start = pd.to_datetime(start_raw, errors="coerce")
+        end = pd.to_datetime(end_raw, errors="coerce")
+        if start is not pd.NaT and end is not pd.NaT and start > end:
+            start, end = end, start
+
+        if not daily_records:
+            return {
+                "status": "empty",
+                "requested_trade_date": cls._json_safe_value(target),
+                "requested_start_date": cls._json_safe_value(start),
+                "requested_end_date": cls._json_safe_value(end),
+                "record_count": 0,
+                "target_date_present": False,
+                "out_of_window_count": 0,
+                "min_record_date": None,
+                "max_record_date": None,
+            }
+
+        frame = pd.DataFrame(daily_records)
+        if "trade_date" not in frame.columns:
+            return {
+                "status": "missing_trade_date_column",
+                "requested_trade_date": cls._json_safe_value(target),
+                "requested_start_date": cls._json_safe_value(start),
+                "requested_end_date": cls._json_safe_value(end),
+                "record_count": len(daily_records),
+                "target_date_present": False,
+                "out_of_window_count": 0,
+                "min_record_date": None,
+                "max_record_date": None,
+            }
+
+        dates = pd.to_datetime(frame["trade_date"], errors="coerce").dropna()
+        if dates.empty:
+            return {
+                "status": "invalid_trade_dates",
+                "requested_trade_date": cls._json_safe_value(target),
+                "requested_start_date": cls._json_safe_value(start),
+                "requested_end_date": cls._json_safe_value(end),
+                "record_count": len(daily_records),
+                "target_date_present": False,
+                "out_of_window_count": 0,
+                "min_record_date": None,
+                "max_record_date": None,
+            }
+
+        target_date_present = bool((dates.dt.normalize() == target.normalize()).any()) if not pd.isna(target) else False
+        out_of_window = pd.Series([False] * len(dates), index=dates.index)
+        if not pd.isna(start):
+            out_of_window = out_of_window | (dates.dt.normalize() < start.normalize())
+        if not pd.isna(end):
+            out_of_window = out_of_window | (dates.dt.normalize() > end.normalize())
+        out_count = int(out_of_window.sum())
+        status = "ok" if target_date_present and out_count == 0 else "warning"
+        return {
+            "status": status,
+            "requested_trade_date": cls._json_safe_value(target),
+            "requested_start_date": cls._json_safe_value(start),
+            "requested_end_date": cls._json_safe_value(end),
+            "record_count": len(daily_records),
+            "target_date_present": target_date_present,
+            "out_of_window_count": out_count,
+            "min_record_date": cls._json_safe_value(dates.min()),
+            "max_record_date": cls._json_safe_value(dates.max()),
         }
 
     @classmethod
@@ -1155,6 +1343,7 @@ def run_data_agent(
     news_keyword: str | None = None,
     sector_keyword: str | None = None,
     use_llm_news_filter: bool = True,
+    use_llm_data_review: bool = False,
     fetch_news_full_text: bool = True,
     include_sector_context: bool = True,
 ) -> DataAgentRun:
@@ -1170,6 +1359,7 @@ def run_data_agent(
         news_keyword=news_keyword,
         sector_keyword=sector_keyword,
         use_llm_news_filter=use_llm_news_filter,
+        use_llm_data_review=use_llm_data_review,
         fetch_news_full_text=fetch_news_full_text,
         include_sector_context=include_sector_context,
     )

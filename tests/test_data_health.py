@@ -46,6 +46,9 @@ def test_data_source_health_reports_required_probe_statuses():
     report = run_data_source_health("2026-07-10", route_fn=fake_route)
 
     assert report["overall_status"] == "ok"
+    assert report["effective_trade_date"] == "2026-07-10"
+    assert report["coverage"]["news_coverage_status"] == "ok"
+    assert report["coverage"]["daily_coverage_status"] == "ok"
     assert report["probes"]["a_share_daily"]["status"] == "ok"
     assert report["probes"]["ticker_news"]["status"] == "ok"
     assert report["probes"]["sector_news"]["status"] == "ok"

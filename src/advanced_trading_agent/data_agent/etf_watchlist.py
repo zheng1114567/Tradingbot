@@ -170,9 +170,14 @@ def build_watchlist_report(
         "note": "Rules fallback roundtable; use AutoGen for the default batch ETF workflow.",
     }
     if roundtable_summary is not None:
+        summary_updates = {
+            key: value
+            for key, value in roundtable_summary.items()
+            if not (key in {"agent_outputs", "dialogue_records", "round_history"} and not value)
+        }
         base_roundtable_summary = {
             **base_roundtable_summary,
-            **roundtable_summary,
+            **summary_updates,
             "backtest_used": False,
         }
         decisions = _apply_roundtable_final_decisions(decisions, candidates, limits, base_roundtable_summary)

@@ -319,6 +319,17 @@ class TestBacktestAgent:
         obj = result["backtest_report_obj"]
         assert isinstance(obj, BacktestReport)
 
+    def test_backtest_error_does_not_create_fake_sample(self, mock_llm_fail, base_state):
+        class ErrorTools:
+            def run_backtest(self, ticker, trade_date):
+                return {"sample_size": 0, "error": "无价格数据"}
+
+        node = create_backtest_agent(mock_llm_fail, tools=ErrorTools())
+        result = node(base_state)
+
+        obj = result["backtest_report_obj"]
+        assert obj.sample_size == 0
+        assert obj.confidence == Confidence.LOW
     def test_confidence_capped_when_low_samples(self, mock_llm, base_state):
         llm = MockLLM(return_value=BacktestReport(
             sample_size=5, win_rate=0.6, avg_excess_return=0.02,
@@ -443,10 +454,10 @@ class TestSystemAgent:
                 "max_rounds": 8,
                 "questions": [],
                 "contradictions": ["Market/Event conflict"],
-                "current_speaker": "AutoGenRoundtable",
+                "current_speaker": "Moderator",
                 "completed": True,
                 "summary": "System_Moderator: final_pressure=downgrade",
-                "provider": "autogen",
+                "provider": "debate_engine",
                 "fallback_reason": "",
                 "final_pressure": "downgrade",
                 "unresolved_conflicts": ["Market/Event conflict"],
@@ -636,10 +647,10 @@ class TestReportAgent:
                     "round_count": 8,
                     "max_rounds": 8,
                     "contradiction_records": [{"id": "ct_0", "description": "Market/Event conflict", "agents_involved": [], "detection_method": "pattern", "severity": "medium"}],
-                    "current_speaker": "AutoGenRoundtable",
+                    "current_speaker": "Moderator",
                     "completed": True,
                     "summary": "System_Moderator: final_pressure=downgrade",
-                    "provider": "autogen",
+                    "provider": "debate_engine",
                     "fallback_reason": "",
                     "final_pressure": "downgrade",
                     "unresolved_conflicts": ["Market/Event conflict"],
@@ -661,7 +672,7 @@ class TestReportAgent:
             config.update({"results_dir": original_results_dir})
 
         assert "## Roundtable Debate Record" in result["final_report"]
-        assert "autogen" in result["final_report"]
+        assert "debate_engine" in result["final_report"]
         assert "downgrade" in result["final_report"]
 
 

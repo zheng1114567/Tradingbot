@@ -7,10 +7,12 @@ without exposing raw chain-of-thought text.
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-from datetime import date
 from typing import Any
 
 from pydantic import BaseModel
+
+from .trading_calendar import resolve_market_trade_date
+from .vendor_router import get_vendor_chain
 
 
 def _model_dump(obj: Any) -> dict[str, Any]:
@@ -20,10 +22,6 @@ def _model_dump(obj: Any) -> dict[str, Any]:
     if hasattr(obj, "__dataclass_fields__"):
         return asdict(obj)
     return dict(obj) if isinstance(obj, dict) else {"value": str(obj)}
-
-from .vendor_router import get_vendor_chain
-
-
 @dataclass(frozen=True)
 class DataAgentPlan:
     """Execution plan generated before DataAgent collection starts."""
@@ -289,7 +287,7 @@ class DataAgentPlanner:
     def _normalize_request(request: Any) -> Any:
         if request.end_date or not request.trade_date:
             return request
-        return request.model_copy(update={"end_date": request.trade_date.replace("-", "")})
+        return request.model_copy(update={"end_date": request.normalized_trade_date().replace("-", "")})
 
     @staticmethod
     def _next_action(
@@ -319,10 +317,10 @@ class DataAgentPlanner:
                 "default": None,
             })
         if not getattr(request, "trade_date", None) and not getattr(request, "end_date", None):
-            today = date.today().isoformat()
+            today = resolve_market_trade_date()
             questions.append({
                 "id": "trade_date",
-                "question": f"没有指定交易日，是否按今天 {today} 的收盘数据分析？",
+                "question": f"没有指定交易日，是否按最近交易日 {today} 的收盘数据分析？",
                 "required": False,
                 "default": today,
             })

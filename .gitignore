@@ -7,3 +7,8 @@ data/results/
 .venv/
 *.egg-info/
 .tmp_ata/
+.ruff_cache/
+.tmp*/
+tmp_full_analysis*/
+local_cache/
+data/memory/

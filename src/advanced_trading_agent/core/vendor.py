@@ -1,4 +1,4 @@
-"""Vendor call wrapper — timing and route_trace for both DataAgent and MarketScanner."""
+"""Vendor call wrapper — timing and route_trace for DataAgent and MarketScanner."""
 
 from __future__ import annotations
 
@@ -15,22 +15,15 @@ def timed_vendor_call(
 ) -> tuple[Any, float]:
     """Call a vendor method with timing and route_trace tracking.
 
-    When *route_fn* is ``route_to_vendor`` (the default), ``_route_trace`` is
-    forwarded so the router records per-vendor timing internally.
-    For a custom *route_fn* a single success/error entry is recorded here.
-
     Returns:
         ``(result, elapsed_ms)``
 
     Raises:
         Any exception from the underlying vendor call.
     """
-    # Lazy import avoids circular dependency:
-    #   core.vendor -> data_agent.vendor_router -> data_agent.__init__ -> data_agent.data_agent -> core.vendor
     from ..data_agent.vendor_router import route_to_vendor  # noqa: F811
 
     effective_route_fn = route_fn or route_to_vendor
-
     call_kwargs = dict(kwargs)
     if effective_route_fn is route_to_vendor and route_trace is not None:
         call_kwargs.setdefault("_route_trace", route_trace)
@@ -59,6 +52,3 @@ def timed_vendor_call(
             "record_count": len(result) if isinstance(result, list) else None,
         })
     return result, elapsed_ms
-
-
-__all__ = ["timed_vendor_call"]

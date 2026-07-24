@@ -1,26 +1,21 @@
 """
-LangGraph 工作流 — 重写版 (含 Round 2 交叉质询)
+LangGraph 工作流 — 精简版
 
 完整拓扑:
 
 START
   → [硬风控1] ST/停牌/退市检查 (代码节点, 无 LLM)
     → HARD_VETO → END
-    → PASS → [Memory Agent] 历史召回 → [Market Agent]
-      → Market 冰点 → 跳过后续分析 → [Risk检2] → [Report]
+    → PASS → [System Init] → [Memory Agent] → [Market Agent]
+      → Market 冰点 → 跳过后续分析 → [Risk检2] → [System 裁定]
       → Market 正常 → [Event Agent] → [Analysis Agent] → [Backtest Agent]
         → [硬风控2] 流动性/涨跌停检查
-          → [System Agent] 判断是否进 Round 2
-            → 有矛盾 → [Round 2 交叉质询] (≤8轮)
-            → 无矛盾 → [硬风控3] 冲击成本/仓位检查
-              → HARD_VETO → END
-              → PASS → [System Agent 裁定] → [Report Agent] → [Memory存储] → END
+          → [矛盾检测] → [硬风控3] 冲击成本/仓位检查
+            → HARD_VETO → END
+            → PASS → [System Agent 裁定] → [Report Agent] → [Memory存储] → END
 
-对比 v0.1.0:
-- 硬风控从 System Agent 内部移到独立代码节点
-- 增加 Round 2 辩论
-- Memory 从第一个节点移到 System Agent 前
-- 冰点模式跳过深度分析省 token
+矛盾检测使用 ContradictionDetector (8 个确定性模式 + LLM 语义),
+检测结果直接传递给 System Agent 作为裁定参考, 不再启动多轮辩论子图。
 """
 from __future__ import annotations
 
@@ -45,12 +40,10 @@ from ..agents.system_agent import create_system_agent
 from ..config import config
 from ..data_agent.data_agent import DataAgent, DataAgentRequest
 from ..llm.client import LLMClient
-from ..roundtable import AutoGenRoundtable, RoundtableHarness
 from .conditional import (
     after_market,
     after_risk_check_1,
     after_risk_check_3,
-    after_round1,
 )
 from .risk_nodes import create_risk_check_1, create_risk_check_2, create_risk_check_3
 from .state import AgentState
@@ -146,7 +139,6 @@ def create_workflow() -> StateGraph:
     workflow.add_node("Skip Backtest", skip_backtest_node)
     workflow.add_node("Risk Check 2", risk2_node)
     workflow.add_node("Round 2 Judge", sa_round2_judge)
-    workflow.add_node("Round 2 Debate", _create_round2_subgraph(llm))
     workflow.add_node("Risk Check 3", risk3_node)
     workflow.add_node("System Final Decision", sa_final)
     workflow.add_node("Approval Agent", approval_node)
@@ -187,16 +179,9 @@ def create_workflow() -> StateGraph:
     workflow.add_edge("Backtest Agent", "Risk Check 2")
     workflow.add_edge("Skip Backtest", "Risk Check 2")
 
-    # 硬风控2 → Round 2 Judge
+    # Round 2 Judge → Risk Check 3 (矛盾检测结果直接传给 System Agent)
     workflow.add_edge("Risk Check 2", "Round 2 Judge")
-
-    # Round 2 Judge -> Round 2 subgraph -> Risk Check 3
-    workflow.add_conditional_edges(
-        "Round 2 Judge",
-        after_round1,
-        {"round2": "Round 2 Debate", "finalize": "Risk Check 3"},
-    )
-    workflow.add_edge("Round 2 Debate", "Risk Check 3")
+    workflow.add_edge("Round 2 Judge", "Risk Check 3")
 
     # 硬风控3: HARD_VETO → 直接生成报告, PASS → 进入裁定
     workflow.add_conditional_edges(
@@ -211,127 +196,6 @@ def create_workflow() -> StateGraph:
     workflow.add_edge("Report Agent", END)
 
     return workflow.compile()
-
-
-def _create_round2_subgraph(llm: LLMClient) -> StateGraph:
-    """Round 2 辩论子图 — 内部管理多轮辩论循环
-
-    strict_autogen 模式:
-    - Round 2 只允许 AutoGen 执行
-    - AutoGen 失败时不再回退到 DebateEngine
-    - 失败信息写入 round2_state, 由上游显式暴露
-    """
-
-    def debate_turn(state: AgentState) -> dict[str, Any]:
-        """执行一轮辩论"""
-        round2 = state.get("round2_state", {})
-        count = round2.get("round_count", 0)
-        max_rounds = round2.get("max_rounds", 8)
-
-        contradictions_raw = round2.get("contradiction_records", [])
-        if not contradictions_raw:
-            return {
-                "round2_state": {
-                    **round2,
-                    "completed": True,
-                    "round_count": count,
-                },
-            }
-
-        autogen_roundtable = AutoGenRoundtable(harness=RoundtableHarness())
-        try:
-            autogen_result = autogen_roundtable.run(state)
-            result = {
-                "round_count": autogen_result.round_count or max(count, 1),
-                "completed": True,
-                "current_speaker": "System_Moderator",
-                "summary": autogen_result.summary,
-                "questions": autogen_result.questions,
-                "final_pressure": autogen_result.final_pressure,
-                "unresolved_conflicts": autogen_result.unresolved_conflicts,
-                "provider": autogen_result.provider,
-                "fallback_reason": autogen_result.fallback_reason,
-                "contradiction_records": contradictions_raw,
-                "evidence_board": autogen_result.evidence_board,
-                "round_history": autogen_result.round_history,
-                "moderator_output": autogen_result.moderator_output,
-            }
-            tool_calls = [
-                {"agent": agent_name, **call}
-                for agent_name, calls in autogen_result.tool_calls_by_agent.items()
-                for call in calls
-            ]
-            evidence = [
-                "provider=autogen",
-                f"contradictions={len(contradictions_raw)}",
-                f"round_count={result['round_count']}",
-                f"tool_events={len(tool_calls)}",
-            ]
-            return build_node_audit_update(
-                sender="Round 2 Debate",
-                round2_state={**round2, **result},
-                evidence=evidence,
-                tool_calls=tool_calls,
-                self_check=basic_self_check(
-                    evidence=evidence,
-                    passed_rules=["autogen_roundtable_executed", "roundtable_tools_whitelisted"],
-                    warnings=[],
-                    confidence=autogen_result.final_pressure,
-                ),
-            )
-        except Exception as e:
-            logger.error("AutoGen roundtable failed in strict_autogen mode, round %d: %s", count, e)
-            result = {
-                "round_count": count + 1,
-                "completed": True,
-                "current_speaker": "",
-                "summary": f"Round {count + 1} AutoGen 圆桌失败: {e}",
-                "final_pressure": "neutral",
-                "unresolved_conflicts": [
-                    c.get("description", str(c))
-                    for c in contradictions_raw
-                ],
-                "provider": "autogen",
-                "fallback_reason": f"strict_autogen_failed: {type(e).__name__}: {e}",
-                "contradiction_records": contradictions_raw,
-                "evidence_board": round2.get("evidence_board", []),
-                "round_history": round2.get("round_history", []),
-                "moderator_output": None,
-            }
-            evidence = [
-                "provider=autogen",
-                "mode=strict_autogen",
-                f"autogen_failed={type(e).__name__}",
-                f"contradictions={len(contradictions_raw)}",
-            ]
-            return build_node_audit_update(
-                sender="Round 2 Debate",
-                round2_state={**round2, **result},
-                evidence=evidence,
-                tool_calls=[],
-                self_check=basic_self_check(
-                    evidence=evidence,
-                    passed_rules=["strict_autogen_enforced"],
-                    warnings=[f"AutoGen roundtable failed: {e}"],
-                    confidence="neutral",
-                ),
-            )
-
-    def after_turn(state: AgentState) -> str:
-        round2 = state.get("round2_state", {})
-        if round2.get("completed") or round2.get("round_count", 0) >= round2.get("max_rounds", 8):
-            return "finalize"
-        return "continue"
-
-    builder = StateGraph(AgentState)
-    builder.add_node("debate_turn", debate_turn)
-    builder.add_edge(START, "debate_turn")
-    builder.add_conditional_edges(
-        "debate_turn",
-        after_turn,
-        {"continue": "debate_turn", "finalize": END},
-    )
-    return builder.compile()
 
 
 class TradingSystem:
@@ -435,9 +299,6 @@ class TradingSystem:
             "round2_state": {
                 "active": False,
                 "round_count": 0,
-                "max_rounds": 8,
-                
-                
                 "current_speaker": "",
                 "completed": False,
                 "summary": "",
@@ -446,9 +307,6 @@ class TradingSystem:
                 "final_pressure": "neutral",
                 "unresolved_conflicts": [],
                 "contradiction_records": [],
-                "evidence_board": [],
-                "round_history": [],
-                "moderator_output": None,
             },
             "round2_summary": "",
             "system_decision_obj": None,

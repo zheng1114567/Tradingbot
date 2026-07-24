@@ -137,7 +137,7 @@ def format_data_collection_summary(summary: dict[str, Any]) -> str:
 
 def _find_vendor_for_method(route_trace: list[dict[str, Any]], method: str) -> str | None:
     for entry in route_trace:
-        if entry.get("method") == method and entry.get("status") == "ok":
+        if entry.get("method") == method and entry.get("status") in {"ok", "success"}:
             return entry.get("vendor")
     return None
 
@@ -177,7 +177,9 @@ def format_roundtable_visualization(round2_state: dict[str, Any]) -> str:
         for round_data in round_history:
             rn = round_data.get("round_number", "?")
             lines.append(f"#### Round {rn + 1}")
-            for turn in round_data.get("turns", []):
+            turns = round_data.get("turns", [])
+            messages = round_data.get("messages", [])
+            for turn in turns:
                 agent = turn.get("agent_name", "?")
                 stance = turn.get("stance", {})
                 pressure = stance.get("pressure", "neutral")
@@ -186,16 +188,38 @@ def format_roundtable_visualization(round2_state: dict[str, Any]) -> str:
                 lines.append(f"- **{agent}**: pressure={pressure}, conf={confidence:.1f}")
                 if reasoning:
                     lines.append(f"  - {reasoning}")
+            for message in messages:
+                source = message.get("source", "?")
+                content = str(message.get("content", ""))[:240].replace("\n", " ")
+                if source and content:
+                    lines.append(f"- **{source}**: {content}")
             lines.append("")
-            lines.append("| Agent | Position | Evidence Cited | Impact |")
-            lines.append("|-------|----------|----------------|--------|")
+            if turns:
+                lines.append("| Agent | Position | Evidence Cited | Impact |")
+                lines.append("|-------|----------|----------------|--------|")
+                for turn in turns:
+                    agent_name = turn.get("agent_name", "?")
+                    stance = turn.get("stance", {})
+                    reasoning = (stance.get("reasoning", "") or "")[:200].replace("\n", " ")
+                    evidence = ", ".join(stance.get("evidence_ids", []) or [])
+                    impact = str(stance.get("pressure", "neutral")).upper()
+                    lines.append(f"| **{agent_name}** | {reasoning} | {evidence or '-'} | {impact} |")
+                lines.append("")
+
+    questions = round2_state.get("questions", [])
+    if questions:
+        lines.append("### Agent Answers")
+        lines.append("")
+        lines.append("| Agent | Position | Evidence Cited | Impact |")
+        lines.append("|-------|----------|----------------|--------|")
+        for item in questions:
             for answer in item.get("answers", []):
                 agent_name = answer.get("target_agent", "?")
                 answer_text = answer.get("answer", "")[:200].replace("\n", " ")
                 evidence = (answer.get("evidence", "") or "")[:100].replace("\n", " ")
                 impact = _extract_impact(answer_text)
-                lines.append(f"| **{agent_name}** | {answer_text} | {evidence} | {impact} |")
-            lines.append("")
+                lines.append(f"| **{agent_name}** | {answer_text} | {evidence or '-'} | {impact} |")
+        lines.append("")
 
     summary = round2_state.get("summary", "")
     if summary:

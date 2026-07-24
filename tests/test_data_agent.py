@@ -106,6 +106,7 @@ def test_data_agent_persists_layered_trace(tmp_path):
     assert "custom_route_fn" in final_payload["vendor_health"]["vendors"]
     assert final_payload["analysis"]["agent_payload"]["tier1_data"]["risk"]["risk_data_available"] is True
     assert final_payload["manifest"]["fields"]["stock.daily"]["available"] is True
+    assert any(event["message"] == "数据流水线全部完成" for event in final_payload["audit_trail"])
     assert result.artifacts["agent_payload"].path.endswith("05_agent_payload\\agent_payload.json") or result.artifacts["agent_payload"].path.endswith("05_agent_payload/agent_payload.json")
     assert result.artifacts["news_events"].path.endswith("04_analysis\\news_events.json") or result.artifacts["news_events"].path.endswith("04_analysis/news_events.json")
 
@@ -647,3 +648,56 @@ def test_data_agent_does_not_refetch_scanner_attempted_news(tmp_path, monkeypatc
     assert raw_news["full_text_attempted"] is True
     assert raw_news["content_status"] == "summary_only"
     assert event["evidence_text"] == "Ping An Bank summary from scanner cache"
+
+
+def test_data_agent_skips_llm_data_review_by_default(tmp_path):
+    def fake_route(method, **kwargs):
+        if method == "get_daily":
+            return []
+        if method == "get_capital_flow":
+            return []
+        if method == "get_news":
+            return []
+        if method in {"get_st_status", "get_suspended", "get_delisting"}:
+            return []
+        raise AssertionError(method)
+
+    llm = FakeLLM(AssertionError("data review should be opt-in"))
+
+    result = DataAgent(route_fn=fake_route, results_dir=str(tmp_path), llm_client=llm).run(
+        DataAgentRequest(ticker="000001.SZ", trade_date="2026-07-10", use_llm_news_filter=False)
+    )
+
+    review = result.final_data["analysis"]["llm_review"]
+    assert review["mode"] == "skipped"
+    assert llm.calls == []
+
+
+def test_data_agent_llm_data_review_is_explicit_opt_in(tmp_path):
+    def fake_route(method, **kwargs):
+        if method == "get_daily":
+            return []
+        if method == "get_capital_flow":
+            return []
+        if method == "get_news":
+            return []
+        if method in {"get_st_status", "get_suspended", "get_delisting"}:
+            return []
+        raise AssertionError(method)
+
+    llm = FakeLLM('{"ok": false, "issues": ["sector mismatch"], "confidence": 0.7}')
+
+    result = DataAgent(route_fn=fake_route, results_dir=str(tmp_path), llm_client=llm).run(
+        DataAgentRequest(
+            ticker="000001.SZ",
+            trade_date="2026-07-10",
+            use_llm_news_filter=False,
+            use_llm_data_review=True,
+        )
+    )
+
+    review = result.final_data["analysis"]["llm_review"]
+    assert review["ok"] is False
+    assert review["issues"] == ["sector mismatch"]
+    assert review["confidence"] == 0.7
+    assert len(llm.calls) == 1

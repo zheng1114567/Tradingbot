@@ -777,7 +777,7 @@ def get_news_cls(
                 "sign": "9f8797a1f4de66c2370f7a03990d2737",
             },
             headers=_http_headers(),
-            timeout=10,
+            timeout=3,
         )
         response.raise_for_status()
         payload = response.json()
@@ -843,7 +843,7 @@ def get_sector_eastmoney(top_n: int = 10, **kwargs: Any) -> list[dict[str, Any]]
                     "ut": "bd1d9ddb04089700cf9c27f6f7426281",
                 },
                 headers=_http_headers(),
-                timeout=10,
+                timeout=3,
             )
             response.raise_for_status()
             payload = response.json()
@@ -998,7 +998,7 @@ def _eastmoney_diff(
                     "ut": "bd1d9ddb04089700cf9c27f6f7426281",
                 },
                 headers=_EM_HEADERS,
-                timeout=10,
+                timeout=3,
             ),
         )
         response.raise_for_status()
@@ -1771,7 +1771,7 @@ def get_etf_daily_eastmoney(
                     "end": end,
                 },
                 headers=_http_headers(),
-                timeout=10,
+                timeout=3,
             ),
         )
         response.raise_for_status()
@@ -1990,7 +1990,7 @@ def get_snapshot_tencent(code: str, **kwargs: Any) -> dict[str, Any]:
         response = requests.get(
             f"https://qt.gtimg.cn/q={symbol}",
             headers=_http_headers(),
-            timeout=10,
+            timeout=8,
         )
         response.raise_for_status()
         response.encoding = "gbk"

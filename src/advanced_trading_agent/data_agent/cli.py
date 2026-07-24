@@ -41,6 +41,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-return-records", type=int, default=20, help="Max daily/factor records in outputs")
     parser.add_argument("--sector-top-n", type=int, default=20, help="Max sector ranking records to keep")
     parser.add_argument("--json", action="store_true", help="Print full DataAgentRun JSON")
+    parser.add_argument(
+        "--analyze",
+        action="store_true",
+        help="After DataAgent finishes, run the trading workflow on the same cleaned payload",
+    )
+    parser.add_argument("--skip-backtest", action="store_true", help="Skip backtest in --analyze mode")
+    parser.add_argument("--lookback-days", type=int, default=90, help="Default daily-data lookback window for --analyze when --start-date is omitted")
+    parser.add_argument("--store-memory", action="store_true", help="Persist analysis decisions to MemoryStore")
     return parser
 
 
@@ -66,11 +74,54 @@ def run_from_args(args: argparse.Namespace) -> dict[str, Any]:
         max_return_records=args.max_return_records,
         sector_top_n=args.sector_top_n,
     )
+    if args.analyze:
+        from ..pipeline import run_full_analysis
+
+        result = run_full_analysis(
+            ticker=request.ticker,
+            trade_date=request.trade_date,
+            start_date=request.start_date,
+            end_date=request.end_date,
+            output_dir=request.output_dir,
+            use_react_planner=request.use_react_planner,
+            news_keyword=request.news_keyword,
+            sector_keyword=request.sector_keyword,
+            use_llm_news_filter=request.use_llm_news_filter,
+            fetch_news_full_text=request.fetch_news_full_text,
+            skip_backtest=args.skip_backtest,
+            lookback_days=args.lookback_days,
+        )
+        return result.to_dict()
+
     result = DataAgent(results_dir=args.output_dir).run(request)
     return result.to_dict()
 
 
 def summarize_run(payload: dict[str, Any]) -> dict[str, Any]:
+    if payload.get("stage") == "full_analysis":
+        data_agent = payload.get("data_agent", {})
+        analysis = payload.get("analysis", {})
+        collection = data_agent.get("collection_summary", {})
+        return {
+            "stage": payload.get("stage"),
+            "analysis_mode": "workflow",
+            "ticker": payload.get("ticker"),
+            "trade_date": payload.get("trade_date"),
+            "run_id": data_agent.get("run_id"),
+            "response_path": data_agent.get("response_path"),
+            "manifest_path": data_agent.get("manifest_path"),
+            "report_path": analysis.get("final_report_path"),
+            "audit_trace_path": analysis.get("audit_trace_path"),
+            "execution_allowed": analysis.get("execution_allowed"),
+            "final_pressure": (analysis.get("round2_state") or {}).get("final_pressure"),
+            "collection": {
+                "categories_with_data": collection.get("categories_with_data", 0),
+                "categories_failed": collection.get("categories_failed", 0),
+                "categories_empty": collection.get("categories_empty", 0),
+            },
+            "errors": data_agent.get("errors", []),
+        }
+
     final_data = payload.get("final_data", {})
     cleaned = final_data.get("cleaned", {})
     analysis = final_data.get("analysis", {})

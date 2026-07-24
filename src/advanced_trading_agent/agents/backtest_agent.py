@@ -20,6 +20,9 @@ import logging
 from datetime import date
 from typing import Any
 
+import pandas as pd
+
+from ..backtest.engine import BacktestEngine
 from ..llm.client import LLMClient
 from ..tool_nodes.backtest_tools import BacktestTools
 from ..tool_nodes.registry import get_agent_tools
@@ -35,6 +38,40 @@ from .specs import get_agent_skill
 logger = logging.getLogger(__name__)
 
 MIN_SAMPLE_SIZE = 30  # 最小样本量阈值
+
+
+def _backtest_from_price_data(
+    price_data: Any,
+    *,
+    ticker: str,
+    trade_date: str,
+) -> dict[str, Any] | None:
+    """Run deterministic backtest from DataAgent price_data when available."""
+    if not isinstance(price_data, list) or len(price_data) < 2:
+        return None
+    df = pd.DataFrame(price_data)
+    if df.empty or "trade_date" not in df.columns or "close" not in df.columns:
+        return None
+    df["trade_date"] = pd.to_datetime(df["trade_date"], errors="coerce")
+    df = df.dropna(subset=["trade_date"]).sort_values("trade_date")
+    if df.empty:
+        return None
+    result = BacktestEngine().run_single(
+        price_df=df,
+        entry_date=date.fromisoformat(trade_date),
+        code=ticker,
+    )
+    valid_returns = [v for v in result.returns.values() if v is not None]
+    valid_excess = [v for v in result.excess_returns.values() if v is not None]
+    return {
+        "sample_size": len(valid_returns),
+        "win_rate": sum(1 for v in valid_returns if v > 0) / len(valid_returns) if valid_returns else 0,
+        "avg_excess_return": sum(valid_excess) / len(valid_excess) if valid_excess else 0,
+        "best_holding_period": result.holding_days or None,
+        "tradable": result.tradable,
+        "returns": result.returns,
+        "error": None if valid_returns else "no executable holding-period returns",
+    }
 
 
 def create_backtest_agent(llm: LLMClient, tools: BacktestTools | None = None):
@@ -56,11 +93,21 @@ def create_backtest_agent(llm: LLMClient, tools: BacktestTools | None = None):
         # 先用工具跑回测
         backtest_tools = tools or BacktestTools()
         bt_result = backtest_tools.run_backtest(ticker, trade_date)
+        local_bt_result = _backtest_from_price_data(
+            tier2.get("price_data", []),
+            ticker=ticker,
+            trade_date=trade_date,
+        )
         tool_calls = [
             {
                 "tool": "run_backtest",
                 "args": {"ticker": ticker, "trade_date": trade_date},
                 "records": 1 if bt_result else 0,
+            },
+            {
+                "tool": "backtest_from_tier2_price_data",
+                "args": {"ticker": ticker, "trade_date": trade_date},
+                "records": 1 if local_bt_result else 0,
             }
         ]
 
@@ -76,10 +123,16 @@ def create_backtest_agent(llm: LLMClient, tools: BacktestTools | None = None):
             win_rate = s.get("win_rate", 0)
             avg_excess = s.get("avg_excess_return", 0)
             best_period = s.get("best_holding_period")
-        elif bt_result:
-            sample_size = 1  # 只有当前样本
-            win_rate = 0
-            avg_excess = 0
+        elif local_bt_result and not local_bt_result.get("error"):
+            sample_size = int(local_bt_result.get("sample_size", 0) or 0)
+            win_rate = float(local_bt_result.get("win_rate", 0) or 0)
+            avg_excess = float(local_bt_result.get("avg_excess_return", 0) or 0)
+            best_period = local_bt_result.get("best_holding_period")
+        elif bt_result and not bt_result.get("error"):
+            sample_size = int(bt_result.get("sample_size", 1) or 1)
+            win_rate = float(bt_result.get("win_rate", 0) or 0)
+            avg_excess = float(bt_result.get("avg_excess_return", 0) or 0)
+            best_period = bt_result.get("best_holding_period")
 
         # 确定性规则校验
         enough_samples = sample_size >= MIN_SAMPLE_SIZE

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import date, timedelta
 from typing import Any
 
 import pandas as pd
@@ -106,3 +107,80 @@ class DataQualityGate:
             DataQAIssue("error", label, f"缺少必要字段: {', '.join(missing)}")
         ]
 
+
+@dataclass
+class BacktestDataset:
+    """Local-cache dataset prepared before a backtest run."""
+
+    prices_by_code: dict[str, pd.DataFrame]
+    coverage: dict[str, Any]
+
+
+class BacktestDatasetBuilder:
+    """Build point-in-time price datasets from local cache before simulation.
+
+    The backtest engine should receive a prepared in-memory dataset.  This
+    keeps network/cache repair outside the simulation loop and makes missing
+    30/60-day history explicit.
+    """
+
+    def __init__(self, *, lookback_days: int = 60, min_coverage_days: int = 30):
+        self.lookback_days = lookback_days
+        self.min_coverage_days = min_coverage_days
+
+    def build(
+        self,
+        signals: list[dict[str, Any]],
+        *,
+        end_date: str,
+        etf: bool = False,
+    ) -> BacktestDataset:
+        from ..data_agent.local_cache import get_cached_daily, get_cached_etf_daily
+
+        end = _parse_iso(end_date)
+        start = end - timedelta(days=self.lookback_days)
+        loader = get_cached_etf_daily if etf else get_cached_daily
+        prices_by_code: dict[str, pd.DataFrame] = {}
+        per_code: dict[str, dict[str, Any]] = {}
+
+        codes = sorted({str(item.get("code") or item.get("ticker") or "") for item in signals if item.get("code") or item.get("ticker")})
+        for code in codes:
+            rows = loader(code, start.isoformat(), end.isoformat())
+            frame = pd.DataFrame(rows)
+            trade_days = _unique_trade_day_count(frame)
+            status = "ok" if trade_days >= self.min_coverage_days else "insufficient_cache"
+            if not frame.empty:
+                prices_by_code[code] = frame
+            per_code[code] = {
+                "status": status,
+                "row_count": int(len(frame)),
+                "trade_day_count": trade_days,
+                "required_min_trade_days": self.min_coverage_days,
+            }
+
+        return BacktestDataset(
+            prices_by_code=prices_by_code,
+            coverage={
+                "status": "ok" if per_code and all(item["status"] == "ok" for item in per_code.values()) else "insufficient_cache",
+                "lookback_days": self.lookback_days,
+                "start_date": start.isoformat(),
+                "end_date": end.isoformat(),
+                "codes": per_code,
+            },
+        )
+
+
+def _unique_trade_day_count(frame: pd.DataFrame) -> int:
+    if frame.empty:
+        return 0
+    for column in ("trade_date", "datetime", "date"):
+        if column in frame.columns:
+            return int(pd.to_datetime(frame[column], errors="coerce").dt.date.nunique())
+    return 0
+
+
+def _parse_iso(value: str) -> date:
+    raw = str(value)
+    if len(raw) == 8 and raw.isdigit():
+        raw = f"{raw[:4]}-{raw[4:6]}-{raw[6:]}"
+    return pd.to_datetime(raw).date()

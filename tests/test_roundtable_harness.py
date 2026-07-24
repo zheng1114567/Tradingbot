@@ -51,21 +51,17 @@ def test_roundtable_harness_builds_dataaware_agent_contexts():
     assert "confidence_score" in context.agent_contexts["Backtest"].evidence_text
     assert "stock.daily" in context.shared_evidence_text
     assert "只能引用自己的 AgentContext" in context.agent_contexts["Market"].system_message
+    assert "你的唯一身份是 Market Agent" in context.agent_contexts["Market"].system_message
+    assert "role=Market Agent" in context.agent_contexts["Market"].system_message
+    assert "禁止自称或扮演其他 Agent" in context.agent_contexts["Event"].system_message
     assert "DATA_AGENT_BRIEF" in context.task
 
 
-def test_roundtable_fallback_produces_valid_state(monkeypatch):
+def test_roundtable_fallback_produces_valid_state():
     class FailingLLM:
         def chat(self, *args, **kwargs):
             raise RuntimeError("offline")
 
-    def fail_autogen(self, state):
-        raise RuntimeError("autogen offline")
-
-    monkeypatch.setattr(
-        "advanced_trading_agent.graph.workflow.AutoGenRoundtable.run",
-        fail_autogen,
-    )
     graph = _create_round2_subgraph(FailingLLM())
     state = {
         "company_of_interest": "000001.SZ",
@@ -103,4 +99,4 @@ def test_roundtable_fallback_produces_valid_state(monkeypatch):
 
     round2 = result["round2_state"]
     assert round2["completed"] is True
-    assert round2["final_pressure"] in ("neutral", "downgrade", "upgrade")
+    assert round2["final_pressure"] == "downgrade"

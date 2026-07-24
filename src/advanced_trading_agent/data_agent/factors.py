@@ -231,7 +231,10 @@ class FactorCalculator:
                     pct = 1 - pct
                 score += pct * weight
                 used.append(factor)
-        df["composite_score"] = score
+        # Public contract: downstream agents and SystemRubric read
+        # composite_score as a 0-10 score. Keep raw weighted alpha for audit.
+        df["composite_raw"] = score
+        df["composite_score"] = ((score + 0.5) * 10).clip(lower=0.0, upper=10.0)
         if skipped:
             logger.debug("Composite score skipped: %s; used: %s", skipped, used)
         return df

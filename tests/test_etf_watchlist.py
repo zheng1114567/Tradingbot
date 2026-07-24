@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import json
+
+import pytest
+
 from advanced_trading_agent.data_agent.etf_watchlist import (
     SectorCandidatePayload,
     WatchlistETFCandidate,
@@ -177,6 +181,93 @@ def test_batch_watchlist_workflow_outputs_json_contract(tmp_path):
     assert len(report["roundtable_summary"]["dialogue_records"]) >= 6
     assert report["roundtable_summary"]["round_history"][0]["sector"] == "半导体"
     assert report["roundtable_summary"]["timings"]["rules_roundtable_seconds"] >= 0
+
+
+def test_main_watchlist_falls_back_when_explicitly_allowed(monkeypatch, tmp_path):
+    import advanced_trading_agent.data_agent.sector_etf as sector_mod
+    import advanced_trading_agent.main as main_mod
+    import advanced_trading_agent.roundtable.etf_watchlist_autogen as autogen_mod
+
+    class FakeSelection:
+        excluded = []
+
+        def watchlist_payloads(self):
+            return [_watchlist_candidate("半导体", "512480.SH", 10)]
+
+    class FakeSelector:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def select_with_exclusions(self, *args, **kwargs):
+            return FakeSelection()
+
+    class FailingRoundtable:
+        def run(self, **kwargs):
+            raise RuntimeError("APIStatusError: Error code: 402 - Insufficient Balance")
+
+    monkeypatch.setattr(sector_mod, "SectorETFSelector", FakeSelector)
+    monkeypatch.setattr(autogen_mod, "ETFWatchlistAutoGenRoundtable", lambda: FailingRoundtable())
+    old_results_dir = main_mod.config.get("results_dir")
+    main_mod.config.update({"results_dir": str(tmp_path)})
+    try:
+        payload = json.loads(
+            main_mod.analyze_sector_etf_watchlist(
+                "2026-07-15",
+                max_roundtable_sectors=3,
+                store_memory=False,
+                force=True,
+                json_output=True,
+                use_autogen=True,
+                allow_roundtable_fallback=True,
+            )
+        )
+    finally:
+        main_mod.config.update({"results_dir": old_results_dir})
+
+    assert payload["decisions"][0]["primary_etf"]["code"] == "512480.SH"
+    assert payload["roundtable_summary"]["provider"] == "rules_batch_roundtable"
+    assert payload["roundtable_summary"]["autogen_requested"] is True
+    assert "402" in payload["roundtable_summary"]["fallback_reason"]
+
+
+def test_main_watchlist_does_not_fallback_by_default(monkeypatch, tmp_path):
+    import advanced_trading_agent.data_agent.sector_etf as sector_mod
+    import advanced_trading_agent.main as main_mod
+    import advanced_trading_agent.roundtable.etf_watchlist_autogen as autogen_mod
+
+    class FakeSelection:
+        excluded = []
+
+        def watchlist_payloads(self):
+            return [_watchlist_candidate("半导体", "512480.SH", 10)]
+
+    class FakeSelector:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def select_with_exclusions(self, *args, **kwargs):
+            return FakeSelection()
+
+    class FailingRoundtable:
+        def run(self, **kwargs):
+            raise RuntimeError("API timeout")
+
+    monkeypatch.setattr(sector_mod, "SectorETFSelector", FakeSelector)
+    monkeypatch.setattr(autogen_mod, "ETFWatchlistAutoGenRoundtable", lambda: FailingRoundtable())
+    old_results_dir = main_mod.config.get("results_dir")
+    main_mod.config.update({"results_dir": str(tmp_path)})
+    try:
+        with pytest.raises(RuntimeError, match="fallback is disabled"):
+            main_mod.analyze_sector_etf_watchlist(
+                "2026-07-15",
+                max_roundtable_sectors=3,
+                store_memory=False,
+                force=True,
+                json_output=True,
+                use_autogen=True,
+            )
+    finally:
+        main_mod.config.update({"results_dir": old_results_dir})
 
 
 def _watchlist_candidate(sector: str, code: str, score: float) -> SectorCandidatePayload:

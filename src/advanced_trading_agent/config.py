@@ -14,6 +14,7 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
+
 # ============================================================
 # 配置加载
 # ============================================================
@@ -24,6 +25,7 @@ _ATA_HOME = Path(os.getenv("ATA_HOME", os.path.join(Path.home(), ".advanced_trad
 # TRADINGAGENTS_* 保持向后兼容, ATA_* 是新的前缀
 _ENV_OVERRIDES = {
     "ATA_LLM_PROVIDER": "llm_provider",
+    "ATA_LLM_MODEL": "llm_model",
     "ATA_DEEP_THINK_LLM": "deep_think_llm",
     "ATA_QUICK_THINK_LLM": "quick_think_llm",
     "ATA_TEMPERATURE": "temperature",
@@ -44,7 +46,7 @@ _ENV_OVERRIDES = {
 
 _BOOL_TRUE = ("true", "1", "yes", "on")
 _BOOL_FALSE = ("false", "0", "no", "off")
-_VALID_PROVIDERS = frozenset({"deepseek", "openai", "anthropic"})
+_VALID_PROVIDERS = frozenset({"qwen", "deepseek", "openai", "kimi", "glm", "anthropic"})
 
 # Config keys whose values are file-system paths — auto-expand ~ on env-var overrides
 _PATH_KEYS = frozenset({
@@ -131,9 +133,10 @@ class Config:
                 str(_ATA_HOME / "memory" / "strategy_audit_queue.jsonl"),
             ),
             # LLM
-            "llm_provider": "deepseek",
-            "deep_think_llm": "deepseek-chat",
-            "quick_think_llm": "deepseek-chat",
+            "llm_provider": "qwen",
+            "llm_model": "qwen3.6-flash",
+            "deep_think_llm": "qwen3.6-flash",
+            "quick_think_llm": "qwen3.6-flash",
             "temperature": 0.1,
             # 运行时
             "max_debate_rounds": 2,
@@ -219,6 +222,9 @@ class Config:
                     if t < 0.0 or t > 2.0:
                         raise ValueError(f"Temperature must be in [0.0, 2.0], got {t}")
                 self._config[config_key] = value
+                if config_key == "llm_model":
+                    self._config["deep_think_llm"] = value
+                    self._config["quick_think_llm"] = value
                 if config_key in _PATH_KEYS:
                     self._config[config_key] = str(Path(str(value)).expanduser())
             except ValueError as e:

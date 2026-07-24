@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import time
 from datetime import date
 from pathlib import Path
@@ -19,6 +20,7 @@ from typing import TYPE_CHECKING, Any
 
 from .config import config
 from .core.atomic_write import atomic_write_json, atomic_write_text
+from .data_agent.trading_calendar import resolve_market_trade_date
 from .strategy_rules import load_strategy_proposals, review_strategy_proposal
 
 if TYPE_CHECKING:
@@ -53,7 +55,7 @@ def analyze_single(ticker: str, trade_date: str | None = None,
     """
     from .graph.workflow import TradingSystem
 
-    trade_date = trade_date or str(date.today())
+    trade_date = resolve_market_trade_date(trade_date)
     logger.info("Analyzing %s on %s...", ticker, trade_date)
 
     system = TradingSystem(debug=debug)
@@ -187,6 +189,7 @@ def run_standalone_data_agent(
     use_react_planner: bool = False,
     news_keyword: str | None = None,
     use_llm_news_filter: bool = True,
+    use_llm_data_review: bool = False,
     fetch_news_full_text: bool = True,
 ) -> str:
     """Run data collection, cleaning, analysis, and layered persistence only."""
@@ -202,11 +205,54 @@ def run_standalone_data_agent(
             use_react_planner=use_react_planner,
             news_keyword=news_keyword,
             use_llm_news_filter=use_llm_news_filter,
+            use_llm_data_review=use_llm_data_review,
             fetch_news_full_text=fetch_news_full_text,
         )
     )
     return json.dumps(result.to_dict(), ensure_ascii=False, indent=2)
 
+
+
+def run_full_data_analysis(
+    ticker: str,
+    *,
+    trade_date: str | None = None,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    output_dir: str | None = None,
+    use_react_planner: bool = True,
+    news_keyword: str | None = None,
+    sector_keyword: str | None = None,
+    use_llm_news_filter: bool = True,
+    use_llm_data_review: bool = False,
+    fetch_news_full_text: bool = True,
+    skip_backtest: bool = False,
+    lookback_days: int = 90,
+    store_memory: bool = False,
+    compact: bool = True,
+) -> str:
+    """采集数据并运行完整 LangGraph 分析工作流。"""
+    from .pipeline import run_full_analysis
+    from .data_agent.cli import summarize_run
+
+    result = run_full_analysis(
+        ticker=ticker,
+        trade_date=trade_date,
+        start_date=start_date,
+        end_date=end_date,
+        output_dir=output_dir,
+        use_react_planner=use_react_planner,
+        news_keyword=news_keyword,
+        sector_keyword=sector_keyword,
+        use_llm_news_filter=use_llm_news_filter,
+        use_llm_data_review=use_llm_data_review,
+        fetch_news_full_text=fetch_news_full_text,
+        skip_backtest=skip_backtest,
+        lookback_days=lookback_days,
+    )
+    payload = result.to_dict()
+    output = summarize_run(payload) if compact else payload
+    return json.dumps(output, ensure_ascii=False, indent=2, default=str)
 
 def list_strategy_audit_queue() -> str:
     """Return pending and reviewed strategy change proposals as JSON."""
@@ -217,21 +263,27 @@ def refresh_local_cache(
     trade_date: str | None = None,
     *,
     output_dir: str | None = None,
+    cache_days: int = 60,
     force_news: bool = False,
 ) -> str:
     """Refresh the daily cache without running the full agent workflow."""
     from .data_agent.build_cache import build as build_local_cache
 
+    requested_date = trade_date or str(date.today())
+    effective_trade_date = resolve_market_trade_date(trade_date)
     cache_dir = build_local_cache(
-        trade_date=trade_date,
+        trade_date=effective_trade_date,
         output_dir=output_dir,
+        days_back=cache_days,
         compute_signals=True,
         refresh_news=True,
         force_news=force_news,
     )
     payload = {
-        "trade_date": trade_date or str(date.today()),
+        "requested_date": requested_date,
+        "effective_trade_date": effective_trade_date,
         "cache_dir": str(cache_dir),
+        "cache_days": cache_days,
         "force_news": force_news,
     }
     return json.dumps(payload, ensure_ascii=False, indent=2)
@@ -274,7 +326,7 @@ def scan_sector_etfs(
     from .data_agent.etf_watchlist import build_watchlist_report, render_watchlist_markdown
     from .data_agent.sector_etf import SectorETFSelector
 
-    trade_date = trade_date or str(date.today())
+    trade_date = resolve_market_trade_date(trade_date)
     results_dir = Path(config.get("results_dir"))
     results_dir.mkdir(parents=True, exist_ok=True)
     suffix = sector.replace("/", "_") if sector else "all"
@@ -306,19 +358,17 @@ def analyze_sector_etf(
     trade_date: str | None = None,
     *,
     question: str | None = None,
-    use_autogen: bool = True,
     store_memory: bool = True,
     refresh_cache: bool = False,
 ) -> str:
     """Run the full LangGraph sector ETF pipeline."""
     from .graph.sector_etf_workflow import SectorETFTradingSystem
 
-    trade_date = trade_date or str(date.today())
+    trade_date = resolve_market_trade_date(trade_date)
     _state, report = SectorETFTradingSystem(refresh_cache=refresh_cache).analyze(
         sector,
         question=question,
         trade_date=trade_date,
-        use_autogen=use_autogen,
         store_memory=store_memory,
     )
     return report
@@ -327,29 +377,25 @@ def analyze_sector_etf(
 def analyze_sector_etf_watchlist(
     trade_date: str | None = None,
     *,
-    max_roundtable_sectors: int = 8,
+    max_roundtable_sectors: int = 5,
     store_memory: bool = True,
     force: bool = False,
     json_output: bool = False,
     refresh_cache: bool = False,
-    use_autogen: bool = True,
 ) -> str:
-    """Run the batch sector ETF observation-pool workflow."""
+    """Run the batch sector ETF observation-pool workflow with AutoGen roundtable."""
     from .data_agent.etf_watchlist import build_watchlist_report, render_watchlist_markdown
     from .data_agent.sector_etf import SectorETFSelector
+    from .roundtable.etf_watchlist_autogen import ETFWatchlistAutoGenRoundtable
 
-    trade_date = trade_date or str(date.today())
+    trade_date = resolve_market_trade_date(trade_date)
     results_dir = Path(config.get("results_dir"))
     results_dir.mkdir(parents=True, exist_ok=True)
     report_path = results_dir / f"sector_etf_watchlist_{trade_date}.md"
     json_path = results_dir / f"sector_etf_watchlist_{trade_date}.json"
 
     if report_path.exists() and json_path.exists() and not force:
-        cached_payload = json.loads(json_path.read_text(encoding="utf-8"))
-        cached_provider = (cached_payload.get("roundtable_summary") or {}).get("provider")
-        expected_provider = "autogen" if use_autogen else "rules_batch_roundtable"
-        if cached_provider == expected_provider:
-            return json.dumps(cached_payload, ensure_ascii=False, indent=2) if json_output else report_path.read_text(encoding="utf-8")
+        return json.dumps(json.loads(json_path.read_text(encoding="utf-8")), ensure_ascii=False, indent=2) if json_output else report_path.read_text(encoding="utf-8")
 
     started = time.perf_counter()
     selector = SectorETFSelector(
@@ -363,31 +409,34 @@ def analyze_sector_etf_watchlist(
     select_seconds = time.perf_counter() - started
 
     roundtable_started = time.perf_counter()
-    roundtable_summary = None
-    if use_autogen:
-        from .roundtable.etf_watchlist_autogen import ETFWatchlistAutoGenRoundtable
-
-        limits = None
+    try:
         autogen_result = ETFWatchlistAutoGenRoundtable().run(
             trade_date=trade_date,
             candidates=selection.watchlist_payloads(),
             max_final_decisions=3,
         )
         roundtable_summary = autogen_result.to_summary_dict()
-    else:
-        limits = None
+    except Exception as exc:
+        logger.warning("AutoGen roundtable failed, falling back: %s", _compact_exception(exc))
+        roundtable_summary = {
+            "provider": "deterministic_fallback",
+            "mode": "no_roundtable",
+            "autogen_requested": True,
+            "fallback_reason": _compact_exception(exc),
+            "note": "AutoGen roundtable failed; sector selector scoring used as fallback.",
+        }
+
     report = build_watchlist_report(
         trade_date=trade_date,
         candidates=selection.watchlist_payloads(),
         excluded=selection.excluded,
-        limits=limits,
         roundtable_summary=roundtable_summary,
     )
     roundtable_seconds = time.perf_counter() - roundtable_started
     payload = report.model_dump(mode="json")
     payload["roundtable_summary"]["timings"] = {
         "select_and_process_seconds": round(select_seconds, 3),
-        "autogen_roundtable_seconds" if use_autogen else "rules_roundtable_seconds": round(roundtable_seconds, 3),
+        "autogen_roundtable_seconds": round(roundtable_seconds, 3),
         "total_pre_render_seconds": round(time.perf_counter() - started, 3),
     }
     markdown = render_watchlist_markdown(report)
@@ -415,6 +464,28 @@ def analyze_sector_etf_watchlist(
     atomic_write_text(report_path, markdown)
     atomic_write_json(json_path, payload)
     return json.dumps(payload, ensure_ascii=False, indent=2) if json_output else markdown
+
+
+def _compact_exception(exc: Exception, *, max_length: int = 1000) -> str:
+    """Return an audit-friendly exception string without leaking configured secrets."""
+    text = f"{type(exc).__name__}: {exc}"
+    for key in (
+        "DASHSCOPE_API_KEY",
+        "QWEN_API_KEY",
+        "DEEPSEEK_API_KEY",
+        "OPENAI_API_KEY",
+        "KIMI_API_KEY",
+        "MOONSHOT_API_KEY",
+        "GLM_API_KEY",
+        "ZHIPU_API_KEY",
+        "ANTHROPIC_API_KEY",
+    ):
+        secret = os.environ.get(key)
+        if secret:
+            text = text.replace(secret, "***")
+    if len(text) > max_length:
+        return text[: max_length - 3] + "..."
+    return text
 
 
 def audit_strategy_proposal(
@@ -451,7 +522,7 @@ def scan_and_analyze(top_n: int = 10, trade_date: str | None = None,
     """
     from .data_agent.scanner import MarketScanner
 
-    trade_date = trade_date or str(date.today())
+    trade_date = resolve_market_trade_date(trade_date)
     results_dir = Path(config.get("results_dir"))
     results_dir.mkdir(parents=True, exist_ok=True)
     scan_path = results_dir / f"scan_report_{trade_date}.md"
@@ -519,6 +590,9 @@ def _analyze_from_bundle(
     bundle: "ScanBundle",
     debug: bool = False,
     skip_backtest: bool = False,
+    analysis_mode: str = "workflow",
+    lookback_days: int = 90,
+    store_memory: bool = False,
 ) -> str:
     """Run DataAgent with pre-collected data, then feed tier1/tier2 to TradingSystem.
 
@@ -566,7 +640,6 @@ def ask_llm(
     trade_date: str | None = None,
     debug: bool = False,
     *,
-    use_autogen: bool = True,
     store_memory: bool = True,
 ) -> str:
     """自然语言问答：根据问题自动分析对应标的或板块并回答。
@@ -575,7 +648,7 @@ def ask_llm(
     2. 扫描 + DataAgent 采集数据
     3. 把 tier1/tier2 + 问题发给 LLM → 生成分析回答
     """
-    trade_date = trade_date or str(date.today())
+    trade_date = resolve_market_trade_date(trade_date)
     from .agents.conversation_memory import ConversationEntry, ConversationMemoryStore
     from .data_agent.data_agent import DataAgent, DataAgentRequest
     from .data_agent.scanner import MarketScanner
@@ -650,7 +723,6 @@ def ask_llm(
             target,
             question=question,
             trade_date=trade_date,
-            use_autogen=use_autogen,
             store_memory=store_memory,
         )
         return report
@@ -740,25 +812,25 @@ def _get_llm():
 
 
 def main():
-    parser = argparse.ArgumentParser(description="多智能体量化交易分析系统")
-    parser.add_argument("--ticker", "-t", help="股票代码 (如 000001.SZ)")
+    parser = argparse.ArgumentParser(description="板块ETF观察池分析系统")
     parser.add_argument("--date", "-d", help="交易日 (默认今天)")
-    parser.add_argument("--batch", "-b", help="批量分析文件路径")
     parser.add_argument("--review", action="store_true", help="运行复盘汇总")
     parser.add_argument("--daily-review", action="store_true", help="运行每日复盘任务")
-    parser.add_argument("--refresh-cache", action="store_true", help="只刷新当日本地数据缓存，不跑扫描/圆桌")
-    parser.add_argument("--refresh-etf-cache", action="store_true", help="只刷新 ETF 现货/日线缓存，不跑扫描/圆桌")
+    parser.add_argument("--refresh-cache", action="store_true", help="刷新当日本地数据缓存")
+    parser.add_argument("--refresh-etf-cache", action="store_true", help="刷新 ETF 现货/日线缓存")
     parser.add_argument("--data-health", action="store_true", help="检查行情、板块、涨停、ETF 数据源可用性")
-    parser.add_argument("--sector-etf-scan", action="store_true", help="扫描板块并映射相关ETF，不输出个股买入列表")
-    parser.add_argument("--sector-etf-analyze", action="store_true", help="运行板块ETF LangGraph 决策流水线（含圆桌和对话记忆）")
+    parser.add_argument("--sector-etf-scan", action="store_true", help="扫描板块并映射相关ETF")
+    parser.add_argument("--sector-etf-analyze", action="store_true", help="运行板块ETF 圆桌决策流水线")
     parser.add_argument("--sector", help="指定板块名称，如 半导体、机器人、创新药")
-    parser.add_argument("--no-autogen", action="store_true", help="板块ETF分析/问答不调用 AutoGen，仅用确定性 fallback")
-    parser.add_argument("--no-conversation-memory", action="store_true", help="板块ETF分析/问答不写入对话记忆")
-    parser.add_argument("--etf-code", action="append", default=[], help="刷新指定 ETF 代码，可重复传入，如 --etf-code 512480.SH")
+    parser.add_argument("--no-conversation-memory", action="store_true", help="板块ETF分析不写入对话记忆")
+    parser.add_argument("--etf-code", action="append", default=[], help="刷新指定 ETF 代码，可重复传入")
     parser.add_argument("--etf-daily-limit", type=int, default=20, help="未指定 ETF 时，按现货成交额刷新前 N 只 ETF 日线")
     parser.add_argument("--force-news", action="store_true", help="刷新缓存时强制重拉当天新闻")
+    parser.add_argument("--cache-days", type=int, default=60, help="刷新本地行情缓存的回看天数，默认 60")
     parser.add_argument("--portfolio-backtest", action="store_true", help="运行观察池组合回测")
-    parser.add_argument("--data-agent", action="store_true", help="单独运行 DataAgent 并分层保存数据")
+    parser.add_argument("--full-analysis", action="store_true", help="按指定日期采集数据、处理并自动分析，返回 JSON")
+    parser.add_argument("--lookback-days", type=int, default=90, help="full-analysis 未指定 start-date 时的日线回看天数")
+    parser.add_argument("--store-memory", action="store_true", help="full-analysis rules 模式写入交易 MemoryStore")
     parser.add_argument("--react-planner", action="store_true", help="DataAgent 运行前启用 ReAct Planner")
     parser.add_argument("--strategy-audit", action="store_true", help="查看策略规则变更审计队列")
     parser.add_argument("--audit-proposal-id", help="要审批的策略变更 proposal_id")
@@ -770,19 +842,18 @@ def main():
     parser.add_argument("--start-date", help="DataAgent 起始日期, 如 20260101")
     parser.add_argument("--end-date", help="DataAgent 结束日期, 如 20260710")
     parser.add_argument("--output-dir", help="DataAgent 输出目录")
-    parser.add_argument("--news-keyword", help="DataAgent 新闻关键词过滤, 可选")
-    parser.add_argument("--no-llm-news-filter", action="store_true", help="DataAgent 新闻筛选不调用 LLM, 仅使用规则兜底")
-    parser.add_argument("--no-news-full-text", action="store_true", help="DataAgent 不抓取新闻 URL 正文, 仅保留摘要")
-    parser.add_argument("--workers", type=int, default=4, help="批量并发数 (默认 4)")
-    parser.add_argument("--skip-backtest", action="store_true", help="跳过 Backtest Agent，仅保留可审计占位报告")
+    parser.add_argument("--news-keyword", help="DataAgent 新闻关键词过滤")
+    parser.add_argument("--no-llm-news-filter", action="store_true", help="DataAgent 新闻筛选不调用 LLM")
+    parser.add_argument("--llm-data-review", action="store_true", help="DataAgent 使用 LLM 做数据质量复核")
+    parser.add_argument("--no-news-full-text", action="store_true", help="DataAgent 不抓取新闻正文")
+    parser.add_argument("--skip-backtest", action="store_true", help="跳过回测")
     parser.add_argument("--debug", action="store_true", help="调试模式")
     parser.add_argument("--json", action="store_true", help="JSON 输出")
-    parser.add_argument("--scan", action="store_true", help="扫描热点板块和强势股，自动分析 Top-N")
-    parser.add_argument("--scan-top-n", type=int, default=10, help="扫描后分析 Top N 只股票 (默认 10)")
-    parser.add_argument("--no-refresh-cache", action="store_true", help="兼容旧参数：不刷新扫描缓存")
-    parser.add_argument("--refresh-scan-cache", action="store_true", help="扫描前刷新行情缓存；新闻建议单独用 --refresh-cache 预缓存")
+    parser.add_argument("--scan-top-n", type=int, default=10, help="扫描 Top N 板块")
+    parser.add_argument("--no-refresh-cache", action="store_true", help="不刷新扫描缓存")
+    parser.add_argument("--refresh-scan-cache", action="store_true", help="扫描前刷新行情缓存")
     parser.add_argument("--force", "-f", action="store_true", help="强制重新扫描，忽略缓存")
-    parser.add_argument("--ask", "-a", help="自然语言提问，如 '新能源汽车板块怎么样' 或 '贵州茅台能买吗'")
+    parser.add_argument("--ask", "-a", help="自然语言提问，如 '新能源汽车板块怎么样'")
 
     args = parser.parse_args()
 
@@ -791,7 +862,6 @@ def main():
             args.ask,
             trade_date=args.date,
             debug=args.debug,
-            use_autogen=not args.no_autogen,
             store_memory=not args.no_conversation_memory,
         ))
         return
@@ -827,7 +897,6 @@ def main():
                 args.sector,
                 args.date,
                 question=f"{args.sector}板块是否适合买ETF？",
-                use_autogen=not args.no_autogen,
                 store_memory=not args.no_conversation_memory,
                 refresh_cache=args.refresh_scan_cache,
             ))
@@ -839,12 +908,16 @@ def main():
                 force=args.force,
                 json_output=args.json,
                 refresh_cache=args.refresh_scan_cache,
-                use_autogen=not args.no_autogen,
             ))
         return
 
     if args.refresh_cache:
-        print(refresh_local_cache(args.date, output_dir=args.output_dir, force_news=args.force_news))
+        print(refresh_local_cache(
+            args.date,
+            output_dir=args.output_dir,
+            cache_days=args.cache_days,
+            force_news=args.force_news,
+        ))
         return
 
     if args.refresh_etf_cache:
@@ -861,10 +934,10 @@ def main():
         print(backtest_portfolio(args.signals_file, args.price_file))
         return
 
-    if args.data_agent:
+    if args.full_analysis:
         if not args.ticker:
-            parser.error("--data-agent requires --ticker")
-        print(run_standalone_data_agent(
+            parser.error("--full-analysis requires --ticker")
+        print(run_full_data_analysis(
             args.ticker,
             trade_date=args.date,
             start_date=args.start_date,
@@ -872,8 +945,13 @@ def main():
             output_dir=args.output_dir,
             use_react_planner=args.react_planner,
             news_keyword=args.news_keyword,
+            sector_keyword=args.sector,
             use_llm_news_filter=not args.no_llm_news_filter,
+            use_llm_data_review=args.llm_data_review,
             fetch_news_full_text=not args.no_news_full_text,
+            skip_backtest=args.skip_backtest,
+            lookback_days=args.lookback_days,
+            compact=not args.json,
         ))
         return
 
@@ -891,15 +969,6 @@ def main():
             print(list_strategy_audit_queue())
         return
 
-    if args.scan:
-        parser.error("旧个股扫描入口已下线；请使用 --sector-etf-analyze 生成板块 ETF 观察池")
-
-    if args.batch:
-        parser.error("旧个股批量分析入口已下线；ETF 观察池按板块批量生成")
-
-    if args.ticker:
-        parser.error("旧个股买入分析入口已下线；个股数据仅作为板块 ETF 证据源保留")
-
     print(analyze_sector_etf_watchlist(
         args.date,
         max_roundtable_sectors=8,
@@ -907,7 +976,6 @@ def main():
         force=args.force,
         json_output=args.json,
         refresh_cache=args.refresh_scan_cache,
-        use_autogen=not args.no_autogen,
     ))
 
 

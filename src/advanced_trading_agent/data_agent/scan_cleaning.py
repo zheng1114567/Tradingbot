@@ -126,6 +126,8 @@ def records_from_frame(df: pd.DataFrame, limit: int | None = None) -> list[dict[
 
 
 def json_safe_value(value: Any) -> Any:
+    if isinstance(value, np.bool_):
+        return bool(value)
     try:
         if pd.isna(value):
             return None
@@ -137,8 +139,6 @@ def json_safe_value(value: Any) -> Any:
         return int(value)
     if isinstance(value, np.floating):
         return float(value)
-    if isinstance(value, (np.integer,)):
-        return int(value)
     return value
 
 
@@ -169,8 +169,10 @@ def _detect_direction(title: str, summary: str, full_text: Any) -> str:
     if bear_score > bull_score + 1:
         return "利空"
     if bull_score > 0 and bull_score == bear_score:
+        return "中性"
+    if bull_score > 0:
         return "中性偏多"
-    if bear_score > 0 and bull_score == bear_score:
+    if bear_score > 0:
         return "中性偏空"
     return "中性"
 

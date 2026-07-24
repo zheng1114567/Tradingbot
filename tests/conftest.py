@@ -6,9 +6,10 @@ import pytest
 
 @pytest.fixture(autouse=True)
 def disable_vendor_throttle_sleep(monkeypatch):
-    """Keep vendor-throttle tests deterministic and fast."""
+    """Keep tests deterministic, offline, and fast."""
     from advanced_trading_agent.data_agent import vendor_throttle
 
+    monkeypatch.setenv("ATA_DISABLE_LLM", "1")
     vendor_throttle.reset_vendor_throttle()
     monkeypatch.setattr(vendor_throttle.time, "sleep", lambda _seconds: None)
     yield

@@ -167,6 +167,16 @@ class TestFactors:
         assert result.iloc[-1]["turnover"] == pytest.approx(0.025)
         assert result.iloc[-1]["amihud"] == pytest.approx(0.00001)
 
+    def test_composite_score_public_contract_is_0_to_10(self):
+        df = pd.DataFrame({
+            "close": [10.0 + i for i in range(25)],
+            "pct_chg": [1.0] * 25,
+            "amount": [1000000.0] * 25,
+        })
+        result = FactorCalculator.run_all(df.copy())
+        assert "composite_raw" in result.columns
+        assert 0 <= result.iloc[-1]["composite_score"] <= 10
+        assert result.iloc[-1]["composite_score"] > 1
 
 class TestVendorRouter:
     """测试供应商路由"""

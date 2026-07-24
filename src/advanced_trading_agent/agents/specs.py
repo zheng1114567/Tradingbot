@@ -11,6 +11,15 @@ from typing import Any
 
 from ..tool_nodes.registry import get_allowed_tool_names
 
+
+_AGENT_KEY_ALIASES: dict[str, str] = {
+    "hotmoney": "hot_money",
+    "hot_money": "hot_money",
+    "riskmanager": "risk",
+    "risk_manager": "risk",
+}
+
+
 @dataclass(frozen=True)
 class AgentSkillSpec:
     """Prompt contract for one project agent."""
@@ -69,6 +78,21 @@ AGENT_SKILLS: dict[str, AgentSkillSpec] = {
         ),
         roundtable_focus="样本量、胜率、超额收益、统计可靠性",
     ),
+    "risk": AgentSkillSpec(
+        key="risk",
+        display_name="Risk Manager",
+        fallback_system_prompt=(
+            "你是 A 股风险经理。硬风控、流动性、涨跌停、冲击成本和数据质量优先于收益叙事。"
+            "你需要在一个角色内同时做激进/中性/保守三视角复核，并报告最严格的阻断项。"
+            "你只能提出 neutral/downgrade/veto，不得提出 upgrade 或买入理由。"
+        ),
+        react_prompt=(
+            "你是 A 股风险经理。审查硬风控、软风控、仓位、流动性、冲击成本和数据缺口。"
+            "按激进/中性/保守三视角复核同一交易，输出最严格且可审计的风险约束。"
+            "任何硬风控失败必须 veto；证据不足必须降级。"
+        ),
+        roundtable_focus="硬风控、软风控、流动性、冲击成本、仓位上限、数据质量 veto",
+    ),
     # ── A-share specialist participants (Phase 0.5+) ────────────
     "hot_money": AgentSkillSpec(
         key="hot_money",
@@ -119,15 +143,23 @@ ROUNDTABLE_RULES = (
     "如果证据缺失，必须明确说“数据不足”，不得补造外部数据。",
     "必须回应矛盾点，并说明对最终裁定的影响: upgrade/neutral/downgrade。",
     "引用共享证据板时使用 [ev_xxxxx] ID，以方便 Moderator 追溯。",
+    "Risk Manager 只能输出 neutral 或 downgrade；硬风控失败时必须明确 veto。",
 )
 
 
 def get_agent_skill(agent_key: str) -> AgentSkillSpec:
     """Return the prompt contract for an agent key."""
-    normalized = agent_key.lower()
+    normalized = normalize_agent_key(agent_key)
     if normalized not in AGENT_SKILLS:
         raise KeyError(f"Unknown agent skill: {agent_key}")
     return AGENT_SKILLS[normalized]
+
+
+def normalize_agent_key(agent_key: str) -> str:
+    """Normalize display names such as HotMoney into registry keys."""
+    normalized = agent_key.strip().replace(" Agent", "").replace(" Specialist", "")
+    normalized = normalized.replace(" ", "_").replace("-", "_").lower()
+    return _AGENT_KEY_ALIASES.get(normalized, normalized)
 
 
 def build_roundtable_system_message(
@@ -141,7 +173,7 @@ def build_roundtable_system_message(
 ) -> str:
     """Build the Round 2 scoped system message from the shared skill rules."""
     skill = get_agent_skill(agent)
-    allowed_tools = ", ".join(get_allowed_tool_names(agent.lower()))
+    allowed_tools = ", ".join(get_allowed_tool_names(skill.key))
     board_text = ""
     if evidence_board:
         formatted = "\n".join(
@@ -151,10 +183,12 @@ def build_roundtable_system_message(
 
     rules = "\n".join(f"{idx}. {rule}" for idx, rule in enumerate(ROUNDTABLE_RULES, 1))
     return f"""你是 {skill.display_name}，参加 Round 2 圆桌会议。
+你的唯一身份是 {skill.display_name}；禁止自称或扮演其他 Agent、Moderator、System、Risk Manager 或 Portfolio Manager。
+回复第一行必须写: role={skill.display_name}。
 
 边界规则:
 {rules}
-6. 如果需要调用工具，只能使用当前角色白名单内已注册工具；禁止调用任何未注册工具。{board_text}
+7. 如果需要调用工具，只能使用当前角色白名单内已注册工具；禁止调用任何未注册工具。{board_text}
 
 关注范围: {skill.roundtable_focus}
 

@@ -119,10 +119,21 @@ class SoftRiskController:
         return SoftRiskAssessment(signal=SignalType.BUY)
 
     def check_invalid_conditions(self, conditions: list[str],
-                                   current_state: dict[str, Any]) -> SoftRiskAssessment:
-        """检查失效条件是否触发"""
+                                   current_state: dict[str, Any],
+                                   llm: Any = None) -> SoftRiskAssessment:
+        """检查失效条件是否触发
+
+        数值条件由确定性规则检查；自然语言条件（政策、舆情等）
+        通过 LLM 评估 current_state 中的事件和新闻数据。
+
+        Args:
+            conditions: 失效条件文案列表
+            current_state: 包含 events、price_change、volume_change、index_change 等字段
+            llm: 可选的 LLMClient，用于自然语言条件判断
+        """
         triggered = []
-        # 规则的失效条件检查 (每个条件需自定义判断逻辑)
+        llm_candidates: list[str] = []
+
         for condition in conditions:
             if "放量下跌" in condition:
                 if (current_state.get("volume_change", 0) > 1.5 and
@@ -131,26 +142,90 @@ class SoftRiskController:
             elif "大盘" in condition and "跌破" in condition:
                 if current_state.get("index_change", 0) < -0.05:
                     triggered.append(condition)
-            elif "政策" in condition and "低于预期" in condition:
-                triggered.append(condition)  # 需要 LLM 判断
+            elif "政策" in condition or "低于预期" in condition or "舆情" in condition or "负面" in condition:
+                llm_candidates.append(condition)
+            elif "涨幅" in condition and "过高" in condition:
+                if current_state.get("price_change", 0) > 0.15:
+                    triggered.append(condition)
+
+        # LLM 评估需要自然语言理解的失效条件
+        if llm_candidates and llm is not None:
+            llm_verdicts = self._evaluate_conditions_with_llm(
+                llm_candidates, current_state, llm
+            )
+            triggered.extend(llm_verdicts)
+        elif llm_candidates:
+            # 无 LLM 可用时，对政策/舆情类条件保守处理：存在即提示，但标记低置信度
+            triggered.extend(llm_candidates)
 
         if triggered:
             return SoftRiskAssessment(
                 signal=SignalType.REDUCE,
-                confidence=0.7,
+                confidence=0.7 if (llm is not None and llm_candidates) else 0.55,
                 reasons=triggered,
                 triggered_invalid_conditions=triggered,
                 suggested_actions=["失效条件触发, 考虑减仓或退出"],
             )
         return SoftRiskAssessment(signal=SignalType.BUY)
 
+    @staticmethod
+    def _evaluate_conditions_with_llm(
+        conditions: list[str],
+        state: dict[str, Any],
+        llm: Any,
+    ) -> list[str]:
+        """Use LLM to judge whether policy/news conditions are triggered.
+
+        Returns the subset of conditions that the LLM considers active.
+        """
+        events = state.get("events", []) or []
+        news_text = state.get("news_summary", "")
+        if not events and not news_text:
+            return conditions  # conservative: trigger if we have conditions but no data
+
+        event_snippets = []
+        for ev in events[:10]:
+            title = str(ev.get("title") or ev.get("headline") or "")
+            direction = str(ev.get("direction") or ev.get("sentiment") or "")
+            if title:
+                event_snippets.append(f"- [{direction}] {title[:120]}")
+
+        prompt = (
+            "你是一个 A 股量化交易系统的失效条件评估器。\n"
+            "根据当前事件和新闻数据，判断以下失效条件是否已经触发。\n"
+            "只返回一个 JSON 数组，包含已触发的条件原文，不要输出其他内容。\n"
+            "如果条件没有触发，返回空数组 []。\n"
+            "触发标准：事件或新闻中明确出现了对应条件的证据。\n"
+            f"\n失效条件清单:\n"
+            f"{chr(10).join(f'- {c}' for c in conditions)}\n"
+            f"\n当前事件摘要:\n"
+            f"{chr(10).join(event_snippets) if event_snippets else '无事件数据'}\n"
+            f"\n新闻摘要: {news_text[:800] if news_text else '无'}"
+        )
+
+        try:
+            raw = llm.chat(
+                [("system", "只返回 JSON 数组，不要解释"), ("human", prompt)],
+                temperature=0,
+                max_tokens=256,
+            )
+            import json
+            parsed = json.loads(str(raw).strip())
+            if isinstance(parsed, list):
+                return [c for c in conditions if any(c in str(item) for item in parsed)]
+        except Exception:
+            pass
+
+        return conditions  # conservative fallback on LLM error
+
     def assess_all(self, holding_days: int = 0,
                     current_return: float = 0,
                     portfolio_drawdown: float = 0,
                     half_life_days: int | None = None,
                     invalid_conditions: list[str] | None = None,
-                    current_state: dict[str, Any] | None = None) -> SoftRiskAssessment:
-        """综合软风控评估"""
+                    current_state: dict[str, Any] | None = None,
+                    llm: Any = None) -> SoftRiskAssessment:
+        """综合软风控评估 — 支持 LLM 辅助评估自然语言失效条件"""
         checks = [
             self.check_stop_loss(current_return),
             self.check_take_profit(current_return),
@@ -160,7 +235,7 @@ class SoftRiskController:
         if half_life_days is not None:
             checks.append(self.check_half_life(half_life_days, holding_days))
         if invalid_conditions and current_state:
-            checks.append(self.check_invalid_conditions(invalid_conditions, current_state))
+            checks.append(self.check_invalid_conditions(invalid_conditions, current_state, llm=llm))
 
         # 取最差信号
         signal_priority = {

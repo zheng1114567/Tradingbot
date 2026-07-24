@@ -173,14 +173,9 @@ class NewsFilter:
 
 
 def llm_news_filter_configured(llm: Any) -> bool:
-    provider = str(getattr(llm, "provider", "deepseek")).upper()
-    if provider == "DEEPSEEK":
-        return bool(os.environ.get("DEEPSEEK_API_KEY"))
-    if provider == "OPENAI":
-        return bool(os.environ.get("OPENAI_API_KEY"))
-    if provider == "ANTHROPIC":
-        return bool(os.environ.get("ANTHROPIC_API_KEY"))
-    return bool(os.environ.get(f"{provider}_API_KEY"))
+    from ..llm.client import llm_api_key_configured
+
+    return llm_api_key_configured(str(getattr(llm, "provider", "qwen")))
 
 
 def ask_llm_to_filter_news(

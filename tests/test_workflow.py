@@ -14,6 +14,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from advanced_trading_agent.agents.schemas import (
+    AnalysisReport,
     BacktestReport,
     Confidence,
     DecisionType,
@@ -21,7 +22,9 @@ from advanced_trading_agent.agents.schemas import (
     MarketReport,
     RiskVerdict,
     SystemDecision,
+    StockRanking,
 )
+from advanced_trading_agent.agents.system_agent import create_system_agent
 from advanced_trading_agent.graph.workflow import create_workflow, TradingSystem
 from advanced_trading_agent.graph.state import AgentState
 
@@ -327,3 +330,82 @@ class TestTradingSystemIntegration:
         ]
         for key in required_keys:
             assert key in hints, f"AgentState 类型注解缺少 key: {key}"
+
+
+class TestSystemFinalDecisionRiskOverrides:
+    def test_risk_check_2_hard_veto_overrides_llm_recommendation(self):
+        class RecommendLLM:
+            def chat(self, *args, **kwargs):
+                return SystemDecision(
+                    decision=DecisionType.RECOMMEND,
+                    position=0.1,
+                    alpha_source=["event"],
+                    reasons=["LLM 推荐"],
+                    objections=[],
+                    risk_verdict=RiskVerdict.PASS,
+                    risk_details=[],
+                    reasoning="mock",
+                )
+
+        final_node = create_system_agent(RecommendLLM())["final"]
+        state = make_base_state(
+            market_report_obj=MarketReport(
+                market_state="正常",
+                position_cap=0.6,
+                capital_confirmation="资金确认",
+                reasoning="ok",
+            ),
+            event_report_obj=EventReport(
+                event_id="e1",
+                event_type="政策",
+                direction="利好",
+                confidence=0.8,
+                transmission_path="direct",
+                direct_beneficiaries=["000001.SZ"],
+                evidence_level="权威媒体",
+                pricing_status="未定价",
+                chain_quality="direct",
+                reasoning="ok",
+            ),
+            analysis_report_obj=AnalysisReport(
+                sector_score=8,
+                stock_rankings=[
+                    StockRanking(
+                        code="000001.SZ",
+                        name="平安银行",
+                        composite_score=8,
+                        main_driver="momentum",
+                    )
+                ],
+                factor_explanation="ok",
+                reasoning="ok",
+            ),
+            backtest_report_obj=BacktestReport(
+                sample_size=40,
+                win_rate=0.6,
+                avg_excess_return=0.03,
+                confidence=Confidence.HIGH,
+                reasoning="ok",
+            ),
+            risk_check_1={"verdict": "PASS", "reasons": []},
+            risk_check_2={"verdict": "HARD_VETO", "reasons": ["涨停不可买入"]},
+            risk_check_3={"verdict": "PASS", "reasons": []},
+            tier1_data={
+                "risk": {
+                    "daily_volume": 50_000_000,
+                    "is_limit_up": False,
+                    "is_limit_down": False,
+                    "current_position": 0,
+                    "current_sector_position": 0,
+                    "proposed_position": 0.05,
+                }
+            },
+        )
+
+        result = final_node(state)
+        decision = result["system_decision_obj"]
+
+        assert decision.decision == DecisionType.REJECT
+        assert decision.risk_verdict == RiskVerdict.HARD_VETO
+        assert decision.position == 0
+        assert "涨停不可买入" in decision.risk_details

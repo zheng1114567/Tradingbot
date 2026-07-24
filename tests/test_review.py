@@ -77,6 +77,22 @@ def test_review_waits_until_horizon_is_available(tmp_path):
     assert store.load_entries()[0]["pending"] is True
 
 
+def test_review_does_not_resolve_with_prices_after_as_of(tmp_path):
+    path = tmp_path / "memory.md"
+    store = MemoryStore(log_path=str(path))
+    store.store_decision("000001.SZ", "2026-07-10", _decision())
+    reviewer = ReviewEngine(review_config={"review_horizons": [5]})
+
+    resolved = reviewer.resolve_due(
+        store,
+        price_loader=lambda ticker, signal_date: _prices(),
+        as_of="2026-07-14",
+    )
+
+    assert resolved == []
+    assert store.load_entries()[0]["pending"] is True
+
+
 def test_daily_review_writes_summary(tmp_path):
     path = tmp_path / "memory.md"
     queue_path = tmp_path / "audit.jsonl"

@@ -6,6 +6,8 @@ from typing import Any
 
 import pandas as pd
 
+from .trading_calendar import resolve_market_trade_date
+
 
 def build_daily_health_report(
     records: list[dict[str, Any]],
@@ -133,7 +135,7 @@ def run_data_source_health(
     """
     from .vendor_router import route_to_vendor
 
-    td = trade_date or date.today().isoformat()
+    td = resolve_market_trade_date(trade_date)
     route = route_fn or route_to_vendor
     probes = [
         {
@@ -197,9 +199,23 @@ def run_data_source_health(
         overall = "degraded"
     else:
         overall = "unavailable"
+    news_probe_names = ("ticker_news", "sector_news")
+    news_ok = sum(1 for name in news_probe_names if results.get(name, {}).get("status") == "ok")
+    daily_rows = int(results.get("a_share_daily", {}).get("row_count") or 0)
     return {
+        "requested_date": trade_date or date.today().isoformat(),
         "trade_date": td,
+        "effective_trade_date": td,
         "overall_status": overall,
+        "coverage": {
+            "daily_probe_rows": daily_rows,
+            "daily_coverage_status": "ok" if daily_rows else "missing",
+            "news_probe_count": len(news_probe_names),
+            "news_ok_count": news_ok,
+            "news_coverage_status": "ok" if news_ok == len(news_probe_names) else "partial" if news_ok else "missing",
+            "ticker_news_status": results.get("ticker_news", {}).get("status", "unavailable"),
+            "sector_news_status": results.get("sector_news", {}).get("status", "unavailable"),
+        },
         "probes": results,
     }
 
@@ -219,7 +235,7 @@ def refresh_etf_cache(
     """
     from .vendor_router import route_to_vendor
 
-    td = trade_date or date.today().isoformat()
+    td = resolve_market_trade_date(trade_date)
     route = route_fn or route_to_vendor
     trace: list[dict[str, Any]] = []
     spot_error: str | None = None

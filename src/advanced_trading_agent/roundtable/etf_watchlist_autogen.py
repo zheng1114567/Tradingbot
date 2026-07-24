@@ -16,6 +16,7 @@ from ..data_agent.etf_watchlist import (
     RoundtableDialogueTurn,
     SectorCandidatePayload,
 )
+from ..llm.client import openai_compatible_model_info, resolve_openai_compatible_settings
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +42,8 @@ class ETFWatchlistAutoGenResult:
     raw_messages: list[dict[str, Any]] = field(default_factory=list)
     final_decisions: list[dict[str, Any]] = field(default_factory=list)
     excluded_by_roundtable: list[dict[str, Any]] = field(default_factory=list)
+    llm_provider: str = ""
+    model: str = ""
 
     def to_summary_dict(self) -> dict[str, Any]:
         return {
@@ -54,6 +57,8 @@ class ETFWatchlistAutoGenResult:
             "raw_messages": self.raw_messages,
             "final_decisions": self.final_decisions,
             "excluded_by_roundtable": self.excluded_by_roundtable,
+            "llm_provider": self.llm_provider,
+            "model": self.model,
             "note": "AutoGen batch roundtable; no backtest is used for ETF watchlist decisions.",
         }
 
@@ -66,42 +71,55 @@ class ETFWatchlistAutoGenRoundtable:
         *,
         model: str | None = None,
         provider: str | None = None,
-        timeout_seconds: float = 90.0,
-        max_turns: int = 5,
+        timeout_seconds: float | None = None,
+        max_turns: int | None = None,
     ) -> None:
         cfg = config.get_all()
         self.provider = provider or cfg.get("llm_provider", "deepseek")
         self.model = model or cfg.get("deep_think_llm", "deepseek-chat")
-        self.timeout_seconds = timeout_seconds
-        self.max_turns = max_turns
+        self.timeout_seconds = (
+            timeout_seconds if timeout_seconds is not None else cfg.get("autogen_timeout", 120.0)
+        )
+        self.max_turns = max_turns or cfg.get("autogen_max_turns", 20)
 
     def run(
         self,
         *,
         trade_date: str,
         candidates: list[SectorCandidatePayload],
-        max_final_decisions: int,
+        max_final_decisions: int = 3,
     ) -> ETFWatchlistAutoGenResult:
-        try:
-            asyncio.get_running_loop()
-        except RuntimeError:
-            return asyncio.run(asyncio.wait_for(
-                self._run_async(
-                    trade_date=trade_date,
-                    candidates=candidates,
-                    max_final_decisions=max_final_decisions,
-                ),
-                timeout=self.timeout_seconds,
-            ))
-        raise RuntimeError("ETF AutoGen roundtable cannot run inside an active event loop")
+        """Run AutoGen roundtable synchronously (wraps async)."""
+        if not candidates:
+            return ETFWatchlistAutoGenResult(summary="没有可进入圆桌的 ETF 板块候选。")
 
-    async def _run_async(
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+
+        if loop and loop.is_running():
+            raise RuntimeError("ETF AutoGen roundtable cannot run inside an active event loop")
+
+        return asyncio.run(
+            self._run_autogen_roundtable(
+                trade_date=trade_date,
+                candidates=candidates,
+                max_final_decisions=max_final_decisions,
+            )
+        )
+
+    async def _run_autogen_roundtable(
         self,
         *,
         trade_date: str,
         candidates: list[SectorCandidatePayload],
-        max_final_decisions: int,
+        max_final_decisions: int = 3,
     ) -> ETFWatchlistAutoGenResult:
+        """Async core: create agents, run roundtable, parse output."""
+        if not candidates:
+            return ETFWatchlistAutoGenResult(summary="没有可进入圆桌的 ETF 板块候选。")
+
         from autogen_agentchat.agents import AssistantAgent
         from autogen_agentchat.teams import RoundRobinGroupChat
         from autogen_ext.models.openai import OpenAIChatCompletionClient
@@ -110,287 +128,292 @@ class ETFWatchlistAutoGenRoundtable:
         logging.getLogger("autogen_core.events").setLevel(logging.WARNING)
         logging.getLogger("autogen_agentchat").setLevel(logging.WARNING)
 
-        if not candidates:
-            return ETFWatchlistAutoGenResult(summary="没有可进入圆桌的 ETF 板块候选。")
+        model_client = self._build_model_client()
+        agents = self._build_agents(model_client, trade_date, candidates)
+        team = RoundRobinGroupChat(agents, max_turns=self.max_turns)
 
-        model_client = self._create_model_client(OpenAIChatCompletionClient)
+        raw_messages: list[dict[str, Any]] = []
         try:
-            agents = [
-                AssistantAgent(
-                    "Market_Agent",
-                    model_client=model_client,
-                    system_message=(
-                        "你是 Market Agent。只讨论板块强度、动量、宽度和市场状态。"
-                        "逐板块指出支持/谨慎/反对，必须引用输入里的分数字段。"
-                    ),
-                ),
-                AssistantAgent(
-                    "Event_Agent",
-                    model_client=model_client,
-                    system_message=(
-                        "你是 Event Agent。只讨论新闻、事件催化和证伪条件。"
-                        "不能编造新闻；缺少事件时必须明确降级理由。"
-                    ),
-                ),
-                AssistantAgent(
-                    "Analysis_Agent",
-                    model_client=model_client,
-                    system_message=(
-                        "你是 Analysis Agent。只讨论 ETF 候选、首选 ETF、备选 ETF、"
-                        "匹配度、流动性和跟踪纯度。每个板块必须落到首选 ETF。"
-                    ),
-                ),
-                AssistantAgent(
-                    "Risk_Agent",
-                    model_client=model_client,
-                    system_message=(
-                        "你是 Risk Agent。只讨论流动性、停牌/涨跌停、映射不确定、组合上限和人工审批。"
-                        "不要使用回测，不要给出自动交易许可。"
-                    ),
-                ),
-                AssistantAgent(
-                    "System_Moderator",
-                    model_client=model_client,
-                    system_message=(
-                        "你是 System Moderator。你要综合四个 Agent 的发言，"
-                        "给出最终保留的 Top ETF 板块排序、每个板块的首选 ETF、主要理由和反对意见。"
-                        "你最后必须输出一个 JSON 对象，字段为 final_decisions 和 excluded_by_roundtable，"
-                        "final_decisions 每项必须包含 sector/status/primary_etf_code/support_reasons/objections/confidence。"
-                        "JSON 之后结尾必须写 TERMINATE。"
-                    ),
-                ),
-            ]
-            team = RoundRobinGroupChat(agents, max_turns=self.max_turns)
-            result = await team.run(task=self._build_task(
-                trade_date=trade_date,
-                candidates=candidates,
-                max_final_decisions=max_final_decisions,
-            ))
-            messages = self._extract_messages(result)
-            return self._to_result(messages, candidates=candidates)
-        finally:
-            await model_client.close()
-
-    def _create_model_client(self, client_cls: type) -> Any:
-        if self.provider == "deepseek":
-            api_key = os.environ.get("DEEPSEEK_API_KEY")
-            if not api_key:
-                raise RuntimeError("DEEPSEEK_API_KEY is not set")
-            return client_cls(
-                model=self.model,
-                api_key=api_key,
-                base_url="https://api.deepseek.com/v1",
-                model_info={
-                    "vision": False,
-                    "function_calling": True,
-                    "json_output": False,
-                    "family": "unknown",
-                    "structured_output": False,
-                },
+            async for event in team.run_stream():
+                raw_messages.append(self._serialize_event(event))
+        except Exception as exc:
+            logger.error("AutoGen roundtable stream failed: %s", exc)
+            return ETFWatchlistAutoGenResult(
+                summary=f"AutoGen roundtable failed: {exc}",
+                raw_messages=raw_messages,
             )
-        if self.provider == "openai":
-            api_key = os.environ.get("OPENAI_API_KEY")
-            if not api_key:
-                raise RuntimeError("OPENAI_API_KEY is not set")
-            return client_cls(model=self.model, api_key=api_key)
 
-        api_key = os.environ.get(f"{self.provider.upper()}_API_KEY")
-        base_url = os.environ.get(f"{self.provider.upper()}_BASE_URL")
-        if not api_key or not base_url:
-            raise RuntimeError(f"{self.provider} API key/base URL is not configured")
-        return client_cls(
+        return self._parse_output(raw_messages, candidates, max_final_decisions)
+
+    def _build_model_client(self) -> OpenAIChatCompletionClient:
+        """Create an OpenAI-compatible model client for AutoGen."""
+        settings = resolve_openai_compatible_settings(self.provider)
+        model_info = openai_compatible_model_info(settings["base_url"])
+        return OpenAIChatCompletionClient(
             model=self.model,
-            api_key=api_key,
-            base_url=base_url,
-            model_info={
-                "vision": False,
-                "function_calling": True,
-                "json_output": False,
-                "family": "unknown",
-                "structured_output": False,
-            },
+            base_url=settings["base_url"],
+            api_key=settings.get("api_key") or os.environ.get(settings.get("api_key_env", "")),
+            model_info=model_info,
         )
 
-    @staticmethod
-    def _build_task(
-        *,
+    def _build_agents(
+        self,
+        model_client: OpenAIChatCompletionClient,
         trade_date: str,
         candidates: list[SectorCandidatePayload],
+    ) -> list[AssistantAgent]:
+        """Build the four specialist agents plus moderator."""
+        candidate_summary = "\n\n".join(
+            f"## 候选 {i + 1}: {c.sector}\n"
+            f"  热度排名: {c.hot_rank}\n"
+            f"  板块涨跌幅: {c.sector_change_pct:+.2f}%\n"
+            f"  资金流向: {c.capital_flow_summary or 'N/A'}\n"
+            f"  主要ETF: {', '.join(f'{e.code} {e.name}' for e in c.etf_candidates[:2])}\n"
+            for i, c in enumerate(candidates)
+        )
+
+        system_context = (
+            f"当前交易日: {trade_date}\n"
+            f"最大最终决策数: {max_final_decisions}\n\n"
+            f"## 候选板块一览\n{candidate_summary}"
+        )
+
+        market_agent = AssistantAgent(
+            name="Market_Agent",
+            model_client=model_client,
+            system_message=(
+                "你是 Market Agent，负责从市场情绪和资金面角度评估板块。\n"
+                f"{system_context}\n"
+                "评估标准：板块热度、资金流入强度、市场情绪阶段。\n"
+                "输出建议保留/排除的板块及理由。"
+            ),
+        )
+
+        event_agent = AssistantAgent(
+            name="Event_Agent",
+            model_client=model_client,
+            system_message=(
+                "你是 Event Agent，负责从事件驱动角度评估板块。\n"
+                f"{system_context}\n"
+                "评估标准：近期政策催化、行业事件、新闻情绪。\n"
+                "输出建议保留/排除的板块及理由。"
+            ),
+        )
+
+        analysis_agent = AssistantAgent(
+            name="Analysis_Agent",
+            model_client=model_client,
+            system_message=(
+                "你是 Analysis Agent，负责从因子和技术面角度评估板块。\n"
+                f"{system_context}\n"
+                "评估标准：动量因子、拥挤度、估值分位、技术形态。\n"
+                "输出建议保留/排除的板块及理由。"
+            ),
+        )
+
+        risk_agent = AssistantAgent(
+            name="Risk_Agent",
+            model_client=model_client,
+            system_message=(
+                "你是 Risk Agent，负责从风控角度评估板块。\n"
+                f"{system_context}\n"
+                "评估标准：ETF流动性、溢折价、停牌风险、板块集中度。\n"
+                "你有否决权：如果某板块的ETF不可交易或风险过高，应排除。"
+            ),
+        )
+
+        moderator = AssistantAgent(
+            name="System_Moderator",
+            model_client=model_client,
+            system_message=(
+                "你是 Moderator，负责综合 Market、Event、Analysis、Risk 四方的意见，"
+                "做出最终决策。\n"
+                f"{system_context}\n"
+                "输出最终决策时请按优先级列出选中的板块及每个板块对应的首选ETF。"
+            ),
+        )
+
+        return [market_agent, event_agent, analysis_agent, risk_agent, moderator]
+
+    def _parse_output(
+        self,
+        raw_messages: list[dict[str, Any]],
+        candidates: list[SectorCandidatePayload],
         max_final_decisions: int,
-    ) -> str:
-        payload = []
-        for candidate in candidates:
-            payload.append({
-                "sector_name": candidate.sector_name,
-                "pre_score": candidate.pre_score,
-                "momentum_score": candidate.momentum_score,
-                "breadth_score": candidate.breadth_score,
-                "event_score": candidate.event_score,
-                "support_evidence": candidate.support_evidence[:6],
-                "risk_flags": candidate.risk_flags,
-                "etf_candidates": [
-                    {
-                        "code": etf.code,
-                        "name": etf.name,
-                        "match_score": etf.match_score,
-                        "liquidity_score": etf.liquidity_score,
-                        "tracking_purity_score": etf.tracking_purity_score,
-                        "total_score": etf.total_score,
-                        "reason": etf.reason,
-                        "blocked_reasons": etf.blocked_reasons,
-                    }
-                    for etf in candidate.raw_etf_candidates[:3]
-                ],
-            })
-        return (
-            f"请召开 A 股板块 ETF 批量圆桌会议。交易日: {trade_date}\n"
-            f"最终最多保留 {max_final_decisions} 个板块，每个板块必须有首选 ETF。\n"
-            "不要使用回测，不要允许自动执行交易。请逐个 Agent 发言，最后 Moderator 总结。\n"
-            "Moderator 最后必须输出严格 JSON，格式如下:\n"
-            "{\n"
-            '  "final_decisions": [\n'
-            "    {\n"
-            '      "sector": "板块名",\n'
-            '      "status": "active|monitor",\n'
-            '      "primary_etf_code": "ETF代码",\n'
-            '      "support_reasons": ["理由1", "理由2"],\n'
-            '      "objections": ["反对意见或风险"],\n'
-            '      "confidence": "high|medium|low"\n'
-            "    }\n"
-            "  ],\n"
-            '  "excluded_by_roundtable": [\n'
-            '    {"sector": "板块名", "reason": "圆桌否决理由"}\n'
-            "  ]\n"
-            "}\n"
-            "候选 JSON:\n"
-            f"{json.dumps(payload, ensure_ascii=False, indent=2)}"
+    ) -> ETFWatchlistAutoGenResult:
+        """Parse AutoGen raw messages into structured result."""
+        summary = ""
+        for msg in raw_messages:
+            content = msg.get("content", "")
+            if isinstance(content, str) and len(content) > len(summary):
+                summary = content
+
+        # Extract JSON decision blocks from moderator output
+        final_decisions: list[dict[str, Any]] = []
+        excluded_by_roundtable: list[dict[str, Any]] = []
+        moderator_messages = [
+            m for m in raw_messages
+            if m.get("source") == "System_Moderator" and isinstance(m.get("content"), str)
+        ]
+        for msg in moderator_messages[-3:]:
+            content: str = msg.get("content", "")
+            for candidate in self._json_object_candidates(content):
+                sector_name = candidate.get("sector", "").strip()
+                action = candidate.get("action", "").strip().lower()
+                matched = [c for c in candidates if c.sector == sector_name]
+                entry = {
+                    "sector": sector_name,
+                    "action": action,
+                    "primary_etf": candidate.get("primary_etf", ""),
+                    "reason": candidate.get("reason", ""),
+                }
+                if action in ("exclude", "排除"):
+                    excluded_by_roundtable.append(entry)
+                else:
+                    final_decisions.append(entry)
+
+        agent_outputs = self._coerce_agent_outputs(raw_messages)
+        dialogue = self._coerce_dialogue_records(raw_messages)
+
+        structured = self._extract_structured_summary(summary)
+        return ETFWatchlistAutoGenResult(
+            provider="autogen",
+            mode="autogen_batch_roundtable",
+            summary=structured.get("summary", summary[:2000]) if summary else "",
+            agent_outputs=agent_outputs,
+            dialogue_records=dialogue,
+            raw_messages=raw_messages,
+            final_decisions=final_decisions[:max_final_decisions],
+            excluded_by_roundtable=excluded_by_roundtable,
+            llm_provider=self.provider,
+            model=self.model,
         )
 
     @staticmethod
-    def _extract_messages(result: Any) -> list[dict[str, Any]]:
-        messages: list[dict[str, Any]] = []
-        for message in getattr(result, "messages", []):
-            source = getattr(message, "source", "") or getattr(message, "name", "")
-            content = getattr(message, "content", "")
-            if not source and not content:
+    def _serialize_event(event: Any) -> dict[str, Any]:
+        content = ""
+        if hasattr(event, "content"):
+            raw = event.content
+            if isinstance(raw, list):
+                content = " ".join(
+                    str(getattr(item, "text", str(item))) for item in raw
+                )
+            elif isinstance(raw, str):
+                content = raw
+            else:
+                content = str(raw)
+        source = ""
+        if hasattr(event, "source"):
+            source = event.source
+        return {
+            "type": type(event).__name__,
+            "source": source,
+            "content": content,
+        }
+
+    @staticmethod
+    def _json_object_candidates(content: str) -> list[dict[str, Any]]:
+        """Extract JSON-like sector decision objects from text."""
+        results = []
+        for match in re.finditer(
+            r'\{\s*"sector"\s*:\s*"[^"]*"\s*,\s*"action"\s*:\s*"[^"]*"\s*[^}]*\}',
+            content,
+        ):
+            try:
+                obj = json.loads(match.group())
+                if isinstance(obj, dict) and obj.get("sector") and obj.get("action"):
+                    results.append(obj)
+            except json.JSONDecodeError:
                 continue
-            messages.append({
-                "source": str(source),
-                "type": type(message).__name__,
-                "content": ETFWatchlistAutoGenRoundtable._stringify_content(content),
-            })
-        return messages
+        return results
 
     @staticmethod
     def _stringify_content(content: Any) -> str:
         if isinstance(content, str):
             return content
         if isinstance(content, list):
-            return "\n".join(str(getattr(item, "content", item)) for item in content)
+            return " ".join(str(item) for item in content)
         return str(content)
 
     @staticmethod
-    def _to_result(
-        messages: list[dict[str, Any]],
-        *,
-        candidates: list[SectorCandidatePayload],
-    ) -> ETFWatchlistAutoGenResult:
-        dialogue: list[RoundtableDialogueTurn] = []
-        agent_outputs: list[RoundtableAgentOutput] = []
-        candidate_names = [candidate.sector_name for candidate in candidates]
-        for idx, message in enumerate(messages, start=1):
-            speaker = _AGENT_SPEAKERS.get(str(message.get("source", "")))
-            if speaker is None:
-                continue
-            content = str(message.get("content", "")).strip()
-            if not content:
-                continue
-            dialogue.append(
-                RoundtableDialogueTurn(
-                    round=1,
-                    sector="batch",
-                    speaker=speaker,  # type: ignore[arg-type]
-                    message=content[:2000],
-                    references=candidate_names,
-                )
-            )
-            if speaker != "Moderator":
-                agent_outputs.append(
-                    RoundtableAgentOutput(
-                        agent=speaker,  # type: ignore[arg-type]
-                        sector="batch",
-                        stance=ETFWatchlistAutoGenRoundtable._infer_stance(content),
-                        summary=content[:500],
-                        evidence=candidate_names,
-                        objections=ETFWatchlistAutoGenRoundtable._extract_objections(content),
-                    )
-                )
-        summary = ""
-        for message in reversed(messages):
-            if message.get("source") == "System_Moderator":
-                summary = str(message.get("content", "")).strip()
-                break
-        if not summary:
-            summary = "\n".join(turn.message for turn in dialogue[-3:])
-        structured = ETFWatchlistAutoGenRoundtable._extract_structured_summary(summary)
-        return ETFWatchlistAutoGenResult(
-            summary=summary[:3000],
-            agent_outputs=agent_outputs,
-            dialogue_records=dialogue,
-            round_history=[{
-                "round": 1,
-                "sector": "batch",
-                "turn_count": len(dialogue),
-                "turns": [turn.model_dump(mode="json") for turn in dialogue],
-            }],
-            raw_messages=messages,
-            final_decisions=structured.get("final_decisions", []),
-            excluded_by_roundtable=structured.get("excluded_by_roundtable", []),
-        )
-
-    @staticmethod
-    def _extract_structured_summary(content: str) -> dict[str, list[dict[str, Any]]]:
-        """Extract the Moderator's final JSON object from free-form text."""
-        for candidate in ETFWatchlistAutoGenRoundtable._json_object_candidates(content):
-            try:
-                parsed = json.loads(candidate)
-            except json.JSONDecodeError:
-                continue
-            if not isinstance(parsed, dict):
-                continue
-            final_decisions = parsed.get("final_decisions")
-            excluded = parsed.get("excluded_by_roundtable")
-            if isinstance(final_decisions, list):
-                return {
-                    "final_decisions": [item for item in final_decisions if isinstance(item, dict)],
-                    "excluded_by_roundtable": [item for item in excluded if isinstance(item, dict)] if isinstance(excluded, list) else [],
-                }
-        return {"final_decisions": [], "excluded_by_roundtable": []}
-
-    @staticmethod
-    def _json_object_candidates(content: str) -> list[str]:
-        fenced = re.findall(r"```(?:json)?\s*(\{.*?\})\s*```", content, flags=re.DOTALL | re.IGNORECASE)
-        candidates = list(fenced)
-        start = content.find("{")
-        end = content.rfind("}")
-        if start != -1 and end != -1 and end > start:
-            candidates.append(content[start : end + 1])
-        return candidates
-
-    @staticmethod
     def _infer_stance(content: str) -> str:
-        if any(token in content for token in ("反对", "剔除", "不建议", "block", "veto")):
-            return "block"
-        if any(token in content for token in ("谨慎", "观察", "风险", "caution", "monitor")):
-            return "caution"
-        return "support"
+        lowered = content.lower()
+        pos_words = ["保留", "推荐", "看好", "positive", "保留/推荐", "建议保留"]
+        neg_words = ["排除", "不推荐", "不看好", "negative", "排除/不推荐", "建议排除"]
+        pos_score = sum(1 for w in pos_words if w in lowered)
+        neg_score = sum(1 for w in neg_words if w in lowered)
+        if pos_score > neg_score:
+            return "保留"
+        if neg_score > pos_score:
+            return "排除"
+        return "中性"
 
     @staticmethod
     def _extract_objections(content: str) -> list[str]:
         objections = []
-        for line in content.splitlines():
-            if any(token in line for token in ("风险", "反对", "不足", "剔除", "不建议")):
-                objections.append(line.strip("- 	")[:300])
-            if len(objections) >= 5:
-                break
-        return objections
+        for marker in ("风险", "担忧", "不足", "问题", "注意"):
+            if marker in content:
+                for sentence in re.split(r'[。！？\n]', content):
+                    if marker in sentence:
+                        s = sentence.strip()
+                        if s and len(s) > 4:
+                            objections.append(s)
+        return objections[:5]
+
+    @staticmethod
+    def _extract_structured_summary(summary: str) -> dict[str, Any]:
+        """Extract structured fields from moderator summary text."""
+        result: dict[str, Any] = {"summary": summary[:2000] if summary else ""}
+        patterns = {
+            "market_verdict": r"市场[：:](.+?)(?=\s|$)",
+            "final_action": r"(最终)?决策[：:](.+?)(?=\s|$)",
+        }
+        for key, pattern in patterns.items():
+            match = re.search(pattern, summary)
+            if match:
+                result[key] = match.group(1).strip()
+        return result
+
+    @staticmethod
+    def _coerce_agent_outputs(
+        raw_messages: list[dict[str, Any]],
+    ) -> list[RoundtableAgentOutput]:
+        """Coerce raw messages into structured agent outputs."""
+        outputs: list[RoundtableAgentOutput] = []
+        seen = set()
+        for msg in raw_messages:
+            source = msg.get("source", "")
+            display = _AGENT_SPEAKERS.get(source, source)
+            if display in seen:
+                continue
+            content = ETFWatchlistAutoGenRoundtable._stringify_content(msg.get("content", ""))
+            if not content:
+                continue
+            stance = ETFWatchlistAutoGenRoundtable._infer_stance(content)
+            outputs.append(RoundtableAgentOutput(
+                agent=display,
+                stance=stance,
+                summary=content[:300],
+                objections=ETFWatchlistAutoGenRoundtable._extract_objections(content),
+                evidence_keys=[],
+            ))
+            seen.add(display)
+        return outputs
+
+    @staticmethod
+    def _coerce_dialogue_records(
+        raw_messages: list[dict[str, Any]],
+    ) -> list[RoundtableDialogueTurn]:
+        """Coerce raw messages into chronological dialogue turns."""
+        records: list[RoundtableDialogueTurn] = []
+        for idx, msg in enumerate(raw_messages, start=1):
+            source = msg.get("source", "")
+            content = ETFWatchlistAutoGenRoundtable._stringify_content(msg.get("content", ""))
+            if not content:
+                continue
+            records.append(RoundtableDialogueTurn(
+                turn=idx,
+                agent=_AGENT_SPEAKERS.get(source, source),
+                content=content[:500],
+            ))
+        return records

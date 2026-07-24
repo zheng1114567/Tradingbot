@@ -1,21 +1,23 @@
 """
-LLM 客户端 — 多供应商支持 (DeepSeek, OpenAI, Anthropic)
+LLM 客户端 — 多供应商支持 (Qwen, DeepSeek, OpenAI, Anthropic)
 
 借鉴 TradingAgents 的 llm_clients/*.py 模式,
-但简化了配置, 默认使用 DeepSeek。
+但简化了配置, 默认使用 Qwen。
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
-import json
 from collections.abc import Sequence
+from dataclasses import dataclass
 from typing import Any
 
 from openai import BadRequestError
 from openai import OpenAI
 
 from ..config import config
+from .provider_registry import first_env_value, provider_spec, resolve_base_url
 
 logger = logging.getLogger(__name__)
 
@@ -25,10 +27,54 @@ _ROLE_ALIASES = {
     "ai": "assistant",
 }
 
+@dataclass(frozen=True)
+class OpenAICompatibleSettings:
+    provider: str
+    api_key: str | None
+    api_key_env: str
+    base_url: str | None = None
+
+
+def _llm_disabled() -> bool:
+    """Return True when callers explicitly request deterministic offline mode."""
+    return os.environ.get("ATA_DISABLE_LLM", "").strip().lower() in {"1", "true", "yes", "on"}
+
 
 def _api_key_or_placeholder(value: str | None) -> str:
     """Allow lazy client construction; real auth still fails at call time."""
     return value or "missing-api-key"
+
+
+def resolve_openai_compatible_settings(provider: str) -> OpenAICompatibleSettings:
+    """Resolve API settings for providers served through the OpenAI SDK."""
+    provider_key = str(provider or "").lower()
+    spec = provider_spec(provider_key)
+    api_key, api_key_env = first_env_value(spec.api_key_envs)
+    return OpenAICompatibleSettings(
+        provider=provider_key,
+        api_key=api_key,
+        api_key_env=api_key_env,
+        base_url=resolve_base_url(spec),
+    )
+
+
+def openai_compatible_model_info() -> dict[str, Any]:
+    """AutoGen model metadata for OpenAI-compatible non-OpenAI providers."""
+    return {
+        "vision": False,
+        "function_calling": True,
+        "json_output": False,
+        "family": "unknown",
+        "structured_output": False,
+    }
+
+
+def llm_api_key_configured(provider: str) -> bool:
+    """Return whether the configured provider has an API key available."""
+    provider_key = str(provider or "").lower()
+    if provider_key == "anthropic":
+        return bool(os.environ.get("ANTHROPIC_API_KEY"))
+    return bool(resolve_openai_compatible_settings(provider_key).api_key)
 
 
 class LLMClient:
@@ -38,9 +84,18 @@ class LLMClient:
                  model: str | None = None,
                  temperature: float | None = None):
         cfg = config.get_all()
-        self.provider = provider or cfg.get("llm_provider", "deepseek")
-        self.model = model or cfg.get("deep_think_llm", "deepseek-v4-flash")
+        configured_provider = str(cfg.get("llm_provider", "qwen")).lower()
+        self.provider = str(provider or configured_provider).lower()
+        spec = provider_spec(self.provider)
+        configured_model = cfg.get("llm_model") or cfg.get("deep_think_llm")
+        if model is not None:
+            self.model = model
+        elif provider is not None and self.provider != configured_provider:
+            self.model = spec.default_model
+        else:
+            self.model = configured_model or spec.default_model
         self.temperature = temperature if temperature is not None else cfg.get("temperature", 0.1)
+        self.timeout_seconds = float(os.environ.get("ATA_LLM_TIMEOUT_SECONDS", "60"))
         self._client = None
 
     @property
@@ -49,16 +104,7 @@ class LLMClient:
         if self._client is not None:
             return self._client
 
-        if self.provider == "deepseek":
-            api_key = _api_key_or_placeholder(os.environ.get("DEEPSEEK_API_KEY"))
-            self._client = OpenAI(
-                api_key=api_key,
-                base_url="https://api.deepseek.com/v1",
-            )
-        elif self.provider == "openai":
-            api_key = _api_key_or_placeholder(os.environ.get("OPENAI_API_KEY"))
-            self._client = OpenAI(api_key=api_key)
-        elif self.provider == "anthropic":
+        if self.provider == "anthropic":
             # Anthropic 使用独立的 anthropic SDK (非 OpenAI 兼容)
             try:
                 from anthropic import Anthropic
@@ -69,11 +115,15 @@ class LLMClient:
             api_key = os.environ.get("ANTHROPIC_API_KEY", "")
             self._client = Anthropic(api_key=api_key)
             return self._client
-        else:
-            # 自定义 OpenAI 兼容端点
-            api_key = _api_key_or_placeholder(os.environ.get(f"{self.provider.upper()}_API_KEY"))
-            base_url = os.environ.get(f"{self.provider.upper()}_BASE_URL", "")
-            self._client = OpenAI(api_key=api_key, base_url=base_url)
+
+        settings = resolve_openai_compatible_settings(self.provider)
+        kwargs: dict[str, Any] = {
+            "api_key": _api_key_or_placeholder(settings.api_key),
+            "timeout": self.timeout_seconds,
+        }
+        if settings.base_url:
+            kwargs["base_url"] = settings.base_url
+        self._client = OpenAI(**kwargs)
 
         return self._client
 
@@ -207,6 +257,9 @@ class LLMClient:
             如果指定了 response_format, 返回 Pydantic 实例;
             否则返回 str.
         """
+        if _llm_disabled():
+            raise RuntimeError("LLM calls disabled by ATA_DISABLE_LLM")
+
         normalized_messages = self._normalize_messages(messages)
         kwargs = {
             "model": self.model,
@@ -250,6 +303,9 @@ class LLMClient:
 
     def as_langchain_chat_model(self):
         """Return a LangChain chat model for LangGraph prebuilt agents."""
+        if _llm_disabled():
+            raise RuntimeError("LLM calls disabled by ATA_DISABLE_LLM")
+
         if self.provider == "anthropic":
             from langchain_anthropic import ChatAnthropic
 
@@ -261,25 +317,21 @@ class LLMClient:
 
         from langchain_openai import ChatOpenAI
 
-        if self.provider == "deepseek":
-            return ChatOpenAI(
-                model=self.model,
-                temperature=self.temperature,
-                api_key=os.environ.get("DEEPSEEK_API_KEY", ""),
-                base_url="https://api.deepseek.com/v1",
-            )
         if self.provider == "openai":
             return ChatOpenAI(
                 model=self.model,
                 temperature=self.temperature,
-                api_key=os.environ.get("OPENAI_API_KEY", ""),
+                api_key=resolve_openai_compatible_settings("openai").api_key or "",
+                timeout=self.timeout_seconds,
             )
 
+        settings = resolve_openai_compatible_settings(self.provider)
         return ChatOpenAI(
             model=self.model,
             temperature=self.temperature,
-            api_key=os.environ.get(f"{self.provider.upper()}_API_KEY", ""),
-            base_url=os.environ.get(f"{self.provider.upper()}_BASE_URL", ""),
+            api_key=settings.api_key or "",
+            base_url=settings.base_url or "",
+            timeout=self.timeout_seconds,
         )
 
 

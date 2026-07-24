@@ -4,10 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "advanced_trading_agent"
-version = "0.1.0"
-description = "多智能体量化交易分析系统 — A股盘后观察池"
+version = "0.2.0"
+description = "板块ETF观察池分析系统 — 多因子板块轮动 + AutoGen 圆桌决策"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.11,<3.14"
 dependencies = [
     "langchain>=1.2.0",
     "langgraph>=1.1.0",
@@ -24,6 +24,7 @@ dependencies = [
     "rich>=13.7.0",
     "pyyaml>=6.0",
     "tabulate>=0.9.0",
+    "pyarrow>=15.0.0",
 ]
 
 [project.optional-dependencies]
@@ -53,7 +54,7 @@ include = ["advanced_trading_agent*"]
 [project.scripts]
 build-cache = "advanced_trading_agent.data_agent.build_cache:main"
 dataagent = "advanced_trading_agent.data_agent.cli:main"
-trading-agent = "advanced_trading_agent.interactive_cli:main"
+trading-agent = "advanced_trading_agent.main:main"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

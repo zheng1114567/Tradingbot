@@ -63,6 +63,8 @@ class ReviewEngine:
         self,
         entry: dict[str, Any],
         price_df: pd.DataFrame | list[dict[str, Any]],
+        *,
+        as_of: str | None = None,
     ) -> dict[str, Any] | None:
         """Build one outcome payload from historical prices."""
         ticker = str(entry.get("ticker", ""))
@@ -79,7 +81,10 @@ class ReviewEngine:
         if horizon not in self.holding_days:
             self.holding_days = sorted(set([*self.holding_days, horizon]))
         if "trade_date" in df.columns:
-            df["trade_date"] = pd.to_datetime(df["trade_date"])
+            df["trade_date"] = pd.to_datetime(df["trade_date"], errors="coerce")
+            df = df.dropna(subset=["trade_date"]).sort_values("trade_date")
+            if as_of is not None:
+                df = df[df["trade_date"] <= pd.Timestamp(as_of)]
             if len(df[df["trade_date"] > pd.Timestamp(signal_date)]) < horizon:
                 return None
 
@@ -111,6 +116,7 @@ class ReviewEngine:
             "excess_returns_by_horizon": result.excess_returns,
             "max_drawdown": result.max_drawdown,
             "tradable": result.tradable,
+            "invalid_reason": getattr(result, "invalid_reason", ""),
             "cost_bps": result.cost_bps,
             "benchmark": result.benchmark,
         }
@@ -129,7 +135,7 @@ class ReviewEngine:
             prices = price_loader(str(entry.get("ticker", "")), str(entry.get("date", "")))
             if prices is None:
                 return None
-            return self.outcome_from_prices(entry, prices)
+            return self.outcome_from_prices(entry, prices, as_of=as_of_date)
 
         return store.resolve_pending(outcome_loader=loader, as_of=as_of_date)
 

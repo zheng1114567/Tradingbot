@@ -260,7 +260,10 @@ class AShareSignalBuilder:
 
         # Score from composite or average of available factors
         if isinstance(composite, (int, float)):
-            score = round(max(0, min(100, (composite + 0.5) * 100)), 1)
+            if 0 <= composite <= 10:
+                score = round(max(0, min(100, composite * 10)), 1)
+            else:
+                score = round(max(0, min(100, (composite + 0.5) * 100)), 1)
         else:
             bull = sum(1 for f in top_factors if f["direction"] == "bullish")
             score = round(bull / max(len(top_factors), 1) * 60 + 20, 1)

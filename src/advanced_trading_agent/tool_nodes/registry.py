@@ -44,6 +44,10 @@ AGENT_TOOL_NAMES: dict[str, tuple[str, ...]] = {
     "event": ("search_news", "get_announcements", "get_calendar"),
     "analysis": ("get_factors", "rank_stocks", "check_crowding"),
     "backtest": ("run_backtest", "find_similar"),
+    "hot_money": ("get_limit_up_tiers", "get_capital_flow"),
+    "policy": ("search_news", "get_announcements", "get_calendar"),
+    "unlock": ("get_announcements", "get_calendar"),
+    "risk": (),
 }
 
 

@@ -118,3 +118,78 @@ def test_data_agent_cli_json_mode_prints_full_payload(monkeypatch, capsys):
     assert exit_code == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload["final_data"]["vendor_health"]["attempt_count"] == 3
+
+class FakeFullRun:
+    def to_dict(self):
+        return {
+            "stage": "full_analysis",
+            "analysis_mode": "rules",
+            "ticker": "000001.SZ",
+            "trade_date": "2026-07-10",
+            "data_agent": {
+                "run_id": "run-full",
+                "response_path": "out/response.json",
+                "manifest_path": "out/manifest.json",
+                "collection_summary": {
+                    "categories_with_data": 5,
+                    "categories_failed": 0,
+                    "categories_empty": 1,
+                },
+                "errors": [],
+            },
+            "analysis": {
+                "final_report_path": "out/report.md",
+                "audit_trace_path": "out/audit.json",
+                "execution_allowed": False,
+                "round2_state": {"final_pressure": "downgrade"},
+            },
+        }
+
+
+def test_data_agent_cli_analyze_mode_runs_full_pipeline(monkeypatch, capsys):
+    calls = []
+
+    def fake_run_full_analysis(**kwargs):
+        calls.append(kwargs)
+        return FakeFullRun()
+
+    import advanced_trading_agent.pipeline as pipeline
+
+    monkeypatch.setattr(pipeline, "run_full_analysis", fake_run_full_analysis)
+
+    exit_code = cli.main([
+        "--ticker", "000001.SZ",
+        "--date", "2026-07-10",
+        "--start-date", "20260701",
+        "--end-date", "20260710",
+        "--sector-keyword", "银行",
+        "--analyze",
+        "--skip-backtest",
+        "--lookback-days", "45",
+        "--store-memory",
+    ])
+
+    assert exit_code == 0
+    assert calls == [{
+        "ticker": "000001.SZ",
+        "trade_date": "2026-07-10",
+        "start_date": "20260701",
+        "end_date": "20260710",
+        "output_dir": None,
+        "use_react_planner": False,
+        "news_keyword": None,
+        "sector_keyword": "银行",
+        "use_llm_news_filter": True,
+        "fetch_news_full_text": True,
+        "skip_backtest": True,
+            "analysis_mode": "rules",
+            "lookback_days": 45,
+            "store_memory": True,
+    }]
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["stage"] == "full_analysis"
+    assert payload["analysis_mode"] == "rules"
+    assert payload["run_id"] == "run-full"
+    assert payload["report_path"] == "out/report.md"
+    assert payload["final_pressure"] == "downgrade"
+    assert payload["collection"]["categories_with_data"] == 5

@@ -126,9 +126,20 @@ def _build_system_rubric(
     risk_score = 2
     risk1_reasons = list(risk1.get("reasons", []) or [])
     overlay_reasons = list(risk_overlay.get("reasons", []) or [])
-    if risk1.get("verdict") == "HARD_VETO" or risk3_verdict == "HARD_VETO":
+    if (
+        risk1.get("verdict") == "HARD_VETO"
+        or risk2.get("verdict") == "HARD_VETO"
+        or risk_overlay.get("verdict") == "HARD_VETO"
+        or risk3_verdict == "HARD_VETO"
+    ):
         risk_score = 0
-        forced_downgrades.extend(risk1_reasons + risk3_reasons or ["硬风控否决"])
+        forced_downgrades.extend(
+            risk1_reasons
+            + risk2.get("reasons", [])
+            + overlay_reasons
+            + risk3_reasons
+            or ["硬风控否决"]
+        )
     elif (
         risk1.get("verdict") == "SOFT_VETO"
         or risk2.get("verdict") == "SOFT_VETO"
@@ -196,6 +207,15 @@ def _enforce_rubric_floor(decision: SystemDecision, rubric: SystemRubric) -> boo
     decision.objections = [*decision.objections, *rubric.objections, *rubric.forced_downgrades]
     decision.risk_details = [*decision.risk_details, *rubric.forced_downgrades]
     return True
+
+
+def _hard_veto_reasons(*checks: dict[str, Any]) -> list[str]:
+    """Collect all code-enforced HARD_VETO reasons from risk checks."""
+    reasons: list[str] = []
+    for check in checks:
+        if check.get("verdict") == "HARD_VETO":
+            reasons.extend(str(reason) for reason in check.get("reasons", []) or [])
+    return reasons or ["硬风控否决"]
 
 
 def create_system_agent(llm: LLMClient):
@@ -373,6 +393,7 @@ def create_system_agent(llm: LLMClient):
                 soft_state.get("invalid_conditions"),
             ),
             current_state=soft_state or tier1_risk.get("current_state"),
+            llm=llm,
         )
 
         # 汇总各 Agent 结论
@@ -515,14 +536,18 @@ position_overlay={risk_overlay}
                 reasoning="LLM 降级: 默认观察",
             )
 
-        # 硬风控 3 覆盖 (HARD_VETO 不可被 LLM 覆盖)
-        is_veto = risk3_verdict == "HARD_VETO"
+        # 硬风控覆盖: 任一代码节点/position overlay 的 HARD_VETO 都不可被 LLM 覆盖。
+        hard_veto_reasons = _hard_veto_reasons(risk1, risk2, risk3, risk_overlay)
+        is_veto = bool(hard_veto_reasons and any(
+            check.get("verdict") == "HARD_VETO"
+            for check in (risk1, risk2, risk3, risk_overlay)
+        ))
         if is_veto:
             decision.decision = DecisionType.REJECT
             decision.risk_verdict = RiskVerdict.HARD_VETO
             decision.position = 0
-            decision.reasons = [f"硬风控3否决: {'; '.join(risk3_reasons)}"]
-            decision.risk_details = risk3_reasons
+            decision.reasons = [f"硬风控否决: {'; '.join(hard_veto_reasons)}"]
+            decision.risk_details = hard_veto_reasons
             decision.reasoning = "硬风控不通过"
         elif (
             risk1.get("verdict") == "SOFT_VETO"

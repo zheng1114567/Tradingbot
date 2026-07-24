@@ -70,8 +70,22 @@ class DataQualityChecker:
                 report.critical_missing.append(f"market.{field}")
                 report.passed = False
 
+        index_close = market.get("index_close")
+        try:
+            if index_close is not None and float(index_close) <= 0:
+                if "market.index_close" not in report.critical_missing:
+                    report.critical_missing.append("market.index_close")
+                report.passed = False
+        except (TypeError, ValueError):
+            if "market.index_close" not in report.critical_missing:
+                report.critical_missing.append("market.index_close")
+            report.passed = False
+
+        if (market.get("advance_count") or 0) == 0 and (market.get("decline_count") or 0) == 0:
+            report.warnings.append("市场涨跌家数全为 0，可能是空数据默认值")
+
         # 检查情绪数据
-        if not sentiment.get("sentiment"):
+        if not sentiment.get("sentiment") or sentiment.get("sentiment") == "未知":
             report.warnings.append("情绪数据缺失")
 
         # 检查数据过时 (如果传入了交易日)

@@ -16,6 +16,22 @@ class TestBacktestEdgeCases:
         result = engine.run_single(df, date(2026, 1, 5), "000001.SZ")
         assert result.tradable is False
 
+    def test_string_trade_dates_are_normalized(self):
+        """JSON-style string dates should match the signal date."""
+        df = pd.DataFrame({
+            "trade_date": ["2026-01-01", "2026-01-02", "2026-01-05"],
+            "open": [10.0, 10.2, 10.4],
+            "close": [10.1, 10.3, 10.5],
+            "volume": [1e7] * 3,
+            "amount": [1e8] * 3,
+            "is_limit_up": [False] * 3,
+            "is_limit_down": [False] * 3,
+        })
+        result = BacktestEngine(config_override={"default_holding_days": [1]}).run_single(
+            df, date(2026, 1, 1), "000001.SZ"
+        )
+        assert result.tradable is True
+        assert result.entry_price == 10.2
     def test_entry_date_not_in_data(self):
         """买入日期不在数据中应返回不可成交"""
         engine = BacktestEngine()

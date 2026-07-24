@@ -97,7 +97,7 @@ class TestParticipantResolution:
         participants = RoundtableHarness._resolve_participants(
             self._tier2_with_signals("absent")
         )
-        assert participants == ("Market", "Event", "Analysis", "Backtest")
+        assert participants == ("Market", "Event", "Analysis", "Backtest", "Risk")
 
     def test_hot_money_confirmed_activates(self):
         participants = RoundtableHarness._resolve_participants(
@@ -132,10 +132,10 @@ class TestParticipantResolution:
 
     def test_no_signals_key_returns_defaults(self):
         participants = RoundtableHarness._resolve_participants({})
-        assert participants == ("Market", "Event", "Analysis", "Backtest")
+        assert participants == ("Market", "Event", "Analysis", "Backtest", "Risk")
 
     def test_empty_a_share_signals_returns_defaults(self):
         participants = RoundtableHarness._resolve_participants(
             {"a_share_signals": {}}
         )
-        assert participants == ("Market", "Event", "Analysis", "Backtest")
+        assert participants == ("Market", "Event", "Analysis", "Backtest", "Risk")

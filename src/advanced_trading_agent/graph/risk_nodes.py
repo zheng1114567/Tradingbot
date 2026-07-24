@@ -141,6 +141,10 @@ def create_risk_check_2():
         # 流动性检查
         daily_volume = risk_data.get("daily_volume")
         if daily_volume is None:
+            daily_volume = risk_data.get("daily_volume_cny")
+        if daily_volume is None:
+            daily_volume = price_record.get("amount")
+        if daily_volume is None:
             reasons = ["流动性数据缺失，无法确认可成交性"]
             return build_node_audit_update(
                 sender="Risk Check 2",

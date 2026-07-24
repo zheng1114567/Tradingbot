@@ -1,7 +1,6 @@
 """LangGraph pipeline for sector-first ETF decisions.
 
-This is the strategy-level workflow for the new direction:
-select a sector, map it to tradable ETFs, run an AutoGen-backed roundtable,
+Select a sector, map it to tradable ETFs, run a deterministic roundtable,
 store conversation memory, then render an auditable report.
 """
 
@@ -21,7 +20,7 @@ from ..data_agent.etf_watchlist import (
     render_watchlist_markdown,
 )
 from ..data_agent.sector_etf import SectorETFSelector
-from ..roundtable.sector_qa import answer_sector_question_with_roundtable
+from ..roundtable.sector_qa import answer_sector_question
 
 
 RoundtableFn = Callable[..., dict[str, Any]]
@@ -34,7 +33,6 @@ class SectorETFState(TypedDict, total=False):
     question: str
     sector_name: str
     trade_date: str
-    use_autogen: bool
     store_memory: bool
     memory_context: str
     sector_evidence: dict[str, Any]
@@ -67,7 +65,7 @@ def create_sector_etf_workflow(
 ) -> Any:
     """Create the compiled LangGraph workflow for sector ETF decisions."""
     selector = selector or SectorETFSelector(auto_refresh_cache=refresh_cache)
-    roundtable_fn = roundtable_fn or answer_sector_question_with_roundtable
+    roundtable_fn = roundtable_fn or answer_sector_question
     memory_store = memory_store or ConversationMemoryStore()
 
     def select_sector_node(state: SectorETFState) -> dict[str, Any]:
@@ -91,7 +89,6 @@ def create_sector_etf_workflow(
             selector=selector,
             explanation=state.get("sector_evidence"),
             memory_context=state.get("memory_context", ""),
-            use_autogen=bool(state.get("use_autogen", True)),
         )
         return {"roundtable_result": result}
 
@@ -190,7 +187,6 @@ class SectorETFTradingSystem:
         *,
         question: str | None = None,
         trade_date: str | None = None,
-        use_autogen: bool = True,
         store_memory: bool = True,
     ) -> tuple[dict[str, Any], str]:
         td = trade_date or date.today().isoformat()
@@ -199,7 +195,6 @@ class SectorETFTradingSystem:
             "question": question or f"{sector_name}板块是否适合买ETF？",
             "sector_name": sector_name,
             "trade_date": td,
-            "use_autogen": use_autogen,
             "store_memory": store_memory,
             "errors": [],
         }
@@ -261,7 +256,7 @@ def create_sector_etf_watchlist_workflow(
             limits=limits,
         )
         timings = dict(selection_raw.get("timings", {}) or state.get("timings", {}) or {})
-        timings["rules_roundtable_seconds"] = round(time.perf_counter() - started, 3)
+        timings["roundtable_seconds"] = round(time.perf_counter() - started, 3)
         timings["total_pre_render_seconds"] = round(sum(timings.values()), 3)
         payload = report.model_dump(mode="json")
         payload["roundtable_summary"]["timings"] = timings

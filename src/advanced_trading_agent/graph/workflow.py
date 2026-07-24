@@ -40,12 +40,10 @@ from ..agents.system_agent import create_system_agent
 from ..config import config
 from ..data_agent.data_agent import DataAgent, DataAgentRequest
 from ..llm.client import LLMClient
-from ..roundtable import DebateEngine, RoundtableHarness
 from .conditional import (
     after_market,
     after_risk_check_1,
     after_risk_check_3,
-    after_round1,
 )
 from .risk_nodes import create_risk_check_1, create_risk_check_2, create_risk_check_3
 from .state import AgentState
@@ -141,7 +139,6 @@ def create_workflow() -> StateGraph:
     workflow.add_node("Skip Backtest", skip_backtest_node)
     workflow.add_node("Risk Check 2", risk2_node)
     workflow.add_node("Round 2 Judge", sa_round2_judge)
-    workflow.add_node("Round 2 Debate", _create_round2_subgraph(llm))
     workflow.add_node("Risk Check 3", risk3_node)
     workflow.add_node("System Final Decision", sa_final)
     workflow.add_node("Approval Agent", approval_node)
@@ -182,16 +179,9 @@ def create_workflow() -> StateGraph:
     workflow.add_edge("Backtest Agent", "Risk Check 2")
     workflow.add_edge("Skip Backtest", "Risk Check 2")
 
-    # 硬风控2 → Round 2 Judge
+    # Round 2 Judge → Risk Check 3 (矛盾检测结果直接传给 System Agent)
     workflow.add_edge("Risk Check 2", "Round 2 Judge")
-
-    # Round 2 Judge -> Round 2 subgraph -> Risk Check 3
-    workflow.add_conditional_edges(
-        "Round 2 Judge",
-        after_round1,
-        {"round2": "Round 2 Debate", "finalize": "Risk Check 3"},
-    )
-    workflow.add_edge("Round 2 Debate", "Risk Check 3")
+    workflow.add_edge("Round 2 Judge", "Risk Check 3")
 
     # 硬风控3: HARD_VETO → 直接生成报告, PASS → 进入裁定
     workflow.add_conditional_edges(
@@ -206,52 +196,6 @@ def create_workflow() -> StateGraph:
     workflow.add_edge("Report Agent", END)
 
     return workflow.compile()
-
-
-def _create_round2_subgraph(llm: LLMClient) -> StateGraph:
-    """Round 2 辩论子图 — 内部管理多轮辩论循环
-
-    DebateEngine 内部的每个 LLM 调用都有确定性 fallback。
-    """
-
-    def debate_turn(state: AgentState) -> dict[str, Any]:
-        round2 = state.get("round2_state", {})
-        count = round2.get("round_count", 0)
-        max_rounds = round2.get("max_rounds", 8)
-        contradictions_raw = round2.get("contradiction_records", [])
-        if not contradictions_raw:
-            return {"round2_state": {**round2, "completed": True, "round_count": count}}
-        try:
-            result = DebateEngine(llm=llm, harness=RoundtableHarness(), max_rounds=max_rounds).run_round(
-                state=state, round_number=count, contradictions=contradictions_raw,
-                round_history=round2.get("round_history", []),
-                previous_moderator_output=round2.get("moderator_output"),
-            )
-            return build_node_audit_update(sender="Round 2 Debate", round2_state={**round2, **result},
-                evidence=["provider=debate_engine", f"contradictions={len(contradictions_raw)}", f"round_count={result.get('round_count')}"],
-                tool_calls=[], self_check=basic_self_check(evidence=[], passed_rules=["debate_engine_executed"], warnings=[], confidence=str(result.get("final_pressure", "neutral"))))
-        except Exception as e:
-            logger.error("DebateEngine roundtable failed, round %d: %s", count, e)
-            result = {"round_count": count + 1, "completed": True, "current_speaker": "", "summary": f"Round {count + 1} 圆桌失败，确定性降级: {e}", "final_pressure": "downgrade",
-                "unresolved_conflicts": [c.get("description", str(c)) for c in contradictions_raw],
-                "provider": "debate_engine", "fallback_reason": f"debate_engine_failed: {type(e).__name__}: {e}",
-                "contradiction_records": contradictions_raw, "evidence_board": round2.get("evidence_board", []),
-                "round_history": round2.get("round_history", []), "moderator_output": None}
-            return build_node_audit_update(sender="Round 2 Debate", round2_state={**round2, **result},
-                evidence=["provider=debate_engine", "fallback_reason=debate_engine_failed"],
-                tool_calls=[], self_check=basic_self_check(evidence=[], passed_rules=["roundtable_failure_conservative_downgrade"], warnings=[f"Roundtable failed: {e}"], confidence="downgrade"))
-
-    def after_turn(state: AgentState) -> str:
-        round2 = state.get("round2_state", {})
-        if round2.get("completed") or round2.get("round_count", 0) >= round2.get("max_rounds", 8):
-            return "finalize"
-        return "continue"
-
-    builder = StateGraph(AgentState)
-    builder.add_node("debate_turn", debate_turn)
-    builder.add_edge(START, "debate_turn")
-    builder.add_conditional_edges("debate_turn", after_turn, {"continue": "debate_turn", "finalize": END})
-    return builder.compile()
 
 
 class TradingSystem:
@@ -355,7 +299,6 @@ class TradingSystem:
             "round2_state": {
                 "active": False,
                 "round_count": 0,
-                "max_rounds": 8,
                 "current_speaker": "",
                 "completed": False,
                 "summary": "",
@@ -364,9 +307,6 @@ class TradingSystem:
                 "final_pressure": "neutral",
                 "unresolved_conflicts": [],
                 "contradiction_records": [],
-                "evidence_board": [],
-                "round_history": [],
-                "moderator_output": None,
             },
             "round2_summary": "",
             "system_decision_obj": None,
